@@ -78,10 +78,14 @@
       - "host       : {{ inventory_hostname }} ({{ 'already in a cluster' if pve_cluster_joined else 'standalone' }})"
       - "role       : {{ 'FOUNDER' if inventory_hostname == pve_cluster_founder else 'joins ' ~ pve_cluster_founder }}"
       - "cluster    : {{ pve_cluster_name }}"
-      - "corosync   : {{ pve_cluster_link0_network }} {{ pve_cluster_link0_addr }}{{ ' + ' ~ pve_cluster_link1_network ~ ' ' ~ pve_cluster_link1_addr if pve_cluster_link1_addr | length > 0 else ' (single link)' }}"
+      - "corosync   : {{ pve_cluster_link0_network }} {{ pve_cluster_link0_addr }}{{ pve_cluster_link1_desc }}"
       - "dscp       : {{ pve_cluster_corosync_dscp | default('unset') }}"
       - "migration  : {{ pve_cluster_migration_network }} {{ pve_cluster_migration_cidr }} ({{ pve_cluster_migration_type }})"
       - "apply      : {{ pve_cluster_apply | bool }}"
+  vars:
+    pve_cluster_link1_desc: >-
+      {{ ' + ' ~ pve_cluster_link1_network ~ ' ' ~ pve_cluster_link1_addr
+         if pve_cluster_link1_addr | length > 0 else ' (single link)' }}
   changed_when: false
 
 - name: Stop here unless the apply gate was cleared

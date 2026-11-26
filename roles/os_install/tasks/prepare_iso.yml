@@ -194,7 +194,8 @@
       {% if os_install_answer_source == 'iso' %}--answer-file {{ os_install_answer_path }}{% endif %}
       {% if os_install_answer_source == 'http' %}--url {{ os_install_answer_url }}{% endif %}
       {% if os_install_answer_source == 'http' and os_install_answer_auth_token | length > 0 %}--answer-auth-token {{ os_install_answer_auth_token }}{% endif %}
-      {% if os_install_answer_source == 'http' and os_install_answer_cert_fingerprint | length > 0 %}--cert-fingerprint {{ os_install_answer_cert_fingerprint }}{% endif %}
+      {% if os_install_answer_source == 'http' and os_install_answer_cert_fingerprint | length > 0 %}
+      --cert-fingerprint {{ os_install_answer_cert_fingerprint }}{% endif %}
       {% if os_install_first_boot_enabled | bool %}--on-first-boot {{ os_install_hook_path }}{% endif %}
       --output {{ os_install_iso_dir }}/{{ os_install_output_iso }}
   delegate_to: "{{ os_install_build_host }}"
