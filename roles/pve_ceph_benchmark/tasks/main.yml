@@ -1,0 +1,84 @@
+---
+# Phase G/H. The role tag (ceph_benchmark) is applied from the playbook and
+# inherited by every task here. The teardown include carries an EXTRA tag
+# (ceph_benchmark_teardown) so it can be run on its own:
+#   --tags ceph_benchmark            -> full cycle: create, measure, tear down
+#   --tags ceph_benchmark_teardown   -> teardown only (no confirm required)
+- name: Ceph pool-tier benchmark and guarded teardown (Phase G/H).
+  block:
+    - name: Initialize Ceph benchmark role state.
+      ansible.builtin.set_fact:
+        pve_ceph_benchmark_outcome: "success"
+        pve_ceph_benchmark_verification: []
+      run_once: true
+      changed_when: false
+
+    # Human gate for the measurement half. Teardown is guarded and safe, so it is
+    # reachable via its own tag without this confirmation.
+    - name: Refuse to run the Ceph benchmark without an explicit confirmation.
+      ansible.builtin.assert:
+        that:
+          - pve_ceph_benchmark_confirm | bool
+        fail_msg: >-
+          pve_ceph_benchmark creates temporary pools and runs a long rados/fio
+          load against the cluster. Re-run with -e pve_ceph_benchmark_confirm=true
+          to proceed, or use --tags ceph_benchmark_teardown to only clean up.
+        quiet: true
+      run_once: true
+      changed_when: false
+
+    - name: Create the temporary benchmark pools (G1/G2).
+      ansible.builtin.include_tasks: pools.yml
+      run_once: true
+
+    - name: Run the rados bench and fio measurement (G).
+      ansible.builtin.include_tasks: run.yml
+      run_once: true
+
+    - name: Tear down the temporary benchmark pools (H).
+      ansible.builtin.include_tasks: teardown.yml
+      run_once: true
+      tags:
+        - ceph_benchmark_teardown
+
+    - name: Collect benchmark verification facts.
+      ansible.builtin.include_tasks: verify.yml
+      run_once: true
+
+    - name: Render Ceph benchmark report payload.
+      ansible.builtin.template:
+        src: ceph_benchmark_report_payload.json.j2
+        dest: "{{ reports_dir }}/ceph-benchmark-change.json"
+        mode: "0644"
+      delegate_to: localhost
+      run_once: true
+      changed_when: false
+
+    - name: Emit Ceph benchmark report via tools/report.py.
+      ansible.builtin.command:
+        cmd: >-
+          python3 tools/report.py render
+          {{ reports_dir }}/ceph-benchmark-change.json
+          --out {{ reports_dir }}/
+          --force
+        chdir: "{{ pve_deploy_root }}"
+      delegate_to: localhost
+      run_once: true
+      register: pve_ceph_benchmark_report_render
+      failed_when: pve_ceph_benchmark_report_render.rc != 0
+      changed_when: false
+
+  rescue:
+    - name: Mark Ceph benchmark as failed for reporting.
+      ansible.builtin.set_fact:
+        pve_ceph_benchmark_outcome: "failed"
+        pve_ceph_benchmark_failure_reason: "{{ ansible_failed_result.msg | default('pve_ceph_benchmark role failed') }}"
+      run_once: true
+      changed_when: false
+
+    - name: Fail after Ceph benchmark rescue.
+      ansible.builtin.fail:
+        msg: >-
+          {{ pve_ceph_benchmark_failure_reason }} -- temporary tst- pools may
+          remain; re-run with --tags ceph_benchmark_teardown to clean up.
+      run_once: true

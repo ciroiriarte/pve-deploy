@@ -1,0 +1,87 @@
+---
+# Classifies one physical drive for Ceph OSD suitability.
+#
+# Reads the canonical shape produced by normalize_evidence.yml. It previously
+# read Redfish PascalCase (Model, SerialNumber, CapacityBytes), which the
+# bmc_inventory file source never provides, so every field fell through to its
+# default and every drive was reported as "Unknown Model / Unknown Serial".
+
+- name: "Extract drive attributes for: {{ drive_item.id | default('unknown') }}"
+  ansible.builtin.set_fact:
+    d_id: "{{ drive_item.id | default('') }}"
+    d_slot: "{{ drive_item.location | default('Unknown') }}"
+    d_model: "{{ drive_item.model | default('Unknown Model') }}"
+    d_serial: "{{ drive_item.serial | default('Unknown Serial') }}"
+    d_capacity: "{{ drive_item.capacity_bytes | default(0) }}"
+    d_media: "{{ drive_item.media_type | default('Unknown') }}"
+    d_protocol: "{{ drive_item.protocol | default('Unknown') }}"
+    d_subsystem: "{{ drive_item.subsystem | default('') }}"
+    d_status: "{{ drive_item.state | default('Unknown') }}"
+    d_health: "{{ drive_item.health | default('Unknown') }}"
+  changed_when: false
+
+# Two independent exclusions, deliberately kept apart.
+#
+# d_in_volume is a fact: the drive is named as a member of a configured volume,
+# so it is in use regardless of which volume that is. This holds even when the
+# boot volume could not be identified, which is what stops an unidentified boot
+# mirror from being offered as free space.
+#
+# d_is_boot is narrower: the drive belongs to the volume identified as the OS
+# boot device, matched on id or serial.
+- name: "Determine volume membership and boot status for: {{ d_id }}"
+  ansible.builtin.set_fact:
+    d_in_volume: "{{ d_id in volume_member_ids }}"
+    d_is_boot: >-
+      {{ (d_id in boot_device_identifiers) or
+         (d_serial != 'Unknown Serial' and d_serial in boot_device_identifiers) }}
+  changed_when: false
+
+- name: "Determine whether the drive is free for consumption: {{ d_id }}"
+  ansible.builtin.set_fact:
+    d_is_unconfigured: >-
+      {{ (not d_in_volume) and
+         (drive_item.is_unconfigured | default(false) or
+          d_status | lower in ['unconfigured', 'raw', 'jbod', 'available', 'good', 'enabled']) }}
+  changed_when: false
+
+- name: "Record OSD candidacy for: {{ d_id }}"
+  vars:
+    d_note_eligible: "Eligible Ceph OSD candidate"
+    d_note_in_volume: "EXCLUDED: member of a configured volume, so the drive is in use"
+    d_note_in_use: "EXCLUDED: not in an unconfigured state"
+    d_note_unverified: >-
+      UNVERIFIED: the boot device could not be established with confidence, so
+      this drive is NOT confirmed safe to consume. Confirm by hand before any
+      destructive storage operation.
+    # Volume membership outranks boot confidence. A drive in a volume is
+    # excluded on evidence, not on a judgement that may never have been reached.
+    d_candidate_state: >-
+      {{ 'in_use' if d_in_volume
+         else (boot_device_confident
+               | ternary(d_is_unconfigured | ternary('eligible', 'in_use'), 'unverified')) }}
+    d_verification_note: >-
+      {{ d_note_in_volume if d_in_volume
+         else (boot_device_confident
+               | ternary(d_is_unconfigured | ternary(d_note_eligible, d_note_in_use),
+                         d_note_unverified)) }}
+  ansible.builtin.set_fact:
+    ceph_osd_candidates: >-
+      {{ ceph_osd_candidates + [{
+           'id': d_id,
+           'slot': d_slot,
+           'model': d_model,
+           'serial': d_serial,
+           'capacity_bytes': d_capacity,
+           'media_type': d_media,
+           'protocol': d_protocol,
+           'subsystem': d_subsystem,
+           'health': d_health,
+           'status': d_status,
+           'candidate_state': d_candidate_state,
+           'verification_note': d_verification_note
+         }] }}
+  # The identified boot device is omitted from the list entirely rather than
+  # listed as excluded: it must not appear in anything a later phase iterates.
+  when: not d_is_boot
+  changed_when: false

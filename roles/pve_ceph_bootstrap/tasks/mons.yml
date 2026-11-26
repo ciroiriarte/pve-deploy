@@ -1,0 +1,34 @@
+---
+# B3 - create monitors on the monitor nodes, one at a time.
+#
+# The loop is sequential, so mons are added in order: mon.a alone is quorate,
+# mon.b joins to make 2/2, mon.c makes 3/3. Each module call blocks until the mon
+# is added, and the quorum gate at the end asserts the full set is present before
+# the role continues -- the same intent as the change report's per-mon
+# `ceph mon dump` wait.
+# The module is idempotent (state=present is a no-op when the mon exists), so a
+# partially completed bootstrap resumes cleanly without the old already-exists
+# stderr matching. The call runs from the controller against the PVE API, so it is
+# delegated to localhost and loops the mon-node list rather than fanning out.
+- name: Create a monitor on each monitor node.
+  community.proxmox.proxmox_ceph_mon:
+    node: "{{ item }}"
+    state: present
+  loop: "{{ pve_ceph_mon_nodes }}"
+  loop_control:
+    label: "{{ item }}"
+  delegate_to: localhost
+  register: pve_ceph_bootstrap_mon_create
+
+- name: Wait for the monitor quorum to include every monitor node.
+  ansible.builtin.command:
+    cmd: ceph -s -f json
+  delegate_to: "{{ pve_ceph_first_node }}"
+  register: pve_ceph_bootstrap_quorum
+  changed_when: false
+  until:
+    - pve_ceph_bootstrap_quorum.rc == 0
+    - ((pve_ceph_bootstrap_quorum.stdout | default('{}', true) | from_json).quorum | default([]) | length)
+      >= (pve_ceph_mon_nodes | length)
+  retries: "{{ pve_ceph_quorum_retries }}"
+  delay: "{{ pve_ceph_quorum_delay }}"

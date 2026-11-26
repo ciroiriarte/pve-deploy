@@ -1,0 +1,132 @@
+---
+# Transfers one firmware payload to the BMC and waits for the update task.
+#
+# TRANSPORT
+#
+# multipart_push POSTs the payload to the BMC's MultipartHttpPushUri, so the
+# BMC acts as the server and needs no outbound reachability. That matters here:
+# the OOBM-BMC segment is default-denied outbound, so the simple_update form --
+# where the BMC fetches a URL we hand it -- would need a firewall change first.
+#
+# Ansible's uri module cannot send multipart/form-data with a file part, so the
+# push is done with curl. The alternative is base64-inlining a ~100MB payload
+# through a Jinja template, which is not viable.
+
+- name: Confirm the BMC advertises the push endpoint for {{ fw_item.id }}
+  ansible.builtin.uri:
+    url: "https://{{ ansible_host }}/redfish/v1/UpdateService"
+    method: GET
+    user: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_validate_certs }}"
+    timeout: "{{ bmc_timeout }}"
+  register: fw_update_service
+  no_log: true
+  changed_when: false
+
+- name: Refuse to push when the BMC exposes no multipart endpoint for {{ fw_item.id }}
+  ansible.builtin.fail:
+    msg: >-
+      {{ parent_host | default(inventory_hostname) }} does not advertise
+      MultipartHttpPushUri. Set firmware_transport=simple_update and open BMC
+      egress to a payload host, or update this BMC by another route.
+  when:
+    - firmware_transport == 'multipart_push'
+    - fw_update_service.json.MultipartHttpPushUri is not defined
+
+# The payload is pushed from the control node, not from the BMC's perspective.
+# --fail-with-body so a rejected payload surfaces the BMC's own error text
+# rather than an opaque non-zero exit.
+# curl is deliberate, not laziness: ansible.builtin.uri cannot send
+# multipart/form-data with a file part, and the alternative is base64-inlining a
+# payload of ~100MB through a Jinja template, which is not viable.
+- name: Push the firmware payload for {{ fw_item.id }}  # noqa: command-instead-of-module
+  vars:
+    fw_targets: '{"Targets":["/redfish/v1/UpdateService/FirmwareInventory/{{ fw_item.id }}"],"@Redfish.OperationApplyTime":"Immediate"}'
+    fw_push_url: "https://{{ ansible_host }}{{ fw_update_service.json.MultipartHttpPushUri }}"
+    fw_payload_path: "{{ firmware_payload_dir }}/{{ fw_item.payload_file }}"
+  ansible.builtin.command:
+    cmd: >-
+      curl --silent --show-error --fail-with-body --insecure
+      --user {{ bmc_username }}:{{ bmc_password }}
+      --max-time {{ firmware_push_timeout | default(1800) }}
+      --form 'UpdateParameters={{ fw_targets }};type=application/json'
+      --form 'UpdateFile=@{{ fw_payload_path }};type=application/octet-stream'
+      {{ fw_push_url }}
+  delegate_to: localhost
+  register: fw_push
+  no_log: true
+  changed_when: fw_push.rc == 0
+  when: firmware_transport == 'multipart_push'
+
+- name: Surface a sanitized push failure for {{ fw_item.id }}
+  # The command is no_log because it carries the BMC password; this re-raises
+  # the response body without it, so a rejected payload is diagnosable.
+  ansible.builtin.fail:
+    msg: >-
+      Firmware push rejected for {{ fw_item.id }} on
+      {{ parent_host | default(inventory_hostname) }}:
+      {{ (fw_push.stdout | default('') ~ ' ' ~ fw_push.stderr | default('')) | trim | truncate(400) }}
+  when:
+    - firmware_transport == 'multipart_push'
+    - fw_push.rc | default(0) != 0
+
+- name: Locate the update task for {{ fw_item.id }}
+  ansible.builtin.set_fact:
+    fw_task_uri: >-
+      {{ (fw_push.stdout | default('{}') | from_json).get('@odata.id', '')
+         if (fw_push.stdout | default('')) | trim | first | default('') == '{'
+         else '' }}
+  changed_when: false
+  failed_when: false
+
+# Polled rather than assumed complete. A firmware update is asynchronous: the
+# POST returns as soon as the BMC accepts the payload, long before the component
+# has been written. Treating the POST's success as the end of the update is how
+# a verification step ends up reading the old version and reporting drift.
+- name: Wait for the update task to finish for {{ fw_item.id }}
+  ansible.builtin.uri:
+    url: "https://{{ ansible_host }}{{ fw_task_uri }}"
+    method: GET
+    user: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_validate_certs }}"
+    timeout: "{{ bmc_timeout }}"
+    status_code: [200, 202]
+  register: fw_task
+  no_log: true
+  until: >-
+    fw_task.json.TaskState | default('Running') not in
+    ['New', 'Starting', 'Running', 'Pending', 'Suspended', 'Interrupted']
+  retries: "{{ firmware_task_retries | default(120) }}"
+  delay: "{{ firmware_task_delay | default(15) }}"
+  changed_when: false
+  when: fw_task_uri | length > 0
+
+- name: Fail when the update task did not complete cleanly for {{ fw_item.id }}
+  ansible.builtin.fail:
+    msg: >-
+      Firmware update task for {{ fw_item.id }} on
+      {{ parent_host | default(inventory_hostname) }} ended in state
+      '{{ fw_task.json.TaskState | default('unknown') }}'
+      ({{ fw_task.json.Messages | default([]) | map(attribute='Message') | join('; ') | truncate(300) }}).
+  when:
+    - fw_task_uri | length > 0
+    - fw_task.json.TaskState | default('') != 'Completed'
+
+# The BMC drops its own connections while it restarts into new firmware, so the
+# next component's request would fail on a connection error rather than on
+# anything meaningful. Waiting for the port to answer again is the difference
+# between a sequence that works and one that fails on step two.
+- name: Wait for the BMC to answer again after flashing {{ fw_item.id }}
+  ansible.builtin.wait_for:
+    host: "{{ ansible_host }}"
+    port: 443
+    state: started
+    delay: "{{ firmware_settle_delay | default(30) }}"
+    timeout: "{{ firmware_settle_timeout | default(900) }}"
+  delegate_to: localhost
+  changed_when: false
+  when: fw_item.class in ['bmc', 'uefi']

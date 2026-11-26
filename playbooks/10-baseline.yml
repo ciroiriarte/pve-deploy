@@ -1,0 +1,27 @@
+---
+- name: Phase 10 - Proxmox VE Repositories, OS Baseline, and Bootloader Convergence
+  hosts: pve
+  gather_facts: true
+  pre_tasks:
+    - name: Assert play targets are limited to PVE inventory group.
+      ansible.builtin.assert:
+        that:
+          - inventory_hostname in groups.get('pve', [])
+        fail_msg: "PVE deployment phases may only modify hosts in the pve inventory group."
+        quiet: true
+      changed_when: false
+      tags:
+        - always
+  roles:
+    - role: pve_repos
+      tags:
+        - phase10
+        - pve_repos
+    - role: pve_baseline
+      tags:
+        - phase10
+        - pve_baseline
+    - role: pve_bootloader
+      tags:
+        - phase10
+        - pve_bootloader

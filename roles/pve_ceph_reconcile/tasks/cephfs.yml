@@ -1,0 +1,72 @@
+---
+# D1 - MDS on the mon nodes (1 active + 2 standby). The module is idempotent
+# (state=present is a no-op when the MDS exists), so re-runs are safe without the
+# old already-exists stderr matching. It runs from the controller against the PVE
+# API (delegate_to localhost) and loops the node list.
+- name: Create an MDS on each MDS node.
+  community.proxmox.proxmox_ceph_mds:
+    node: "{{ item }}"
+    state: present
+  loop: "{{ pve_ceph_mon_nodes }}"
+  loop_control:
+    label: "{{ item }}"
+  delegate_to: localhost
+  register: pve_ceph_reconcile_mds_create
+
+# D2 - CephFS, bound to the class rule and exposed as PVE storage.
+- name: Read existing CephFS filesystems.
+  ansible.builtin.command:
+    cmd: ceph fs ls -f json
+  delegate_to: "{{ pve_ceph_first_node }}"
+  register: pve_ceph_reconcile_fs_ls
+  changed_when: false
+
+- name: Create the CephFS filesystem and register it as PVE storage.
+  ansible.builtin.command:
+    cmd: pveceph fs create --name {{ pve_ceph_fs_name }} --add-storage 1
+  delegate_to: "{{ pve_ceph_first_node }}"
+  when: pve_ceph_fs_name not in (pve_ceph_reconcile_fs_ls.stdout | default('[]', true) | from_json | map(attribute='name') | list)
+  register: pve_ceph_reconcile_fs_create
+  changed_when: pve_ceph_reconcile_fs_create.rc == 0
+
+- name: Bind the CephFS data and metadata pools to the class-scoped rule (idempotent).
+  ansible.builtin.shell:
+    cmd: |
+      set -u
+      cur=$(ceph osd pool get {{ item }} crush_rule 2>/dev/null | awk '{print $2}')
+      changed=0
+      if [ "$cur" != "{{ pve_ceph_crush_rule }}" ]; then
+        ceph osd pool set {{ item }} crush_rule {{ pve_ceph_crush_rule }}
+        changed=1
+      fi
+      echo "RULE_CHANGED=$changed"
+  delegate_to: "{{ pve_ceph_first_node }}"
+  loop:
+    - "{{ pve_ceph_fs_name }}_data"
+    - "{{ pve_ceph_fs_name }}_metadata"
+  loop_control:
+    label: "{{ item }}"
+  register: pve_ceph_reconcile_fs_rule
+  changed_when: "'RULE_CHANGED=1' in (pve_ceph_reconcile_fs_rule.stdout | default(''))"
+
+- name: Set the CephFS storage content types (idempotent, order-independent).
+  # pvesm set always exits 0 and rewrites the stanza, so guard it: compare the
+  # current content set (from storage.cfg) with the desired one as SORTED sets,
+  # and only call pvesm set when they differ. Order in --content is not
+  # significant, so a sorted comparison avoids churn.
+  ansible.builtin.shell:
+    cmd: |
+      set -u
+      want="{{ pve_ceph_fs_content }}"
+      cur=$(awk '/^cephfs: {{ pve_ceph_fs_name }}$/{f=1;next} /^[^[:space:]]/{f=0} f&&/^[[:space:]]*content /{print $2}' /etc/pve/storage.cfg)
+      ws=$(printf '%s' "$want" | tr ',' '\n' | sort | tr '\n' ',')
+      cs=$(printf '%s' "$cur"  | tr ',' '\n' | sort | tr '\n' ',')
+      changed=0
+      if [ "$ws" != "$cs" ]; then
+        pvesm set {{ pve_ceph_fs_name }} --content "$want"
+        changed=1
+      fi
+      echo "CONTENT_CHANGED=$changed"
+  delegate_to: "{{ pve_ceph_first_node }}"
+  register: pve_ceph_reconcile_fs_content_set
+  changed_when: "'CONTENT_CHANGED=1' in (pve_ceph_reconcile_fs_content_set.stdout | default(''))"

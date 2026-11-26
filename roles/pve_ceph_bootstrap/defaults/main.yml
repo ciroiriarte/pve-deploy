@@ -1,0 +1,67 @@
+---
+# pve_ceph_bootstrap defaults.
+#
+# Phase B: ONE-SHOT bootstrap of a Ceph cluster on an existing PVE cluster.
+# This role is NOT idempotent by design and is gated behind an explicit confirm.
+# It creates monitors, managers and OSDs; run it once, against a freshly
+# clustered, dataless fleet.
+
+# Human gate. The role refuses to run unless this is true -- the same shape as
+# pve_firewall's datacenter enable: an accidental run must not touch storage.
+pve_ceph_bootstrap_confirm: false
+
+# Ceph release passed to `pveceph install`. tentacle == 20.2.x on PVE 9.
+pve_ceph_release: "tentacle"
+pve_ceph_repository: "no-subscription"
+
+# Networks `pveceph init` pins. Empty by design: the real CIDRs are site data
+# and belong in site vars/inventory, not in a site-agnostic tool.
+# Example values, for reference: public 198.51.100.64/28, cluster 198.51.100.80/28.
+pve_ceph_public_network: ""
+pve_ceph_cluster_network: ""
+
+# Node roles. Deterministic ordering so a re-run picks the same first node,
+# exactly like pve_cluster (groups['pve'] | sort | first).
+pve_ceph_nodes: "{{ groups['pve'] | default([]) | sort }}"
+pve_ceph_first_node: "{{ (groups['pve'] | default([]) | sort | first) | default('') }}"
+# mon + mgr (and later mds) live on the first three nodes; OSDs on every node.
+pve_ceph_mon_nodes: "{{ (groups['pve'] | default([]) | sort)[:3] }}"
+
+# CRUSH device class stamped on each OSD at create time by proxmox_ceph_osd.
+# Setting it here means module-created OSDs land on the right class directly, so
+# pve_ceph_reconcile's reclass is only a fallback. Keep in sync with
+# pve_ceph_reconcile's pve_ceph_device_class.
+pve_ceph_device_class: "nvme"
+
+# Proxmox API connection contract for the proxmox_ceph_* modules. Wired at the
+# play level (playbooks/16-ceph.yml module_defaults). The non-secret values are
+# site data; pve_api_token_secret is a vault/-e secret and is NOT defaulted here.
+#   pve_api_host, pve_api_user (root@pam), pve_api_token_id (ansible),
+#   pve_api_token_secret, pve_api_validate_certs (false).
+
+# OSD disk selection guard. A disk is only used when ALL of these hold:
+#   - its model string contains pve_ceph_osd_disk_model_match, AND
+#   - its size (bytes) is greater than pve_ceph_osd_min_size_bytes, AND
+#   - it carries no mountpoint (so never the booted root), AND
+#   - it is not already an OSD.
+# It is then addressed by its stable /dev/disk/by-id/ link, never /dev/sdX.
+# The boot disk is excluded by construction: it is a different model AND mounted.
+pve_ceph_osd_disk_model_match: "MTFDKCC"        # Micron 7450 NVMe
+pve_ceph_osd_min_size_bytes: 6000000000000      # greater than 6 TB
+pve_ceph_osd_byid_glob: "/dev/disk/by-id/scsi-2*"
+
+# Timing knobs for the ceph.conf propagation and mon-quorum waits.
+pve_ceph_conffile_retries: 30
+pve_ceph_conffile_delay: 2
+pve_ceph_quorum_retries: 20
+pve_ceph_quorum_delay: 3
+
+# Reporting (same contract as pve_firewall / pve_repos).
+# environment_name is report metadata (the deployment tier), not a path.
+environment_name: "production"
+pve_environment: "production"
+pve_deploy_root: "{{ (playbook_dir ~ '/..') | realpath }}"
+# Site data root: where per-deployment records are written. Defaults to this
+# checkout; point it at a site repository to keep records out of the tool repo.
+pve_site_root: "{{ pve_deploy_root }}"
+reports_dir: "{{ pve_site_root }}/reports"

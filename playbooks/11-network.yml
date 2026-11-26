@@ -1,0 +1,26 @@
+---
+- name: "Phase 11 - Proxmox VE Network Configuration (WARNING - touches the management path)"
+  hosts: pve
+  gather_facts: true
+  # One node at a time, stopping the moment one fails. This play rewrites
+  # /etc/network/interfaces and runs ifreload on the management path; in
+  # parallel a config that is syntactically valid but wrong takes every node
+  # down at once. Phase 13, which is read-only, was already gated this way
+  # while this one was not.
+  serial: "{{ pve_network_serial | default(1) }}"
+  any_errors_fatal: true
+  pre_tasks:
+    - name: Assert play targets are limited to PVE inventory group.
+      ansible.builtin.assert:
+        that:
+          - inventory_hostname in groups.get('pve', [])
+        fail_msg: "PVE deployment phases may only modify hosts in the pve inventory group."
+        quiet: true
+      changed_when: false
+      tags:
+        - always
+  roles:
+    - role: pve_network
+      tags:
+        - phase11
+        - pve_network

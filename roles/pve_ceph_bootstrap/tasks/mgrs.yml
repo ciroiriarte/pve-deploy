@@ -1,0 +1,16 @@
+---
+# B4 - create managers on the monitor nodes (1 active + 2 standby).
+#
+# The module is idempotent (state=present is a no-op when the mgr exists), so
+# re-runs are safe without the old already-exists stderr matching. It runs from
+# the controller against the PVE API (delegate_to localhost) and loops the node
+# list.
+- name: Create a manager on each monitor node.
+  community.proxmox.proxmox_ceph_mgr:
+    node: "{{ item }}"
+    state: present
+  loop: "{{ pve_ceph_mon_nodes }}"
+  loop_control:
+    label: "{{ item }}"
+  delegate_to: localhost
+  register: pve_ceph_bootstrap_mgr_create

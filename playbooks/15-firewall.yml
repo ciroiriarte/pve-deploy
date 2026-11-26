@@ -1,0 +1,104 @@
+---
+# Phase 15 - Proxmox VE firewall. RUNS AFTER THE CLUSTER EXISTS (14-cluster).
+#
+# WHY THE NUMBER CHANGED (was 12-firewall)
+#
+# The entire PVE firewall lives in /etc/pve -- firewall/cluster.fw for
+# datacenter rules, nodes/<node>/host.fw for node rules -- and `man pvecm` is
+# unambiguous about what joining does to that:
+#
+#     All existing configuration in /etc/pve is overwritten when joining a
+#     cluster.
+#
+# So firewall configuration applied before clustering survives only on whichever
+# node founds the cluster. Every node that joins loses it, silently, at the
+# moment it joins. Running this at 12 against four standalone nodes meant doing
+# the work four times and keeping one quarter of it.
+#
+# The role was already written for a clustered fleet, which is the corroborating
+# evidence: it configures datacenter-level options through
+# `pvesh set /cluster/firewall/options`, and enable.yml verifies corosync quorum
+# after enabling -- a check with no meaning on a standalone node. Its headline
+# risk is losing quorum on corosync UDP 5405-5412 and triggering HA fencing,
+# which likewise requires a cluster to be at risk of.
+#
+# The ordering is asserted below rather than left to the filename, because a
+# number in a filename is a convention and this is a correctness requirement.
+- name: Configure Proxmox VE firewall rules safely.
+  hosts: pve
+  gather_facts: false
+  any_errors_fatal: true
+  serial: "{{ pve_firewall_serial | default('100%') }}"
+  pre_tasks:
+    - name: Assert play targets are limited to PVE inventory group.
+      ansible.builtin.assert:
+        that:
+          - inventory_hostname in groups.get('pve', [])
+        fail_msg: "PVE deployment phases may only modify hosts in the pve inventory group."
+        quiet: true
+      changed_when: false
+      tags:
+        - always
+
+    - name: Read cluster membership before configuring the firewall.
+      ansible.builtin.command:
+        cmd: pvecm status
+      register: pve_firewall_cluster_status
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      tags:
+        - always
+
+    # Refusing rather than warning. A warning here produces a node that looks
+    # firewalled until it joins a cluster and quietly reverts to no rules at
+    # all -- the failure is invisible precisely when it matters.
+    - name: Refuse to configure the firewall before the cluster exists.
+      ansible.builtin.assert:
+        that:
+          - pve_firewall_cluster_status.rc == 0
+        fail_msg: >-
+          {{ inventory_hostname }} is not in a cluster ({{ (pve_firewall_cluster_status.stderr | default('')) | trim | truncate(120) }}).
+          The PVE firewall lives in /etc/pve, and `man pvecm` states that all
+          existing configuration there is overwritten when joining a cluster --
+          so anything written now is discarded on join for every node except the
+          founder. Run 14-cluster first. Override with
+          -e pve_firewall_require_cluster=false only when configuring a node
+          that is deliberately standalone.
+        quiet: true
+      when: pve_firewall_require_cluster | default(true) | bool
+      changed_when: false
+      tags:
+        - always
+
+    - name: Assert generated inventory provides required firewall segments.
+      ansible.builtin.assert:
+        that:
+          - network_catalog is defined
+          - network_catalog[pve_firewall_segments.management.catalog_key] is defined
+          - network_catalog[pve_firewall_segments.corosync.catalog_key] is defined
+          - network_catalog[pve_firewall_segments.live_migration.catalog_key] is defined
+          - network_catalog[pve_firewall_segments.underlay.catalog_key] is defined
+          - network_catalog[pve_firewall_segments.ceph_public.catalog_key] is defined
+          - network_catalog[pve_firewall_segments.ceph_cluster.catalog_key] is defined
+          - network_catalog[pve_firewall_segments.management.catalog_key].cidr | length > 0
+          - network_catalog[pve_firewall_segments.corosync.catalog_key].cidr | length > 0
+          - network_catalog[pve_firewall_segments.live_migration.catalog_key].cidr | length > 0
+          - network_catalog[pve_firewall_segments.underlay.catalog_key].cidr | length > 0
+          - network_catalog[pve_firewall_segments.ceph_public.catalog_key].cidr | length > 0
+          - network_catalog[pve_firewall_segments.ceph_cluster.catalog_key].cidr | length > 0
+        fail_msg: >-
+          generated.yml network_catalog must define management, corosync, live
+          migration, underlay, Ceph public and Ceph cluster segments, each with
+          a non-empty CIDR.
+        quiet: true
+      changed_when: false
+      tags:
+        - firewall
+        - phase15
+
+  roles:
+    - role: pve_firewall
+      tags:
+        - firewall
+        - phase15

@@ -1,0 +1,22 @@
+---
+# Phase 17 - PVE SDN EVPN overlay (controller + zones config-of-record; VNets optional).
+#
+# ORDERING
+#   Runs AFTER the cluster exists (14-cluster) and the network/underlay is up
+#   (11-network). It declares the EVPN controller + zones into pmxcfs and applies.
+#
+# SDN config is cluster-wide (pmxcfs) so the role's object tasks are run_once.
+#
+# APPLY / ifreload SAFETY
+#   The apply triggers an ifreload. On this fleet that is safe because the SDN bond
+#   MAC is pinned (pve_network). Idempotent: apply only fires when an
+#   object was created, so a converge run with everything present is a no-op.
+- name: Phase 17 - PVE SDN EVPN
+  hosts: pve
+  become: true
+  gather_facts: false
+  roles:
+    - role: pve_sdn
+  tags:
+    - phase17
+    - pve_sdn

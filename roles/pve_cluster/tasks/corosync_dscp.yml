@@ -1,0 +1,76 @@
+---
+# Mark corosync traffic so a switch that trusts DSCP can protect it.
+#
+# corosync.conf lives in /etc/pve, so it is cluster-wide and edited on ONE node
+# only -- pmxcfs replicates it. Editing it on every node in a serial loop would
+# race the replication.
+#
+# Corosync requires config_version to increase on every change, and reloads on
+# `corosync-cfgtool -R`. Getting that wrong does not error; it just silently
+# keeps running the old configuration.
+#
+# MARKING ALONE CHANGES NOTHING. The switch must trust the marking
+# (`set trust-ip-dscp-map` on the trunk) and have a queue policy that favours
+# it. Without that, this sets six bits nobody reads.
+
+- name: Read the current corosync configuration
+  ansible.builtin.slurp:
+    src: /etc/pve/corosync.conf
+  register: pve_cluster_corosync_raw
+  run_once: true
+
+- name: Determine whether the DSCP marking is already in place
+  ansible.builtin.set_fact:
+    pve_cluster_corosync_text: "{{ pve_cluster_corosync_raw.content | b64decode }}"
+  run_once: true
+  changed_when: false
+
+- name: Apply the DSCP marking
+  when:
+    - inventory_hostname == pve_cluster_founder
+    - "'ip_dscp' not in pve_cluster_corosync_text"
+  block:
+    - name: Back up corosync.conf before editing
+      ansible.builtin.copy:
+        src: /etc/pve/corosync.conf
+        dest: "/root/corosync.conf.pre-dscp.{{ ansible_date_time.iso8601_basic_short | default('backup') }}"
+        remote_src: true
+        mode: "0600"
+
+    # Inserted into the totem directive, where ip_dscp belongs, and
+    # config_version bumped in the same pass -- corosync ignores a changed file
+    # whose version did not increase.
+    - name: Insert ip_dscp and bump config_version
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          f=/etc/pve/corosync.conf
+          ver=$(awk '/config_version:/ {print $2}' "$f")
+          next=$((ver + 1))
+          awk -v dscp="{{ pve_cluster_corosync_dscp }}" -v nv="$next" '
+            /^totem \{/ { print; print "  ip_dscp: " dscp; next }
+            /config_version:/ { sub(/[0-9]+$/, nv); print; next }
+            { print }
+          ' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+          echo "config_version $ver -> $next"
+        executable: /bin/bash
+      register: pve_cluster_dscp_edit
+      changed_when: true
+
+    - name: Reload corosync on every node so the new configuration takes effect
+      ansible.builtin.command:
+        cmd: corosync-cfgtool -R
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['pve'] }}"
+      loop_control:
+        label: "{{ item }}"
+      changed_when: true
+
+- name: Confirm the marking is present and corosync still holds quorum
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      grep -c 'ip_dscp' /etc/pve/corosync.conf || true
+    executable: /bin/bash
+  register: pve_cluster_dscp_check
+  changed_when: false

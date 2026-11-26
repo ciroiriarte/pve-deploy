@@ -1,0 +1,47 @@
+# Storage Topology & Ceph OSD Candidate Report: {{ parent_host }}
+
+- **Target Host**: {{ parent_host }} (`{{ ansible_host }}`)
+- **Environment**: {{ environment_name }}
+- **Audit Outcome**: {{ raid_audit_outcome | upper }}
+- **Evidence Source**: {{ raid_evidence_source }}
+- **Boot Redundancy**: {{ boot_disk_redundancy | upper }} (`{{ boot_device_confident | ternary('Confident', 'UNVERIFIED LOW CONFIDENCE') }}`)
+- **Audit Mode**: ZERO WRITES PERFORMED
+
+## Storage Controllers
+
+| Controller | Location | Operational Mode | Cache Health | Compliance Status |
+|------------|----------|------------------|--------------|-------------------|
+{% for ctl in storage_controllers %}
+| {{ ctl.name | default('Unknown') }} | {{ ctl.location | default('N/A') }} | {{ ctl.mode | default('not reported') }} | {{ ctl.cache_health | default('N/A') }} | {% if ctl.mode | default('') | lower == 'raid' %}**NON-COMPLIANT (RAID Mode)**{% else %}COMPLIANT (HBA/JBOD){% endif %} |
+{% endfor %}
+
+{% if ceph_raid0_findings | length > 0 %}
+> [!CAUTION]
+> **Ceph Direct Access Finding**: Hardware RAID mode detected with single-drive RAID-0 volumes. Ceph BlueStore requires direct HBA/JBOD disk access. Presenting OSD candidates through RAID-0 layer is an unacceptable configuration.
+{% endif %}
+
+{% if not boot_device_confident %}
+> [!WARNING]
+> **LOUD WARNING - Boot Device Identification Low Confidence**: The OS boot device could not be identified with certainty. For safety, all candidate drives have been marked as **`unverified`** to prevent accidental node destruction during subsequent deployment.
+{% endif %}
+
+{% if boot_disk_redundancy == 'single_device' %}
+> [!WARNING]
+> **Boot Redundancy Warning**: OS boot disk is a single device (non-mirrored). Host lacks boot storage redundancy.
+{% endif %}
+
+## Ceph OSD Candidate Drives
+
+| Slot/Bay | Drive Model | Serial Number | Capacity | Media | Protocol | Status | Candidate State | Verification Note |
+|----------|-------------|---------------|----------|-------|----------|--------|-----------------|-------------------|
+{% for drive in ceph_osd_candidates %}
+| {{ drive.slot }} | {{ drive.model }} | {{ drive.serial }} | {{ (drive.capacity_bytes | int / 1000000000000) | round(2) }} TB | {{ drive.media_type }} | {{ drive.protocol }} | {{ drive.status }} | **{{ drive.candidate_state | upper }}** | {{ drive.verification_note }} |
+{% endfor %}
+
+## Configured Virtual Disks / Volumes
+
+| Volume Name | RAID Level | Size | Controller | Member Drives |
+|-------------|------------|------|------------|---------------|
+{% for vd in virtual_disks %}
+| {{ vd.name | default('(unnamed)') or '(unnamed)' }} | {{ vd.raid_type | default('N/A') }} | {{ (vd.capacity_bytes | int / 1000000000) | round(1) }} GB | {{ vd.controller | default('N/A') }} | {{ vd.member_ids | default([]) | join(', ') }} |
+{% endfor %}

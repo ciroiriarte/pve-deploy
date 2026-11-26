@@ -1,0 +1,177 @@
+---
+# SDN config is cluster-wide (pmxcfs) — declare from a single node.
+# Idempotent get-or-create: existing objects are left untouched (this role ensures
+# presence + adds new objects; it does NOT reconcile field drift on existing ones —
+# a deliberate param change on a live zone/controller is a supervised manual op).
+
+- name: Ensure EVPN controllers exist
+  ansible.builtin.shell: |
+    set -euo pipefail
+    if pvesh get /cluster/sdn/controllers/{{ item.id | quote }} --output-format json >/dev/null 2>&1; then
+      echo UNCHANGED
+    else
+      pvesh create /cluster/sdn/controllers \
+        --controller {{ item.id | quote }} --type {{ item.type | quote }} \
+        --asn {{ item.asn }} --peers {{ item.peers | quote }} >/dev/null
+      echo CREATED
+    fi
+  args:
+    executable: /bin/bash
+  environment:
+    LC_ALL: C
+  register: pve_sdn_ctrl
+  changed_when: "'CREATED' in pve_sdn_ctrl.stdout"
+  run_once: true
+  loop: "{{ pve_sdn_controllers }}"
+  loop_control:
+    label: "{{ item.id }}"
+  tags:
+    - phase17
+    - pve_sdn
+
+- name: Ensure EVPN zones exist
+  ansible.builtin.shell: |
+    set -euo pipefail
+    if pvesh get /cluster/sdn/zones/{{ item.id | quote }} --output-format json >/dev/null 2>&1; then
+      echo UNCHANGED
+    else
+      pvesh create /cluster/sdn/zones \
+        --zone {{ item.id | quote }} --type {{ item.type | quote }} \
+        --controller {{ item.controller | quote }} --vrf-vxlan {{ item.vrf_vxlan }} \
+        --ipam {{ item.ipam | default('pve') | quote }} \
+        {{ ('--mtu ' ~ item.mtu) if item.mtu is defined else '' }} >/dev/null
+      echo CREATED
+    fi
+  args:
+    executable: /bin/bash
+  environment:
+    LC_ALL: C
+  register: pve_sdn_zone
+  changed_when: "'CREATED' in pve_sdn_zone.stdout"
+  run_once: true
+  loop: "{{ pve_sdn_zones }}"
+  loop_control:
+    label: "{{ item.id }}"
+  tags:
+    - phase17
+    - pve_sdn
+
+- name: Ensure VNets exist
+  ansible.builtin.shell: |
+    set -euo pipefail
+    if pvesh get /cluster/sdn/vnets/{{ item.id | quote }} --output-format json >/dev/null 2>&1; then
+      echo UNCHANGED
+    else
+      pvesh create /cluster/sdn/vnets \
+        --vnet {{ item.id | quote }} --zone {{ item.zone | quote }} --tag {{ item.tag }} >/dev/null
+      echo CREATED
+    fi
+  args:
+    executable: /bin/bash
+  environment:
+    LC_ALL: C
+  register: pve_sdn_vnet
+  changed_when: "'CREATED' in pve_sdn_vnet.stdout"
+  run_once: true
+  loop: "{{ pve_sdn_vnets }}"
+  loop_control:
+    label: "{{ item.id }}"
+  tags:
+    - phase17
+    - pve_sdn
+
+# Subnet id is rendered by PVE as "<zone>-<cidr with / -> ->".
+- name: Ensure VNet subnets exist
+  ansible.builtin.shell: |
+    set -euo pipefail
+    sid={{ (item.0.zone ~ '-' ~ (item.1.cidr | regex_replace('/', '-'))) | quote }}
+    if pvesh get /cluster/sdn/vnets/{{ item.0.id | quote }}/subnets/"$sid" --output-format json >/dev/null 2>&1; then
+      echo UNCHANGED
+    else
+      pvesh create /cluster/sdn/vnets/{{ item.0.id | quote }}/subnets \
+        --subnet {{ item.1.cidr | quote }} --type subnet --gateway {{ item.1.gateway | quote }} >/dev/null
+      echo CREATED
+    fi
+  args:
+    executable: /bin/bash
+  environment:
+    LC_ALL: C
+  register: pve_sdn_subnet
+  changed_when: "'CREATED' in pve_sdn_subnet.stdout"
+  run_once: true
+  loop: "{{ pve_sdn_vnets | subelements('subnets', skip_missing=True) }}"
+  loop_control:
+    label: "{{ item.0.id }}:{{ item.1.cidr }}"
+  tags:
+    - phase17
+    - pve_sdn
+
+# ---- North/South: per-VRF eBGP transit (PVE exit-nodes <-> FG tenant VDOMs) ----
+# The vrf_* devices must already exist (an EVPN zone needs >=1 VNet to instantiate
+# them). Import default-only; export only the tenant VNet subnets (leak-safe).
+- name: Render the SDN N/S per-VRF eBGP override (frr.conf.local, cluster-wide)
+  ansible.builtin.template:
+    src: frr.conf.local.j2
+    dest: /etc/pve/sdn/frr.conf.local
+    mode: "0640"
+  register: pve_sdn_ns_frr
+  run_once: true
+  when: pve_sdn_ns_enabled | default(false)
+  tags:
+    - phase17
+    - pve_sdn
+
+# PVE::Network::SDN::Frr merges /etc/frr/frr.conf.local; point it at the pmxcfs file.
+# Must be frr:frr-owned (use follow:false so the LINK is chowned, not the target) or
+# the frr reload PVE triggers will fail.
+- name: Symlink /etc/frr/frr.conf.local to the pmxcfs override
+  ansible.builtin.file:
+    src: /etc/pve/sdn/frr.conf.local
+    dest: /etc/frr/frr.conf.local
+    state: link
+    owner: frr
+    group: frr
+    follow: false
+    force: true
+  register: pve_sdn_ns_symlink
+  when: pve_sdn_ns_enabled | default(false)
+  tags:
+    - phase17
+    - pve_sdn
+
+- name: Render the N/S transit sub-interfaces (per node, VRF-bound)
+  ansible.builtin.template:
+    src: ns-transit.j2
+    dest: /etc/network/interfaces.d/ns-transit
+    owner: root
+    group: root
+    mode: "0644"
+  register: pve_sdn_ns_ifaces
+  when: pve_sdn_ns_enabled | default(false)
+  tags:
+    - phase17
+    - pve_sdn
+
+# Apply when an SDN object was created OR the N/S config changed — else a re-run is a
+# true no-op (no needless ifreload). The reload is ifreload-safe (bond MAC pin);
+# pvesh set /cluster/sdn is cluster-wide (renders FRR incl. the merged local, ifreloads
+# all nodes -> brings up each node's transit sub-interfaces).
+- name: Apply SDN configuration (pvesh set /cluster/sdn)
+  ansible.builtin.command:
+    cmd: pvesh set /cluster/sdn
+  environment:
+    LC_ALL: C
+  run_once: true
+  when:
+    - pve_sdn_apply | default(true)
+    - (pve_sdn_ctrl is defined and pve_sdn_ctrl.changed | default(false))
+      or (pve_sdn_zone is defined and pve_sdn_zone.changed | default(false))
+      or (pve_sdn_vnet is defined and pve_sdn_vnet.changed | default(false))
+      or (pve_sdn_subnet is defined and pve_sdn_subnet.changed | default(false))
+      or (pve_sdn_ns_frr is defined and pve_sdn_ns_frr.changed | default(false))
+      or (pve_sdn_ns_symlink is defined and pve_sdn_ns_symlink.changed | default(false))
+      or (pve_sdn_ns_ifaces is defined and pve_sdn_ns_ifaces.changed | default(false))
+  changed_when: true
+  tags:
+    - phase17
+    - pve_sdn

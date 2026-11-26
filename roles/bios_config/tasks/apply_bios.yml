@@ -1,0 +1,33 @@
+---
+# Apply path for bios_config. Reached only when the caller has cleared the
+# Phase 01 apply gate (hardware_apply=true plus a site-named confirmation).
+#
+# The gate is implemented; this, the thing behind it, is not yet.
+#
+# It fails rather than warning on purpose. A debug message here would let an
+# operator who deliberately asked to converge BIOS walk away from a green run
+# believing the fleet had been reconfigured, with the drift still in place and
+# an assessment report that agrees the drift is still in place. Failing closed
+# is the honest outcome for "you asked for something this role cannot do yet".
+#
+# Implementing this means, per the Tier A lifecycle in README.md:
+#   1. Consume bios_drift_items from audit_bios.yml — the diff is already
+#      computed by the time execution reaches here, so do not re-read.
+#   2. PATCH the pending-attributes resource on the XCC
+#      (/redfish/v1/Systems/1/Bios/Pending) with only the drifted keys. Lenovo
+#      stages BIOS writes; nothing takes effect until the host posts.
+#   3. Reboot once, after all attributes are staged — not once per attribute.
+#   4. Re-read and verify the applied state, then re-render the report as a
+#      change report rather than an assessment.
+# Staging matters most for the settings in bios_baseline that gate the rest of
+# the build: SR-IOV, IOMMU and SEV control what the OS can do with the NICs and
+# guests, so a partial commit is worse than none.
+
+- name: Fail because BIOS apply mode is not implemented yet
+  ansible.builtin.fail:
+    msg: >-
+      bios_config was invoked in apply mode, but its apply path is not
+      implemented. {{ bios_drift_items | length }} drifted attribute(s) were
+      detected on {{ inventory_hostname }} and have NOT been changed. Re-run
+      without hardware_apply to produce the assessment report, and converge BIOS
+      by hand until this path is built.

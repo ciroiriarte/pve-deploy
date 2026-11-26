@@ -1,0 +1,211 @@
+---
+# PVE 9 uses PVE API endpoints (/nodes/{node}/apt/repositories) for repository management.
+# The API provides standardized GET/PUT actions, but cannot express custom third-party OBS
+# keyrings/sources or bootstrap deb822 files prior to API availability. Where API calls are
+# unavailable or incomplete, we fall back to templated deb822 files under /etc/apt/sources.list.d/.
+
+- name: Ensure legacy list files are absent
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/apt/sources.list.d/pve-enterprise.list
+    - /etc/apt/sources.list.d/pve-install-repo.list
+    - /etc/apt/sources.list.d/pve-no-subscription.list
+    - /etc/apt/sources.list.d/ceph.list
+  tags:
+    - phase10
+    - pve_repos
+
+- name: Configure Debian base repositories
+  ansible.builtin.template:
+    src: debian.sources.j2
+    dest: /etc/apt/sources.list.d/debian.sources
+    owner: root
+    group: root
+    mode: "0644"
+  register: debian_repos_sources_change
+  tags:
+    - phase10
+    - pve_repos
+
+- name: Prefer IPv4 for APT while PVE management has no routed IPv6
+  ansible.builtin.copy:
+    dest: /etc/apt/apt.conf.d/99pve-deploy-ipv4-acquire
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      // Managed by pve-deploy. Remove when routed IPv6 is provided to VLAN2001/PVE nodes.
+      Acquire::ForceIPv4 "true";
+  register: apt_ipv4_acquire_change
+  tags:
+    - phase10
+    - pve_repos
+
+- name: Configure APT to use a forward proxy for repository egress
+  ansible.builtin.copy:
+    dest: /etc/apt/apt.conf.d/01pve-deploy-proxy
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      // Managed by pve-deploy. APT repository/update egress via a forward proxy.
+      // Controlled by the `pve_apt_proxy_url` inventory variable; unset it to remove.
+      Acquire::http::Proxy "{{ pve_apt_proxy_url }}";
+      Acquire::https::Proxy "{{ pve_apt_proxy_url }}";
+  when: pve_apt_proxy_url | default('', true) | length > 0
+  register: apt_proxy_change
+  tags:
+    - phase10
+    - pve_repos
+
+- name: Remove pve-deploy APT proxy config when no proxy is configured
+  ansible.builtin.file:
+    path: /etc/apt/apt.conf.d/01pve-deploy-proxy
+    state: absent
+  when: pve_apt_proxy_url | default('', true) | length == 0
+  register: apt_proxy_absent
+  tags:
+    - phase10
+    - pve_repos
+
+- name: Check if Proxmox archive keyring exists
+  ansible.builtin.stat:
+    path: "{{ pve_keyring_path }}"
+  register: pve_repos_keyring_stat
+  tags:
+    - phase10
+    - pve_repos
+
+- name: Verify Proxmox archive keyring presence
+  ansible.builtin.assert:
+    that:
+      - pve_repos_keyring_stat.stat.exists
+    fail_msg: "Package-managed keyring {{ pve_keyring_path }} is missing. Ensure proxmox-archive-keyring is installed."
+  tags:
+    - phase10
+    - pve_repos
+
+- name: Attempt APT repository configuration via PVE API (pc tool on control node)
+  ansible.builtin.command:
+    cmd: >-
+      pc api PUT /nodes/{{ inventory_hostname }}/apt/repositories
+      -digest "{{ ansible_date_time.epoch }}"
+  delegate_to: localhost
+  register: pve_repos_api_result
+  failed_when: false
+  changed_when: pve_repos_api_result.rc == 0
+  when: pve_repos_use_api | bool
+  tags:
+    - phase10
+    - pve_repos
+
+- name: Remove PVE repository source file for inactive subscription mode
+  ansible.builtin.file:
+    path: >-
+      {{ '/etc/apt/sources.list.d/proxmox.sources'
+         if (pve_subscription_key | default('', true) | length > 0)
+         else '/etc/apt/sources.list.d/pve-enterprise.sources' }}
+    state: absent
+  register: pve_repos_inactive_source_change
+  tags:
+    - phase10
+    - pve_repos
+
+- name: Fallback to deb822 template for PVE repository
+  ansible.builtin.template:
+    src: pve.sources.j2
+    dest: >-
+      {{ '/etc/apt/sources.list.d/pve-enterprise.sources'
+         if (pve_subscription_key | default('', true) | length > 0)
+         else '/etc/apt/sources.list.d/proxmox.sources' }}
+    owner: root
+    group: root
+    mode: "0644"
+  register: pve_repos_sources_change
+  tags:
+    - phase10
+    - pve_repos
+
+- name: Fallback to deb822 template for Ceph repository
+  ansible.builtin.template:
+    src: ceph.sources.j2
+    dest: /etc/apt/sources.list.d/ceph.sources
+    owner: root
+    group: root
+    mode: "0644"
+  register: ceph_repos_sources_change
+  tags:
+    - phase10
+    - pve_repos
+
+# Named once instead of repeating the same six-clause expression at three call
+# sites, where it had already drifted: the cache-refresh copy omitted the
+# upgrade clause the two report gates carried.
+- name: Determine whether repository configuration changed
+  ansible.builtin.set_fact:
+    pve_repos_sources_changed: >-
+      {{ apt_ipv4_acquire_change is changed
+         or debian_repos_sources_change is changed
+         or pve_repos_sources_change is changed
+         or pve_repos_inactive_source_change is changed
+         or ceph_repos_sources_change is changed
+         or pve_repos_api_result is changed }}
+  changed_when: false
+  tags:
+    - phase10
+    - pve_repos
+
+- name: Update APT cache following repository adjustments
+  ansible.builtin.apt:
+    update_cache: true
+  register: pve_repos_apt_update
+  when: pve_repos_sources_changed | bool
+  tags:
+    - phase10
+    - pve_repos
+
+- name: Apply pending package upgrades after repository convergence
+  ansible.builtin.apt:
+    upgrade: dist
+    update_cache: true
+  register: pve_repos_full_upgrade
+  when: pve_repos_apply_full_upgrade | bool
+  tags:
+    - phase10
+    - pve_repos
+
+- name: Determine whether this run has anything to report
+  ansible.builtin.set_fact:
+    pve_repos_reportable_change: >-
+      {{ pve_repos_sources_changed | bool
+         or (pve_repos_full_upgrade.changed | default(false)) }}
+  changed_when: false
+  tags:
+    - phase10
+    - pve_repos
+
+- name: Render change report payload
+  ansible.builtin.template:
+    src: report_payload.json.j2
+    dest: "/tmp/pve_repos_report_{{ inventory_hostname }}.json"
+    mode: "0600"
+  delegate_to: localhost
+  when: pve_repos_reportable_change | bool
+  tags:
+    - phase10
+    - pve_repos
+
+- name: Emit change report via tools/report.py
+  ansible.builtin.command:
+    cmd: "python3 tools/report.py render /tmp/pve_repos_report_{{ inventory_hostname }}.json --out {{ reports_dir }}/"
+    chdir: "{{ pve_deploy_root }}"
+  delegate_to: localhost
+  register: pve_repos_report_output
+  failed_when: pve_repos_report_output.rc != 0
+  changed_when: true
+  when: pve_repos_reportable_change | bool
+  tags:
+    - phase10
+    - pve_repos

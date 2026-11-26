@@ -1,0 +1,50 @@
+---
+# yamllint configuration for pve-deploy.
+#
+# CI runs `yamllint -s .`, where -s promotes warnings to errors, so anything
+# left at warning level fails the build. The rules below are therefore set to
+# what this repo actually intends rather than left at defaults.
+
+extends: default
+
+ignore: |
+  .omc/
+  .omx/
+  environments/
+  inventories/
+  .venv/
+
+rules:
+  # Match ansible-lint's limit so the two tools cannot disagree about a line.
+  line-length:
+    max: 160
+    level: error
+
+  # GitHub Actions requires the `on:` key. The YAML 1.1 truthy rule reads it as
+  # a boolean; quoting it in the workflow satisfies both, and this keeps the
+  # rule active for genuine yes/no/on/off mistakes elsewhere.
+  truthy:
+    allowed-values: ["true", "false"]
+    check-keys: true
+
+  # Ansible files conventionally start with ---; enforce it consistently.
+  document-start:
+    present: true
+
+  comments:
+    min-spaces-from-content: 1
+
+  braces:
+    max-spaces-inside: 1
+
+  brackets:
+    max-spaces-inside: 0
+
+  # The three settings below are required by ansible-lint: it refuses to enable
+  # its own --fix mode unless the yamllint config agrees with them, so leaving
+  # them at yamllint defaults silently costs autofix for the whole repo.
+  comments-indentation: false
+
+  octal-values:
+    forbid-implicit-octal: true
+    forbid-explicit-octal: true

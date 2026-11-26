@@ -1,0 +1,45 @@
+---
+- name: Execute Firmware Audit Block
+  tags:
+    - audit
+    - bmc
+    - readonly
+    - firmware
+  block:
+    - name: Gather the current firmware inventory
+      ansible.builtin.include_tasks: gather_inventory.yml
+
+    - name: Resolve target versions from the baseline or catalog
+      ansible.builtin.include_tasks: resolve_targets.yml
+
+    - name: Build the firmware update plan
+      ansible.builtin.include_tasks: audit_firmware.yml
+
+    - name: Generate firmware evidence and assessment reports
+      ansible.builtin.include_tasks: generate_reports.yml
+
+  rescue:
+    - name: Record firmware audit failure state
+      ansible.builtin.set_fact:
+        firmware_config_outcome: "failed"
+        firmware_config_failure_reason: >-
+          {{ ansible_failed_result.msg | default('Redfish firmware request failed') }}
+      changed_when: false
+
+    - name: Generate failure evidence and report
+      ansible.builtin.include_tasks: generate_reports.yml
+
+# Outside the block above, which carries the `readonly` tag, so that
+# `--tags readonly` cannot select a mutating task. Same reasoning as the other
+# Tier A roles.
+#
+# `| bool` is not redundant: firmware_config_audit_only arrives as a rendered
+# template and can also be set as a quoted string, and every non-empty string is
+# truthy in Jinja -- including "False".
+- name: Apply firmware updates
+  ansible.builtin.include_tasks: apply_firmware.yml
+  when: not (firmware_config_audit_only | bool)
+  tags:
+    - bmc
+    - firmware
+    - apply

@@ -1,0 +1,56 @@
+---
+pve_deploy_root: "{{ (playbook_dir ~ '/..') | realpath }}"
+
+# Site data root: where per-deployment records are written. Defaults to this
+# checkout; point it at a site repository to keep records out of the tool repo.
+pve_site_root: "{{ pve_deploy_root }}"
+reports_dir: "{{ pve_site_root }}/reports"
+
+pve_environment: "production"
+pve_subscription_key: ""
+pve_ceph_archive: "ceph-tentacle"
+pve_ceph_component: "{{ 'enterprise' if pve_subscription_key | default('', true) | length > 0 else 'no-subscription' }}"
+pve_apt_suite: "trixie"
+
+# Components for the two Debian base repositories.
+#
+# The PVE wiki and the PBS docs genuinely disagree here: the PVE Package
+# Repositories page lists "main non-free-firmware", the PBS installation docs
+# list "main contrib non-free-firmware". This default follows the PVE wiki,
+# because the role only runs against the pve group.
+#
+# Dropping contrib is safe on a PVE node. The ZFS packages are the only
+# plausible contrib consumers, and Proxmox ships its own build of them:
+# zfsutils-linux is installed at 2.4.3-pve1 from pve-no-subscription, which
+# outranks Debian's contrib 2.3.2-2. Verified on pve-01 -- no
+# installed package's version appears in the Debian contrib index at all.
+#
+# When PBS is brought under this role, override this for that group with
+# "main contrib non-free-firmware" so each product follows its own guide.
+pve_debian_components: "main non-free-firmware"
+
+pve_keyring_path: "/usr/share/keyrings/proxmox-archive-keyring.gpg"
+pve_repos_use_api: true
+
+# Phase 10 is expected to converge package level after repositories are corrected.
+# This runs a Debian/Proxmox dist-upgrade on PVE nodes when Phase 10 is executed.
+pve_repos_apply_full_upgrade: true
+
+# Optional forward proxy for APT repository/update egress. When set to a proxy
+# URL (e.g. "http://proxy.example.internal:3128"), the role writes
+# /etc/apt/apt.conf.d/01pve-deploy-proxy pointing http and https APT traffic at
+# it; when empty (the default) that file is removed and APT egresses directly.
+# Use this where nodes cannot reach the repositories directly -- e.g. a firewall
+# that only permits a controlled egress host, or CDN-backed mirrors
+# (deb.debian.org / Fastly) whose rotating IPs defeat FQDN-based egress rules.
+pve_apt_proxy_url: ""
+
+# OBS host for the ciriarte pve-cli / pve-tools / network-tools packages.
+#
+# downloadcontent.opensuse.org is the canonical origin and serves content
+# DIRECTLY. download.opensuse.org runs MirrorBrain and redirects to a nearby
+# mirror, which on this network resolved to an IPv6-only host -- unreachable,
+# with no IPv4 address for Acquire::ForceIPv4 to fall back to.
+#
+# Override only if a local mirror is available that is known to answer over IPv4.
+obs_repo_host: "downloadcontent.opensuse.org"

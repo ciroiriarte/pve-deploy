@@ -1,0 +1,57 @@
+---
+# pve_ceph_reconcile defaults.
+#
+# Phase C/D: IDEMPOTENT reconciliation of a bootstrapped Ceph cluster into its
+# intended shape -- device class, CRUSH rule, autotuning, pools, and CephFS.
+# Every task guards with a read-before-write check, so re-runs are no-ops.
+
+# Deterministic first node (cluster-wide ceph commands delegate here) and the
+# mon/mgr/mds nodes (first three), matching pve_ceph_bootstrap.
+pve_ceph_first_node: "{{ (groups['pve'] | default([]) | sort | first) | default('') }}"
+pve_ceph_mon_nodes: "{{ (groups['pve'] | default([]) | sort)[:3] }}"
+
+# Device class + class-scoped replicated CRUSH rule (host failure domain).
+pve_ceph_device_class: "nvme"
+pve_ceph_crush_rule: "repl-nvme-host"
+pve_ceph_crush_failure_domain: "host"
+
+# Autotuning. Values and config scopes follow the hand-run Phase C/D script
+# exactly (osd scope for the memory knobs, global for pg autoscale). NVMe OSDs
+# want a fixed memory headroom, so autotune is off and the target is pinned.
+pve_ceph_osd_memory_target_autotune: false
+pve_ceph_osd_memory_target: 8589934592          # 8 GiB
+pve_ceph_balancer_mode: "upmap"
+pve_ceph_pg_autoscale_default: "on"
+
+# Production RBD pools. size/min_size are shared; compression differs per pool.
+# pg_autoscale_mode is the per-pool autoscaler setting passed to proxmox_ceph_pool
+# (distinct from pve_ceph_pg_autoscale_default above, which is the cluster-wide
+# default written via `ceph config set global`).
+pve_ceph_pool_size: 3
+pve_ceph_pool_min_size: 2
+pve_ceph_pool_pg_autoscale_mode: "on"
+pve_ceph_pools:
+  - name: "nvme"
+    compression_algorithm: ""
+    compression_mode: ""
+  - name: "nvme-compressed"
+    compression_algorithm: "zstd"
+    compression_mode: "aggressive"
+
+# CephFS filesystem and the PVE storage content types bound to it.
+pve_ceph_fs_name: "cfs01"
+pve_ceph_fs_content: "iso,vztmpl,snippets,backup"
+
+# Proxmox API connection contract for the proxmox_ceph_* modules (pool + MDS
+# create). Wired at the play level (playbooks/16-ceph.yml module_defaults). The
+# non-secret values are site data; pve_api_token_secret is a vault/-e secret and
+# is NOT defaulted here.
+#   pve_api_host, pve_api_user (root@pam), pve_api_token_id (ansible),
+#   pve_api_token_secret, pve_api_validate_certs (false).
+
+# Reporting (same contract as pve_firewall / pve_repos).
+environment_name: "production"
+pve_environment: "production"
+pve_deploy_root: "{{ (playbook_dir ~ '/..') | realpath }}"
+pve_site_root: "{{ pve_deploy_root }}"
+reports_dir: "{{ pve_site_root }}/reports"

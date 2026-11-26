@@ -1,0 +1,100 @@
+---
+# Validates the baseline against the firmware's own attribute registry, before
+# anything is compared or applied.
+#
+# WHAT THIS CATCHES, AND WHY IT EXISTS
+#
+# Both original defects in this role were baseline errors that no amount of
+# careful comparison logic could have caught, because the comparison was working
+# correctly on wrong input:
+#
+#   - every attribute name used '.' where this firmware uses '_', so all ten
+#     keys missed and the audit reported success having matched nothing;
+#   - "Maximum Performance" carried a space the firmware does not use, so even
+#     the correctly-named key would never have matched.
+#
+# The registry states exactly which attributes exist, which are settable, and
+# which values are legal. Checking against it turns both of those from a silent
+# fleet-wide false pass into a named error before the first comparison.
+#
+# It also matters for apply: a value outside the allowed set is rejected by the
+# BMC as PropertyValueNotInList, and learning that halfway through staging a
+# batch of BIOS attributes is a poor time to find out.
+
+- name: Initialize baseline validation results
+  ansible.builtin.set_fact:
+    bios_baseline_problems: []
+  changed_when: false
+
+- name: Validate every baseline key against the registry
+  ansible.builtin.set_fact:
+    bios_baseline_problems: >-
+      {%- set problems = [] -%}
+      {%- for key, want in bios_baseline.items() -%}
+      {%-   if key not in bios_registry -%}
+      {%-     set _ = problems.append({
+                'key': key, 'kind': 'unknown_attribute', 'wanted': want,
+                'detail': 'not present in ' ~ bios_registry_name
+                          ~ '; the name is wrong for this firmware, or the attribute does not exist on this model'
+              }) -%}
+      {%-   else -%}
+      {%-     set spec = bios_registry[key] -%}
+      {%-     if spec.read_only -%}
+      {%-       set _ = problems.append({
+                  'key': key, 'kind': 'read_only', 'wanted': want,
+                  'detail': 'the firmware reports this attribute as read-only, so it can never be converged and would sit in permanent drift'
+                }) -%}
+      {%-     elif spec.type == 'Enumeration' and spec.allowed | length > 0
+                and (want | string) not in spec.allowed -%}
+      {%-       set _ = problems.append({
+                  'key': key, 'kind': 'invalid_value', 'wanted': want,
+                  'detail': 'not an allowed value; the firmware accepts ' ~ (spec.allowed | join(', '))
+                }) -%}
+      {%-     elif spec.type == 'Integer' and spec.lower is not none
+                and (want | int) < (spec.lower | int) -%}
+      {%-       set _ = problems.append({
+                  'key': key, 'kind': 'out_of_range', 'wanted': want,
+                  'detail': 'below the firmware minimum of ' ~ spec.lower
+                }) -%}
+      {%-     elif spec.type == 'Integer' and spec.upper is not none
+                and (want | int) > (spec.upper | int) -%}
+      {%-       set _ = problems.append({
+                  'key': key, 'kind': 'out_of_range', 'wanted': want,
+                  'detail': 'above the firmware maximum of ' ~ spec.upper
+                }) -%}
+      {%-     endif -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ problems }}
+  changed_when: false
+  when: bios_registry_available | bool
+
+- name: Report a validated baseline
+  ansible.builtin.debug:
+    msg: >-
+      Baseline validated against {{ bios_registry_name }}:
+      {{ bios_baseline | length }} attribute(s), all present, settable and
+      within the firmware's allowed values.
+  changed_when: false
+  when:
+    - bios_registry_available | bool
+    - bios_baseline_problems | length == 0
+
+# Fails rather than warns.
+#
+# A baseline the firmware cannot accept is not a degraded audit, it is a wrong
+# one: the affected keys either compare against nothing or would be rejected on
+# apply. Continuing would produce a report that looks like a result. That is the
+# exact failure this role already shipped once.
+- name: Refuse to audit against a baseline the firmware rejects
+  ansible.builtin.fail:
+    msg: >-
+      Baseline validation failed against {{ bios_registry_name }} on
+      {{ parent_host | default(inventory_hostname) }} --
+      {{ bios_baseline_problems | length }} problem(s):
+      {% for p in bios_baseline_problems %}
+      [{{ p.kind }}] {{ p.key }} = {{ p.wanted }} -- {{ p.detail }};
+      {% endfor %}
+  when:
+    - bios_registry_available | bool
+    - bios_baseline_problems | length > 0

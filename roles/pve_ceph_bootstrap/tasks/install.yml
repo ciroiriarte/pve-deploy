@@ -1,0 +1,49 @@
+---
+# B1 - install Ceph packages on every node.
+#
+# GOTCHA (from the Phase B change report): `pveceph install` shells out to apt,
+# which prompts "Do you want to continue? [Y/n]" even under
+# DEBIAN_FRONTEND=noninteractive. The first hand-run wedged on this prompt inside
+# screen. Force it non-interactive by dropping an APT Assume-Yes config in for the
+# duration of the install and removing it afterwards. The removal is in `always`
+# so a failed install cannot leave the override behind.
+- name: Install Ceph with a temporary APT non-interactive override.
+  block:
+    - name: Add the temporary APT Assume-Yes override on every Ceph node.
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/90ceph-assumeyes
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          // Managed by pve-deploy (pve_ceph_bootstrap). Temporary: forces the apt
+          // call inside `pveceph install` to run non-interactively. Removed after.
+          APT::Get::Assume-Yes "true";
+      loop: "{{ pve_ceph_nodes }}"
+      loop_control:
+        label: "{{ item }}"
+      delegate_to: "{{ item }}"
+
+    - name: Install Ceph packages on every node ({{ pve_ceph_release }}).
+      ansible.builtin.command:
+        cmd: >-
+          pveceph install --version {{ pve_ceph_release }}
+          --repository {{ pve_ceph_repository }}
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      loop: "{{ pve_ceph_nodes }}"
+      loop_control:
+        label: "{{ item }}"
+      delegate_to: "{{ item }}"
+      register: pve_ceph_bootstrap_install
+      changed_when: pve_ceph_bootstrap_install.rc == 0
+
+  always:
+    - name: Remove the temporary APT Assume-Yes override from every node.
+      ansible.builtin.file:
+        path: /etc/apt/apt.conf.d/90ceph-assumeyes
+        state: absent
+      loop: "{{ pve_ceph_nodes }}"
+      loop_control:
+        label: "{{ item }}"
+      delegate_to: "{{ item }}"

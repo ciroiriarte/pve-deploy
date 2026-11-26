@@ -1,0 +1,12 @@
+---
+galaxy_info:
+  author: "PVE Automation Team"
+  description: "Enforces OS baseline configuration for Proxmox VE 9.2 nodes"
+  license: "MIT"
+  min_ansible_version: "2.15.0"
+  platforms:
+    - name: Debian
+      versions:
+        - trixie
+dependencies:
+  - role: pve_repos

@@ -1,0 +1,37 @@
+{{ ansible_managed | comment }}
+! PVE SDN North/South per-VRF eBGP override (merged by PVE::Network::SDN::Frr via the
+! /etc/frr/frr.conf.local symlink). Cluster-wide (pmxcfs); update-source makes each node
+! peer from its own transit IP. Leak-safe by construction: import default-only; export ONLY
+! the listed tenant VNet subnets (transit /29, underlay, L3VNI are never advertised).
+ip prefix-list PL-DEFAULT-ONLY seq 5 permit 0.0.0.0/0
+route-map RM-NS-IMPORT permit 10
+ match ip address prefix-list PL-DEFAULT-ONLY
+!
+{% for t in pve_sdn_ns_transits %}
+{% set pl = 'PL-' ~ t.vrf | upper | replace('VRF_', '') ~ '-EXPORT' %}
+{% set rm = 'RM-' ~ t.vrf | upper | replace('VRF_', '') ~ '-EXPORT' %}
+{% if t.export_prefixes | default([]) | length > 0 %}
+{% for p in t.export_prefixes %}
+ip prefix-list {{ pl }} seq {{ loop.index * 5 }} permit {{ p }}
+{% endfor %}
+{% else %}
+ip prefix-list {{ pl }} seq 5 deny 0.0.0.0/0 le 32
+{% endif %}
+route-map {{ rm }} permit 10
+ match ip address prefix-list {{ pl }}
+!
+{% endfor %}
+{% for t in pve_sdn_ns_transits %}
+{% set rm = 'RM-' ~ t.vrf | upper | replace('VRF_', '') ~ '-EXPORT' %}
+router bgp {{ pve_sdn_local_asn }} vrf {{ t.vrf }}
+ neighbor {{ t.fg_neighbor }} remote-as {{ t.fg_asn }}
+ neighbor {{ t.fg_neighbor }} update-source vmbr1.{{ t.vlan }}
+ address-family ipv4 unicast
+{% for p in t.export_prefixes | default([]) %}
+  network {{ p }}
+{% endfor %}
+  neighbor {{ t.fg_neighbor }} route-map {{ rm }} out
+  neighbor {{ t.fg_neighbor }} route-map RM-NS-IMPORT in
+ exit-address-family
+!
+{% endfor %}

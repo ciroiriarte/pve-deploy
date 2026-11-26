@@ -1,0 +1,38 @@
+---
+# pve_sdn — declare the PVE SDN EVPN config-of-record (controller + zones, and
+# optionally VNets/subnets) idempotently via pvesh, then apply. SDN config lives in
+# pmxcfs (cluster-wide), so the role runs once from any cluster node.
+#
+# The apply (`pvesh set /cluster/sdn`) triggers an ifreload. On this fleet that is
+# safe because the SDN bond MAC is pinned (pve_network) — no promisc and
+# no reboot-after-apply needed. On a cluster without that fix, set pve_sdn_apply:false
+# and apply under supervision.
+
+# Run `pvesh set /cluster/sdn` after declaring objects (only when something changed).
+pve_sdn_apply: true
+
+# EVPN controllers. Each: {id, type, asn, peers}. peers = comma-separated VTEP IPs.
+pve_sdn_controllers: []
+
+# EVPN zones = VRFs. Each: {id, type, controller, vrf_vxlan, ipam, mtu (optional)}.
+# mtu is the OVERLAY MTU: it sets the vnet bridge + anycast SVI the guests see, and is
+# independent of the underlay MTU. Pin it to 1500 for standard guests — a jumbo underlay
+# only prevents fragmentation of the encapsulated frame; it does NOT make the vnet bridge
+# 1500 on its own (an unset zone mtu on a jumbo uplink can bring the bridge up larger than
+# 1500, blackholing MTU-inheriting guests/containers toward 1500 peers). MTU is a zone
+# attribute in PVE (applies to all vnets in the zone).
+pve_sdn_zones: []
+
+# VNets + their anycast-gateway subnets. Each:
+#   {id, zone, tag, subnets: [{cidr, gateway}]}
+# Empty by default — populated per-site when tenant subnets migrate onto the overlay.
+pve_sdn_vnets: []
+
+# North/South: per-VRF eBGP from the PVE exit-nodes (all nodes, ECMP) to external
+# routers (e.g. FortiGate tenant VDOMs), via the frr.conf.local override. Off by default.
+pve_sdn_ns_enabled: false
+pve_sdn_local_asn: 4200000006
+pve_sdn_ns_transit_mtu: 1500
+# Each transit: {vrf, vlan, transit_net (the /29), node_ip_first (last octet of node-0's
+# transit IP; +node index), fg_neighbor, fg_asn, export_prefixes (tenant VNet subnets)}.
+pve_sdn_ns_transits: []

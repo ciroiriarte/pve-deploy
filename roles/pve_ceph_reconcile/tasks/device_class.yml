@@ -1,0 +1,56 @@
+---
+# C1 - reclass every OSD to the real medium, then create a class-scoped rule.
+#
+# GOTCHA: the drives present as /dev/sdX behind the MegaRAID, so bootstrap left
+# them as device class `ssd`. Reclass to nvme so CRUSH placement matches the
+# medium and the class-scoped rule can select them. Both operations are guarded
+# so a re-run does nothing.
+- name: List all OSD ids.
+  ansible.builtin.command:
+    cmd: ceph osd ls -f json
+  delegate_to: "{{ pve_ceph_first_node }}"
+  register: pve_ceph_reconcile_osd_ls
+  changed_when: false
+
+- name: Read OSD ids already on the target device class.
+  # -f json makes ls-osd emit a JSON array ([0,1,...]); without it the output is
+  # newline-separated ids, which from_json cannot parse.
+  ansible.builtin.command:
+    cmd: ceph osd crush class ls-osd {{ pve_ceph_device_class }} -f json
+  delegate_to: "{{ pve_ceph_first_node }}"
+  register: pve_ceph_reconcile_class_members
+  changed_when: false
+  # The class may not exist yet on a fresh bootstrap; the command then errors with
+  # empty stdout. failed_when:false + default('[]', true) below treats that as
+  # "no OSD is on this class yet", the correct starting assumption.
+  failed_when: false
+
+- name: Reclass OSDs that are not yet on the target device class.
+  ansible.builtin.shell:
+    cmd: >-
+      ceph osd crush rm-device-class osd.{{ item }} &&
+      ceph osd crush set-device-class {{ pve_ceph_device_class }} osd.{{ item }}
+  delegate_to: "{{ pve_ceph_first_node }}"
+  loop: "{{ pve_ceph_reconcile_osd_ls.stdout | default('[]', true) | from_json }}"
+  loop_control:
+    label: "osd.{{ item }}"
+  when: (item | int) not in (pve_ceph_reconcile_class_members.stdout | default('[]', true) | from_json)
+  register: pve_ceph_reconcile_reclass
+  changed_when: pve_ceph_reconcile_reclass.rc == 0
+
+- name: Read existing CRUSH rules.
+  ansible.builtin.command:
+    cmd: ceph osd crush rule ls
+  delegate_to: "{{ pve_ceph_first_node }}"
+  register: pve_ceph_reconcile_rule_ls
+  changed_when: false
+
+- name: Create the class-scoped CRUSH rule (host failure domain).
+  ansible.builtin.command:
+    cmd: >-
+      ceph osd crush rule create-replicated {{ pve_ceph_crush_rule }}
+      default {{ pve_ceph_crush_failure_domain }} {{ pve_ceph_device_class }}
+  delegate_to: "{{ pve_ceph_first_node }}"
+  when: pve_ceph_crush_rule not in (pve_ceph_reconcile_rule_ls.stdout_lines | default([]))
+  register: pve_ceph_reconcile_rule_create
+  changed_when: pve_ceph_reconcile_rule_create.rc == 0

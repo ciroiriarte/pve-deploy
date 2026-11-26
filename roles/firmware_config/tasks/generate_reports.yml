@@ -1,0 +1,45 @@
+---
+- name: Set timestamp for firmware evidence document
+  ansible.builtin.set_fact:
+    stamp: "{{ lookup('pipe', 'date +%Y-%m-%dT%H%M') }}"
+  changed_when: false
+
+- name: Ensure evidence and report directories exist on control node
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  delegate_to: localhost
+  loop:
+    - "{{ evidence_dir }}"
+    - "{{ reports_dir }}"
+  changed_when: false
+
+- name: Render firmware JSON evidence document on control node
+  ansible.builtin.template:
+    src: firmware_evidence.json.j2
+    dest: "{{ evidence_dir }}/{{ parent_host }}-firmware-{{ stamp }}.json"
+    mode: "0644"
+  delegate_to: localhost
+  changed_when: false
+
+- name: Render firmware assessment JSON payload on control node
+  ansible.builtin.template:
+    src: firmware_report_payload.json.j2
+    dest: "{{ reports_dir }}/{{ parent_host }}-firmware-assessment.json"
+    mode: "0644"
+  delegate_to: localhost
+  changed_when: false
+
+- name: Emit assessment report via tools/report.py
+  ansible.builtin.command:
+    cmd: >-
+      python3 tools/report.py render
+      {{ reports_dir }}/{{ parent_host }}-firmware-assessment.json
+      --out {{ reports_dir }}/
+      --force
+    chdir: "{{ pve_deploy_root }}"
+  delegate_to: localhost
+  register: firmware_report_render
+  failed_when: firmware_report_render.rc != 0
+  changed_when: false

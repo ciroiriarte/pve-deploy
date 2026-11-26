@@ -1,0 +1,88 @@
+---
+- name: Configure Proxmox VE firewall safely.
+  tags:
+    - firewall
+    - phase15
+  block:
+    - name: Initialize firewall role state.
+      ansible.builtin.set_fact:
+        pve_firewall_outcome: "success"
+        pve_firewall_changes: []
+        pve_firewall_verification: []
+      changed_when: false
+
+    - name: Validate requested firewall implementation.
+      ansible.builtin.assert:
+        that:
+          - pve_firewall_implementation in ['iptables', 'nftables']
+        fail_msg: "pve_firewall_implementation must be either iptables or nftables."
+        quiet: true
+      changed_when: false
+
+    - name: Derive segment aliases and IPSets from generated network catalog.
+      ansible.builtin.include_tasks: aliases.yml
+
+    - name: Converge datacenter firewall rules before any enable action.
+      ansible.builtin.include_tasks: rules_cluster.yml
+
+    - name: Converge node firewall rules before datacenter enable.
+      ansible.builtin.include_tasks: rules_node.yml
+
+    - name: Enable datacenter firewall with rollback verification.
+      ansible.builtin.include_tasks: enable.yml
+      when: pve_firewall_enable | bool
+      tags:
+        - enable
+
+    - name: Render firewall change report payload.
+      ansible.builtin.template:
+        src: firewall_report_payload.json.j2
+        dest: "{{ reports_dir }}/{{ inventory_hostname }}-firewall-change.json"
+        mode: "0644"
+      delegate_to: localhost
+      changed_when: false
+
+    - name: Emit firewall change report via tools/report.py.
+      ansible.builtin.command:
+        cmd: >-
+          python3 tools/report.py render
+          {{ reports_dir }}/{{ inventory_hostname }}-firewall-change.json
+          --out {{ reports_dir }}/
+          --force
+        chdir: "{{ pve_deploy_root }}"
+      delegate_to: localhost
+      register: pve_firewall_report_render
+      failed_when: pve_firewall_report_render.rc != 0
+      changed_when: false
+
+  rescue:
+    - name: Mark firewall role as failed for reporting.
+      ansible.builtin.set_fact:
+        pve_firewall_outcome: "failed"
+        pve_firewall_failure_reason: "{{ ansible_failed_result.msg | default('pve_firewall role failed') }}"
+      changed_when: false
+
+    - name: Render firewall failure report payload.
+      ansible.builtin.template:
+        src: firewall_report_payload.json.j2
+        dest: "{{ reports_dir }}/{{ inventory_hostname }}-firewall-change.json"
+        mode: "0644"
+      delegate_to: localhost
+      changed_when: false
+
+    - name: Emit firewall failure report via tools/report.py.
+      ansible.builtin.command:
+        cmd: >-
+          python3 tools/report.py render
+          {{ reports_dir }}/{{ inventory_hostname }}-firewall-change.json
+          --out {{ reports_dir }}/
+          --force
+        chdir: "{{ pve_deploy_root }}"
+      delegate_to: localhost
+      register: pve_firewall_failure_report_render
+      failed_when: pve_firewall_failure_report_render.rc != 0
+      changed_when: false
+
+    - name: Fail after firewall rescue reporting.
+      ansible.builtin.fail:
+        msg: "{{ pve_firewall_failure_reason }}"

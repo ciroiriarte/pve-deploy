@@ -1,0 +1,126 @@
+---
+- name: Bootstrap a Ceph cluster on the PVE cluster (Phase B).
+  tags:
+    - ceph_bootstrap
+    - phase16
+  block:
+    - name: Initialize Ceph bootstrap role state.
+      ansible.builtin.set_fact:
+        pve_ceph_bootstrap_outcome: "success"
+        pve_ceph_bootstrap_verification: []
+      run_once: true
+      changed_when: false
+
+    # Human gate. Same shape as pve_firewall's datacenter enable: refuse to touch
+    # storage unless an operator explicitly confirms this one-shot, destructive run.
+    - name: Refuse to bootstrap Ceph without an explicit confirmation.
+      ansible.builtin.assert:
+        that:
+          - pve_ceph_bootstrap_confirm | bool
+        fail_msg: >-
+          pve_ceph_bootstrap is a one-shot, non-idempotent bootstrap that creates
+          monitors, managers and OSDs. Re-run with
+          -e pve_ceph_bootstrap_confirm=true only against a freshly clustered,
+          dataless fleet. Refusing to continue.
+        quiet: true
+      run_once: true
+      changed_when: false
+
+    - name: Assert the bootstrap inputs are present.
+      ansible.builtin.assert:
+        that:
+          - pve_ceph_nodes | length >= 3
+          - pve_ceph_first_node | length > 0
+          - pve_ceph_mon_nodes | length >= 3
+          - pve_ceph_public_network | length > 0
+          - pve_ceph_cluster_network | length > 0
+        fail_msg: >-
+          pve_ceph_bootstrap needs at least three PVE nodes and non-empty
+          pve_ceph_public_network / pve_ceph_cluster_network (site vars). Set the
+          Ceph public and cluster CIDRs before bootstrapping.
+        quiet: true
+      run_once: true
+      changed_when: false
+
+    - name: Install Ceph packages (B1).
+      ansible.builtin.include_tasks: install.yml
+      run_once: true
+
+    - name: Initialize Ceph and wait for ceph.conf to propagate (B2).
+      ansible.builtin.include_tasks: init.yml
+      run_once: true
+
+    - name: Create monitors (B3).
+      ansible.builtin.include_tasks: mons.yml
+      run_once: true
+
+    - name: Create managers (B4).
+      ansible.builtin.include_tasks: mgrs.yml
+      run_once: true
+
+    - name: Create OSDs from the guarded disk selection (B5).
+      ansible.builtin.include_tasks: osds.yml
+      run_once: true
+
+    - name: Collect bootstrap verification facts.
+      ansible.builtin.include_tasks: verify.yml
+      run_once: true
+
+    - name: Render Ceph bootstrap report payload.
+      ansible.builtin.template:
+        src: ceph_bootstrap_report_payload.json.j2
+        dest: "{{ reports_dir }}/ceph-bootstrap-change.json"
+        mode: "0644"
+      delegate_to: localhost
+      run_once: true
+      changed_when: false
+
+    - name: Emit Ceph bootstrap report via tools/report.py.
+      ansible.builtin.command:
+        cmd: >-
+          python3 tools/report.py render
+          {{ reports_dir }}/ceph-bootstrap-change.json
+          --out {{ reports_dir }}/
+          --force
+        chdir: "{{ pve_deploy_root }}"
+      delegate_to: localhost
+      run_once: true
+      register: pve_ceph_bootstrap_report_render
+      failed_when: pve_ceph_bootstrap_report_render.rc != 0
+      changed_when: false
+
+  rescue:
+    - name: Mark Ceph bootstrap as failed for reporting.
+      ansible.builtin.set_fact:
+        pve_ceph_bootstrap_outcome: "failed"
+        pve_ceph_bootstrap_failure_reason: "{{ ansible_failed_result.msg | default('pve_ceph_bootstrap role failed') }}"
+      run_once: true
+      changed_when: false
+
+    - name: Render Ceph bootstrap failure report payload.
+      ansible.builtin.template:
+        src: ceph_bootstrap_report_payload.json.j2
+        dest: "{{ reports_dir }}/ceph-bootstrap-change.json"
+        mode: "0644"
+      delegate_to: localhost
+      run_once: true
+      changed_when: false
+
+    - name: Emit Ceph bootstrap failure report via tools/report.py.
+      ansible.builtin.command:
+        cmd: >-
+          python3 tools/report.py render
+          {{ reports_dir }}/ceph-bootstrap-change.json
+          --out {{ reports_dir }}/
+          --force
+        chdir: "{{ pve_deploy_root }}"
+      delegate_to: localhost
+      run_once: true
+      register: pve_ceph_bootstrap_failure_render
+      failed_when: pve_ceph_bootstrap_failure_render.rc != 0
+      changed_when: false
+
+    - name: Fail after Ceph bootstrap rescue reporting.
+      ansible.builtin.fail:
+        msg: "{{ pve_ceph_bootstrap_failure_reason }}"
+      run_once: true

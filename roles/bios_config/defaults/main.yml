@@ -1,0 +1,93 @@
+---
+# Default variables for bios_config role
+
+# Audit mode flag: MUST default to true. ZERO writes to BMC or hardware.
+bios_config_audit_only: true
+
+# BMC connection defaults.
+# bmc_password is deliberately NOT defaulted: an empty default would satisfy an
+# "is defined" assertion and turn a missing vault into a confusing auth failure
+# against every BMC. Supply it from group_vars/bmc/vault.yml.
+bmc_username: "USERID"
+bmc_validate_certs: false
+bmc_timeout: 30
+
+# Deployment tier stamped into report metadata. Names the tier, not a path.
+environment_name: "production"
+
+# Directory name under environments/ holding this site's evidence.
+pve_site_name: "default"
+
+# Repository root, resolved from the playbook location rather than the caller's
+# working directory, so the tools are found no matter where ansible-playbook
+# was invoked from.
+pve_deploy_root: "{{ (playbook_dir ~ '/..') | realpath }}"
+
+# Site data root: where per-deployment records are written. Defaults to this
+# checkout; point it at a site repository to keep records out of the tool repo.
+pve_site_root: "{{ pve_deploy_root }}"
+
+# Evidence and report directories on the control node
+evidence_dir: "{{ pve_site_root }}/environments/{{ pve_site_name }}/evidence"
+reports_dir: "{{ pve_site_root }}/reports"
+
+# Audit result counters.
+#
+# Defined here, not only in audit_bios.yml, because the rescue path renders the
+# same evidence and report templates without having run the audit. Initialising
+# them solely on the success path made the error handler itself fail with
+# "'bios_audit_critical_count' is undefined", which masked the original error.
+bios_audit_outcome: "failed"
+bios_audit_critical_count: 0
+bios_audit_warning_count: 0
+bios_audit_match_count: 0
+bios_audit_absent_count: 0
+bios_drift_items: []
+bios_pending_attributes: {}
+bios_attributes: {}
+bios_evidence_source: "none"
+
+# Registry state. Defined here because the rescue path renders reports without
+# having reached the fetch.
+bios_registry: {}
+bios_registry_name: ""
+bios_registry_available: false
+bios_baseline_problems: []
+
+# Baseline BIOS configuration dictionary (Lenovo XCC attribute names).
+#
+# SEPARATOR: XCC uses '_' between namespace and attribute, NOT '.'. Every key
+# here previously used dots, so all ten missed, every node reported
+# "absent" for the whole baseline, and the audit still called itself a success.
+# Verified against the live 421-attribute dump from XCC on a production SR655 V3
+# fleet (evidence 2026-07-26T1933). Two keys additionally sat in the wrong
+# namespace and one value carried a space the firmware does not use:
+#
+#   Processors.IOMMU        -> DevicesandIOPorts_IOMMU
+#   Processors.SEVControl   -> Memory_SEVControl
+#   "Maximum Performance"   -> MaximumPerformance
+#
+# Attribute names are firmware-version-specific: a BIOS/XCC upgrade can rename
+# or move keys. Re-verify this map against a fresh dump after any firmware
+# change rather than assuming it survived.
+bios_baseline:
+  SecureBootConfiguration_SecureBootSetting: Disabled
+  OperatingModes_ChooseOperatingMode: MaximumPerformance
+  Processors_SEV_SNPSupport: Enabled
+  Processors_SVMMode: Enabled
+  Processors_SMTMode: Enabled
+  DevicesandIOPorts_IOMMU: Enabled
+  Memory_SEVControl: Enabled
+  DevicesandIOPorts_SRIOV: Enabled
+  Memory_NUMANodesperSocket: NPS1
+  Memory_Interleave: Enabled
+
+# Attribute whose drift is treated as critical rather than a warning.
+# Referenced by name in evaluate_key.yml, which hardcoded the dotted spelling
+# and so never matched once the separator was corrected.
+bios_critical_attribute: SecureBootConfiguration_SecureBootSetting
+
+# Value the Mellanox per-port VirtualizationMode attribute reports when SR-IOV
+# is active. The firmware spells it with an underscore; comparing against the
+# marketing spelling "SR-IOV" made every correctly-configured port report drift.
+bios_nic_sriov_value: SR_IOV

@@ -1,0 +1,19 @@
+---
+galaxy_info:
+  author: pve-deploy team
+  description: Audit BIOS settings against a site-defined production baseline via Redfish / Lenovo XCC
+  company: Proxmox VE Infrastructure
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: EL
+      versions:
+        - all
+    - name: GenericLinux
+      versions:
+        - all
+  galaxy_tags:
+    - system
+    - monitoring
+
+dependencies: []

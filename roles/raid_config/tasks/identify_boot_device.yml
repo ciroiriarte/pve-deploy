@@ -1,0 +1,165 @@
+---
+# Boot-device identification, from structure rather than from names.
+#
+# SAFETY: the only job of this file is to decide whether the boot device can be
+# named WITH CONFIDENCE. Getting it wrong is not cosmetic -- if the real boot
+# device is not excluded, it stays in ceph_osd_candidates and a later apply
+# phase would destroy a running node's operating system.
+#
+# The rule is: prove it, or declare low confidence. A guess that happens to be
+# right most of the time is worse than an honest "unverified", because it
+# removes the operator's reason to look.
+#
+# WHY THIS NO LONGER MATCHES ON NAMES
+#
+# The previous implementation matched a volume's Name against a boot pattern and
+# fell back to matching drive names against /m\.?2/. Against real Lenovo
+# hardware both miss completely: the RAID1 boot volume's Name is the empty
+# string, and the M.2 drive model reads "Micron_7450_MTFDKBA480TFR", which
+# contains no "m.2". Confidence was therefore never established, every drive was
+# reported "unverified", and the role produced nothing actionable.
+#
+# The evidence needed was present the whole time. A volume states its members
+# explicitly, and the member id matches the drive id exactly -- both spell it
+# "Disk.M.2_Bay_0". That is a factual join, not an inference from a label.
+
+- name: Initialise boot-device facts to the safe default
+  # These MUST exist on every code path. Referencing an undefined
+  # boot_device_confident later is itself a failure mode.
+  ansible.builtin.set_fact:
+    boot_device_confident: false
+    boot_device_identifiers: []
+    boot_disk_redundancy: "unknown"
+    boot_device_evidence: "none"
+    volume_member_ids: []
+    boot_volume_candidates: []
+  changed_when: false
+
+# Membership is a fact about the hardware, independent of which volume is the
+# OS. It is computed first and applied unconditionally: a drive belonging to a
+# configured volume is in use and is never an OSD candidate, whether or not the
+# boot volume was subsequently identified.
+- name: Collect the ids of every drive that belongs to a configured volume
+  ansible.builtin.set_fact:
+    volume_member_ids: >-
+      {%- set ids = [] -%}
+      {%- for v in virtual_disks | default([]) -%}
+      {%-   for m in v.member_ids | default([]) -%}
+      {%-     if m and m not in ids -%}{%- set _ = ids.append(m) -%}{%- endif -%}
+      {%-   endfor -%}
+      {%- endfor -%}
+      {{ ids }}
+  changed_when: false
+
+# Scoring, not pattern matching. Each signal is independently checkable against
+# the evidence, and two are required -- the "at least two independent signals"
+# rule. One signal is never enough to authorise excluding a device from
+# destruction, because a single signal is exactly what produced the false
+# confidence this file exists to avoid.
+- name: Score each configured volume on independent boot signals
+  ansible.builtin.set_fact:
+    boot_volume_candidates: >-
+      {%- set scored = [] -%}
+      {%- for v in virtual_disks | default([]) -%}
+      {%-   set signals = [] -%}
+      {%-   if v.raid_type in ['RAID1', 'RAID10', 'Mirrored'] -%}
+      {%-     set _ = signals.append('mirrored volume (' ~ v.raid_type ~ ')') -%}
+      {%-   endif -%}
+      {%-   if (virtual_disks | length) == 1 -%}
+      {%-     set _ = signals.append('sole configured volume on the host') -%}
+      {%-   endif -%}
+      {%-   set m2 = [] -%}
+      {%-   for d in physical_drives | default([]) -%}
+      {%-     if d.id in v.member_ids and 'm.2' in (d.location | lower) -%}
+      {%-       set _ = m2.append(d.id) -%}
+      {%-     endif -%}
+      {%-   endfor -%}
+      {%-   if m2 | length > 0 and m2 | length == v.member_ids | length -%}
+      {%-     set _ = signals.append('every member reports an M.2 bay location') -%}
+      {%-   endif -%}
+      {%-   if v.name and v.name is search(boot_volume_name_pattern) -%}
+      {%-     set _ = signals.append('volume name matches the boot pattern') -%}
+      {%-   endif -%}
+      {%-   if signals | length >= 2 -%}
+      {%-     set _ = scored.append({'volume': v, 'signals': signals}) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ scored }}
+  changed_when: false
+
+- name: Accept the boot volume only when exactly one candidate qualifies
+  # Exactly one. Two or more means the OS volume cannot be told apart, and
+  # "pick the first" is precisely the guess this file exists to avoid.
+  when: boot_volume_candidates | length == 1
+  block:
+    - name: Record the identified boot volume
+      vars:
+        chosen: "{{ boot_volume_candidates[0] }}"
+      ansible.builtin.set_fact:
+        boot_device_confident: true
+        boot_disk_redundancy: >-
+          {{ (chosen.volume.raid_type in ['RAID1', 'RAID10', 'Mirrored'])
+             | ternary('mirrored', 'single_device') }}
+        boot_device_evidence: >-
+          volume '{{ chosen.volume.name | default('(unnamed)') }}' on
+          {{ chosen.volume.controller | default('unknown controller') }};
+          signals: {{ chosen.signals | join('; ') }}
+      changed_when: false
+
+    # Identifiers carry BOTH the volume member id and the drive serial. The id
+    # is what the volume names; the serial is what an operator reads off the
+    # chassis, and what a destructive operation should be keyed on.
+    - name: Derive boot device identifiers from the volume's members
+      vars:
+        chosen: "{{ boot_volume_candidates[0] }}"
+      ansible.builtin.set_fact:
+        boot_device_identifiers: >-
+          {%- set ids = [] -%}
+          {%- for m in chosen.volume.member_ids -%}
+          {%-   if m not in ids -%}{%- set _ = ids.append(m) -%}{%- endif -%}
+          {%- endfor -%}
+          {%- for d in physical_drives | default([]) -%}
+          {%-   if d.id in chosen.volume.member_ids -%}
+          {%-     if d.serial and d.serial != 'Unknown Serial' and d.serial not in ids -%}
+          {%-       set _ = ids.append(d.serial) -%}
+          {%-     endif -%}
+          {%-   endif -%}
+          {%- endfor -%}
+          {{ ids }}
+      changed_when: false
+
+- name: Report an ambiguous boot volume rather than choosing one
+  when: boot_volume_candidates | length > 1
+  ansible.builtin.set_fact:
+    boot_device_evidence: >-
+      ambiguous: {{ boot_volume_candidates | length }} volumes each satisfied two
+      or more boot signals; refusing to choose
+  changed_when: false
+
+- name: Report that no volume met the evidence bar
+  when:
+    - boot_volume_candidates | length == 0
+    - virtual_disks | default([]) | length > 0
+  ansible.builtin.set_fact:
+    boot_device_evidence: >-
+      {{ virtual_disks | length }} configured volume(s) present but none met two
+      independent boot signals
+  changed_when: false
+
+- name: Report that the host has no configured volumes at all
+  when: virtual_disks | default([]) | length == 0
+  ansible.builtin.set_fact:
+    boot_device_evidence: >-
+      no configured volumes; either a boot mirror has not been created yet, or
+      the OS boots from a device this audit cannot see
+  changed_when: false
+
+- name: Warn loudly when the boot device could not be established
+  # The report marks every candidate "unverified" in this case; this makes the
+  # reason visible during the run as well, so it is not discovered later.
+  when: not boot_device_confident
+  ansible.builtin.debug:
+    msg: >-
+      BOOT DEVICE NOT CONFIRMED on {{ parent_host | default(inventory_hostname) }}
+      ({{ boot_device_evidence }}). Every drive will be reported as 'unverified'
+      and MUST be confirmed by hand before any destructive storage operation.

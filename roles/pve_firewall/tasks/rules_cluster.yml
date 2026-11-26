@@ -1,0 +1,196 @@
+---
+- name: Reset NMS poller SNMP monitoring rule accumulator (datacenter).
+  ansible.builtin.set_fact:
+    pve_firewall_monitoring_rules: []
+  changed_when: false
+  run_once: true
+  delegate_to: localhost
+  tags:
+    - firewall
+    - phase15
+
+- name: Build NMS poller SNMP monitoring rules (datacenter).
+  ansible.builtin.set_fact:
+    pve_firewall_monitoring_rules: "{{ pve_firewall_monitoring_rules + [rule] }}"
+  vars:
+    rule:
+      comment: "pve-deploy allow SNMP {{ item.1 }} from NMS poller {{ item.0 }}"
+      type: "in"
+      action: "ACCEPT"
+      proto: "{{ item.1 }}"
+      dport: "{{ pve_firewall_ports.snmp }}"
+      source: "{{ item.0 }}"
+      enable: 1
+  loop: "{{ pve_firewall_nms_pollers | product(pve_firewall_snmp_protocols) | list }}"
+  when: pve_firewall_nms_pollers | length > 0
+  changed_when: false
+  run_once: true
+  delegate_to: localhost
+  tags:
+    - firewall
+    - phase15
+
+- name: Add NMS poller ICMP monitoring rules (datacenter).
+  # LibreNMS pings before polling; without ICMP the device is marked down and
+  # SNMP polling is skipped. One proto-only ICMP rule per poller (all types).
+  ansible.builtin.set_fact:
+    pve_firewall_monitoring_rules: "{{ pve_firewall_monitoring_rules + [rule] }}"
+  vars:
+    rule:
+      comment: "pve-deploy allow ICMP from NMS poller {{ item }}"
+      type: "in"
+      action: "ACCEPT"
+      proto: "icmp"
+      source: "{{ item }}"
+      enable: 1
+  loop: "{{ pve_firewall_nms_pollers }}"
+  when: pve_firewall_nms_pollers | length > 0
+  changed_when: false
+  run_once: true
+  delegate_to: localhost
+  tags:
+    - firewall
+    - phase15
+
+- name: Build N/S per-VRF eBGP transit rules (datacenter).
+  # The FG tenant VDOMs peer from their transit /29s, not the underlay ipset, so the
+  # EVPN underlay-BGP rule doesn't cover them. One TCP/179 accept per transit subnet.
+  ansible.builtin.set_fact:
+    pve_firewall_ns_bgp_rules: "{{ pve_firewall_ns_bgp_rules | default([]) + [rule] }}"
+  vars:
+    rule:
+      comment: "pve-deploy allow N/S eBGP from transit {{ item }}"
+      type: "in"
+      action: "ACCEPT"
+      proto: "tcp"
+      dport: "{{ pve_firewall_ports.bgp }}"
+      source: "{{ item }}"
+      enable: 1
+  loop: "{{ pve_firewall_ns_transit_bgp_sources | default([]) }}"
+  changed_when: false
+  run_once: true
+  delegate_to: localhost
+  tags:
+    - firewall
+    - phase15
+
+- name: Build desired datacenter firewall rule list.
+  ansible.builtin.set_fact:
+    pve_firewall_cluster_rules_desired: >-
+      {{
+        pve_firewall_cluster_rules_base
+        + (pve_firewall_cluster_rules_evpn if pve_firewall_sdn_evpn_enabled | bool else [])
+        + (pve_firewall_ns_bgp_rules | default([]))
+        + (pve_firewall_cluster_rules_validation if pve_firewall_allow_validation | bool else [])
+        + (pve_firewall_monitoring_rules | default([]))
+      }}
+  changed_when: false
+  run_once: true
+  delegate_to: localhost
+  tags:
+    - firewall
+    - phase15
+
+- name: Read current datacenter firewall rules.
+  ansible.builtin.command:
+    argv:
+      - "{{ pve_firewall_pc_bin }}"
+      - "api"
+      - "GET"
+      - "/cluster/firewall/rules"
+  delegate_to: localhost
+  register: pve_firewall_cluster_rules_get
+  changed_when: false
+  failed_when: pve_firewall_cluster_rules_get.rc != 0
+  no_log: "{{ pve_firewall_pc_no_log }}"
+  run_once: true
+  tags:
+    - firewall
+    - phase15
+
+- name: Normalize current datacenter firewall rules.
+  ansible.builtin.set_fact:
+    pve_firewall_cluster_rules_current: "{{ ((pve_firewall_cluster_rules_get.stdout | default('{\"data\": []}') | from_json).data | default([])) }}"
+  changed_when: false
+  run_once: true
+  delegate_to: localhost
+  tags:
+    - firewall
+    - phase15
+
+- name: Create missing datacenter firewall rules before enable.
+  # Use pc api with repeatable --data flags; this avoids pvesh and matches
+  # pve-cli v0.13's documented mutating API syntax.
+  ansible.builtin.command:
+    cmd: >-
+      {{ pve_firewall_pc_bin }} api POST /cluster/firewall/rules --yes
+      --data {{ ('type=' ~ item.type) | quote }}
+      --data {{ ('action=' ~ item.action) | quote }}
+      --data {{ ('proto=' ~ item.proto) | quote }}
+      {{ ('--data ' ~ (('dport=' ~ item.dport) | quote)) if (item.dport | default('') | string | length > 0) else '' }}
+      --data {{ ('source=' ~ item.source) | quote }}
+      --data {{ ('enable=' ~ (item.enable | string)) | quote }}
+      --data {{ ('comment=' ~ item.comment) | quote }}
+  delegate_to: localhost
+  loop: "{{ pve_firewall_cluster_rules_desired }}"
+  when:
+    - not ansible_check_mode
+    - item.comment not in (pve_firewall_cluster_rules_current | map(attribute='comment') | list)
+  register: pve_firewall_cluster_rule_create
+  changed_when: true
+  failed_when: pve_firewall_cluster_rule_create.rc != 0
+  no_log: "{{ pve_firewall_pc_no_log }}"
+  run_once: true
+  tags:
+    - firewall
+    - phase15
+
+- name: Read datacenter firewall rules after convergence.
+  ansible.builtin.command:
+    argv:
+      - "{{ pve_firewall_pc_bin }}"
+      - "api"
+      - "GET"
+      - "/cluster/firewall/rules"
+  delegate_to: localhost
+  register: pve_firewall_cluster_rules_verify
+  changed_when: false
+  failed_when: pve_firewall_cluster_rules_verify.rc != 0
+  no_log: "{{ pve_firewall_pc_no_log }}"
+  run_once: true
+  tags:
+    - firewall
+    - phase15
+
+- name: Verify required datacenter firewall rules are present.
+  ansible.builtin.assert:
+    that:
+      - "item.comment in (((pve_firewall_cluster_rules_verify.stdout | from_json).data | default([])) | map(attribute='comment') | list)"
+    fail_msg: "Missing required datacenter firewall rule: {{ item.comment }}"
+    quiet: true
+  loop: "{{ pve_firewall_cluster_rules_desired }}"
+  changed_when: false
+  run_once: true
+  delegate_to: localhost
+  tags:
+    - firewall
+    - phase15
+
+- name: Record datacenter firewall rule verification.
+  ansible.builtin.set_fact:
+    pve_firewall_verification: >-
+      {{
+        pve_firewall_verification + [
+          {
+            'name': 'Datacenter firewall rules present',
+            'command': pve_firewall_pc_bin ~ ' api GET /cluster/firewall/rules',
+            'expected': (pve_firewall_cluster_rules_desired | map(attribute='comment') | list | to_json),
+            'actual': (((pve_firewall_cluster_rules_verify.stdout | from_json).data | default([])) | map(attribute='comment') | list | to_json),
+            'result': 'pass'
+          }
+        ]
+      }}
+  changed_when: false
+  tags:
+    - firewall
+    - phase15

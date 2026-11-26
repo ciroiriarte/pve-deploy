@@ -1,0 +1,12 @@
+---
+galaxy_info:
+  role_name: pve_ceph_benchmark
+  author: pve-deploy
+  description: Temporary, gated Ceph pool-tier benchmark (rados bench + fio librbd) with guarded teardown.
+  license: MIT
+  min_ansible_version: "2.15"
+  platforms:
+    - name: Debian
+      versions:
+        - trixie
+dependencies: []

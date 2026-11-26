@@ -1,0 +1,117 @@
+---
+# The destructive step.
+#
+# Reached only with os_install_dry_run=false, on top of the phase gate that had
+# to be cleared to run this at all. From here the disks are being rewritten and
+# nothing in this role can undo it.
+
+- name: Read the current power state
+  ansible.builtin.uri:
+    url: "https://{{ ansible_host }}/redfish/v1/Systems/1"
+    method: GET
+    user: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_validate_certs }}"
+    timeout: "{{ bmc_timeout }}"
+  register: os_install_power
+  no_log: true
+  changed_when: false
+
+# Re-read rather than trusting the value from set_boot_override.
+#
+# `Once` overrides are consumed by a boot, and a machine can boot for reasons
+# this role did not cause -- a watchdog, a power event, someone at the console.
+# If that happened between the two tasks, the override is already spent and the
+# power cycle would boot the existing disk instead of the installer, producing a
+# run that reports an install it never performed.
+- name: Refuse to power cycle without a live boot override
+  ansible.builtin.fail:
+    msg: >-
+      {{ inventory_hostname }} is no longer set to boot from
+      {{ os_install_boot_target }} -- firmware now reports
+      target={{ ((os_install_power.json | default({})).Boot | default({})).BootSourceOverrideTarget | default('unset') }},
+      override={{ ((os_install_power.json | default({})).Boot | default({})).BootSourceOverrideEnabled | default('unset') }}.
+      Something rebooted this machine after the override was set and consumed
+      it. Re-run the dry run to re-establish the sequence before installing.
+  when: >-
+    ((os_install_power.json | default({})).Boot | default({})).BootSourceOverrideTarget | default('') != os_install_boot_target
+    or ((os_install_power.json | default({})).Boot | default({})).BootSourceOverrideEnabled | default('') != os_install_boot_override
+
+# The one deliberately loud message in the role. It is the last thing printed
+# before the disks go, and it names the host and the image so an operator
+# watching the run can still stop it with Ctrl-C.
+- name: Announce the point of no return
+  ansible.builtin.debug:
+    msg:
+      - "*** INSTALLING {{ inventory_hostname }} ({{ ansible_host }}) ***"
+      - "image      : {{ os_install_media_url }}"
+      - "fqdn       : {{ os_install_fqdn }}"
+      - "address    : {{ os_install_cidr }}"
+      - "disks      : all matching {{ os_install_disk_filter | default(os_install_disk_list) }} WILL BE ERASED"
+      - "power state: {{ (os_install_power.json | default({})).PowerState | default('unknown') }}"
+  changed_when: false
+
+# ForceRestart when on, On when off. There is no PowerCycle in XCC's
+# ResetActionInfo, and reset types are not interchangeable: ForceRestart on a
+# powered-off machine is rejected rather than treated as a power-on.
+- name: Choose the reset type for the current power state
+  ansible.builtin.set_fact:
+    os_install_reset: >-
+      {{ ((os_install_power.json | default({})).PowerState | default('Off') == 'On')
+         | ternary(os_install_reset_type, 'On') }}
+  changed_when: false
+
+# Set BEFORE the reset, not after, and this ordering is the whole point.
+#
+# This flag is what tells cleanup_media that the machine may be mid-install and
+# must not have its media pulled. It was originally set by a task AFTER the
+# reset -- so when that task failed, the reset had already fired, the flag was
+# unset, and cleanup concluded it was safe to detach a machine that was at that
+# moment booting into the installer. A guard that only exists once the dangerous
+# thing has succeeded does not guard the dangerous thing.
+#
+# Anything set here is true from the instant the reset is *attempted*. If the
+# reset itself fails the flag is still set, and the cost is a detach we skip
+# unnecessarily -- which is the direction to be wrong in.
+- name: Record that this host is being committed to an install
+  ansible.builtin.set_fact:
+    os_install_committed: true
+    # now() rather than ansible_date_time: this play runs gather_facts: false,
+    # so the fact does not exist and referencing it fails the task. That is
+    # exactly how the guard above got defeated.
+    os_install_started_at: "{{ now(utc=true).isoformat() }}"
+    os_install_reset_sent: "{{ os_install_reset }}"
+  changed_when: false
+
+- name: Boot into the installer
+  ansible.builtin.uri:
+    url: "https://{{ ansible_host }}/redfish/v1/Systems/1/Actions/ComputerSystem.Reset"
+    method: POST
+    body_format: json
+    body:
+      ResetType: "{{ os_install_reset }}"
+    user: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_validate_certs }}"
+    timeout: "{{ bmc_timeout }}"
+    status_code: [200, 202, 204]
+  no_log: true
+  changed_when: true
+
+- name: Confirm the machine is powered on
+  ansible.builtin.uri:
+    url: "https://{{ ansible_host }}/redfish/v1/Systems/1"
+    method: GET
+    user: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_validate_certs }}"
+    timeout: "{{ bmc_timeout }}"
+  register: os_install_power_after
+  no_log: true
+  until: (os_install_power_after.json | default({})).PowerState | default('') == 'On'
+  retries: 12
+  delay: 10
+  changed_when: false

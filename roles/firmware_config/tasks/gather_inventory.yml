@@ -1,0 +1,127 @@
+---
+# Reads the BMC's firmware inventory and normalizes it into one shape.
+
+- name: Initialize firmware inventory variables
+  ansible.builtin.set_fact:
+    firmware_inventory_items: []
+    firmware_inventory_raw: []
+    firmware_machine_type: ""
+  changed_when: false
+
+# The machine type gates catalog selection. A catalog assembled for a different
+# model must not be applied here. This is not hypothetical on the reference site: the four PVE
+# nodes are SR655 V3 (SKU 7D9ECTO1WW) while the backup node is SR665 V3 (SKU
+# 7D9ACTO1WW), so a baseline captured from one is wrong for the other.
+- name: Read the system model and machine type
+  ansible.builtin.uri:
+    url: "https://{{ ansible_host }}/redfish/v1/Systems/1"
+    method: GET
+    user: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_validate_certs }}"
+    timeout: "{{ bmc_timeout }}"
+    status_code: [200, 404]
+  register: firmware_system_response
+  no_log: true
+  failed_when: false
+  changed_when: false
+
+- name: Record the machine type
+  ansible.builtin.set_fact:
+    firmware_machine_type: >-
+      {{ (firmware_system_response.json | default({})).SKU
+         | default((firmware_system_response.json | default({})).Model | default('')) }}
+  changed_when: false
+
+# One expanded call rather than a collection fetch plus a GET per member. This
+# host exposes 30 components, and Lenovo XCC answers a sequential GET slowly
+# enough that the per-member form dominates the phase runtime.
+- name: Fetch the expanded firmware inventory
+  ansible.builtin.uri:
+    url: "https://{{ ansible_host }}/redfish/v1/UpdateService/FirmwareInventory?$expand=*"
+    method: GET
+    user: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_validate_certs }}"
+    timeout: "{{ bmc_timeout }}"
+    status_code: [200, 404]
+  register: firmware_inventory_response
+  # no_log hides the credentials in the module args, but it also hides the
+  # failure message. Tolerate the failure here and surface a sanitized message
+  # in the next task instead.
+  no_log: true
+  failed_when: false
+  changed_when: false
+
+- name: Surface a sanitized Redfish error when the inventory query failed
+  ansible.builtin.fail:
+    msg: >-
+      Redfish FirmwareInventory query failed on
+      {{ parent_host | default(inventory_hostname) }}:
+      {{ firmware_inventory_response.msg | default('no message returned') }}
+  when: firmware_inventory_response.status | default(0) != 200
+
+- name: Record the raw inventory members
+  ansible.builtin.set_fact:
+    firmware_inventory_raw: >-
+      {{ (firmware_inventory_response.json | default({})).Members | default([]) }}
+  changed_when: false
+
+# Classification and exclusion happen here so every consumer sees one shape,
+# already filtered to things that can actually be flashed.
+- name: Normalize and classify firmware components
+  ansible.builtin.set_fact:
+    firmware_inventory_items: >-
+      {%- set out = [] -%}
+      {%- for m in firmware_inventory_raw -%}
+      {%-   if m.Id is defined -%}
+      {%-     set excluded = [] -%}
+      {%-     for pat in firmware_component_exclude_patterns -%}
+      {%-       if m.Id is search(pat) -%}{%- set _ = excluded.append(pat) -%}{%- endif -%}
+      {%-     endfor -%}
+      {%-     set cls = [] -%}
+      {%-     for rule in firmware_component_class_patterns -%}
+      {%-       if cls | length == 0 and m.Id is search(rule.pattern) -%}
+      {%-         set _ = cls.append(rule.class) -%}
+      {%-       endif -%}
+      {%-     endfor -%}
+      {%-     if excluded | length == 0 -%}
+      {%-       set _ = out.append({
+                  'id': m.Id,
+                  'name': m.Name | default(m.Id),
+                  'version': m.Version | default(''),
+                  'updateable': m.Updateable | default(false),
+                  'class': (cls | first) if cls | length > 0 else 'unclassified',
+                  'excluded_by': ''
+                }) -%}
+      {%-     endif -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ out }}
+  changed_when: false
+
+# An empty inventory is a collection failure, not "the host has no firmware".
+# The BIOS audit reported a vacuous pass on exactly this shape.
+- name: Fail when the BMC returned no firmware components
+  ansible.builtin.fail:
+    msg: >-
+      No firmware components were collected from
+      {{ parent_host | default(inventory_hostname) }}
+      ({{ firmware_inventory_raw | length }} raw member(s) returned). This is a
+      collection failure, not evidence that the host carries no updatable
+      firmware. Check Redfish reachability before interpreting any result.
+  when: firmware_inventory_items | length == 0
+
+# A component the classifier does not recognise is reported, never silently
+# grouped into a class it might not belong to -- update ordering depends on the
+# class, and flashing a BMC as though it were a drive is not a small mistake.
+- name: Warn about firmware components the classifier did not recognise
+  ansible.builtin.debug:
+    msg: >-
+      {{ firmware_inventory_items | selectattr('class', 'equalto', 'unclassified') | map(attribute='id') | join(', ') }}
+      could not be classified on {{ parent_host | default(inventory_hostname) }},
+      so they are excluded from the update plan. Add a pattern to
+      firmware_component_class_patterns if any should be updatable.
+  when: firmware_inventory_items | selectattr('class', 'equalto', 'unclassified') | list | length > 0

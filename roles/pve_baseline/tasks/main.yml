@@ -1,0 +1,413 @@
+---
+- name: Configure Chrony NTP service
+  ansible.builtin.template:
+    src: chrony.conf.j2
+    dest: /etc/chrony/chrony.conf
+    owner: root
+    group: root
+    mode: "0644"
+  register: pve_baseline_chrony_conf
+  tags:
+    - phase10
+    - pve_baseline
+
+- name: Restart Chrony service
+  ansible.builtin.systemd_service:
+    name: chrony
+    state: restarted
+    enabled: true
+  when: pve_baseline_chrony_conf.changed
+  tags:
+    - phase10
+    - pve_baseline
+
+- name: Verify Chrony NTP synchronization
+  ansible.builtin.command:
+    cmd: chronyc sources
+  register: pve_baseline_chronyc_sources
+  changed_when: false
+  # Read-only probe, so run it under --check too. Without this the module is
+  # skipped in check mode and returns no stdout, so the until condition can
+  # never match and the task burns all ten retries before failing a dry run.
+  check_mode: false
+  until: "'*' in pve_baseline_chronyc_sources.stdout"
+  retries: 10
+  delay: 6
+  tags:
+    - phase10
+    - pve_baseline
+
+- name: Configure DNS resolution
+  ansible.builtin.template:
+    src: resolv.conf.j2
+    dest: /etc/resolv.conf
+    owner: root
+    group: root
+    mode: "0644"
+  tags:
+    - phase10
+    - pve_baseline
+
+- name: Install SSH operator authorized keys
+  ansible.builtin.authorized_key:
+    user: root
+    state: present
+    key: "{{ item }}"
+  loop: "{{ ssh_public_keys }}"
+  no_log: true
+  tags:
+    - phase10
+    - pve_baseline
+
+# Retire the install-time password.
+#
+# Phase 02 writes a password into the answer file, in cleartext, inside an ISO
+# that is published over plain HTTP so a BMC can fetch it. That is acceptable
+# only because it is meant to be short-lived: anyone who can reach the image can
+# read it, and the image names are predictable from the inventory. This is what
+# makes it short-lived.
+#
+# DELIBERATELY ORDERED AFTER the authorized_key task above. The keys are what
+# guarantees a way back in if the hash is wrong; rotating first would leave a
+# node with an unknown password and no key, recoverable only over the serial
+# console. Do not move this task earlier.
+#
+# root@pam authenticates against this same Linux password, so rotating it also
+# changes the PVE web UI login for the node.
+- name: Refuse a root password that is not a crypt hash
+  ansible.builtin.assert:
+    that:
+      - pve_root_password_hash is match('^\$[0-9a-z]+\$')
+    fail_msg: >-
+      pve_root_password_hash does not look like a crypt hash (expected something
+      like $6$...). The user module writes this value into /etc/shadow verbatim:
+      a cleartext password here is stored as if it were already hashed, which
+      does not set that password and leaves the account unable to authenticate
+      at all. Generate one with `mkpasswd -m sha512crypt` -- see docs/OPERATOR.md.
+    quiet: true
+  when: pve_root_password_hash | length > 0
+  changed_when: false
+  tags:
+    - phase10
+    - pve_baseline
+
+- name: Rotate the root password away from the install-time value
+  ansible.builtin.user:
+    name: root
+    password: "{{ pve_root_password_hash }}"
+  # The module compares the stored hash, so this is idempotent and reports
+  # changed only when the hash actually differs from what is in /etc/shadow.
+  when: pve_root_password_hash | length > 0
+  register: pve_baseline_root_password
+  no_log: true
+  tags:
+    - phase10
+    - pve_baseline
+
+# Unset is a legitimate choice for a site that manages root credentials
+# elsewhere, but it must not pass silently: the install-time password stays live
+# on the node, and it is readable by anyone who can fetch the installer image.
+- name: Warn when the install-time root password has not been rotated
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }}: pve_root_password_hash is unset, so the
+      install-time root password from phase 02 is still active. It is stored in
+      cleartext inside {{ inventory_hostname }}'s installer ISO. Set the hash, or
+      rotate the credential by another route.
+  when: pve_root_password_hash | length == 0
+  tags:
+    - phase10
+    - pve_baseline
+
+- name: Configure SSH hardening options
+  ansible.builtin.template:
+    src: sshd_pve.conf.j2
+    dest: /etc/ssh/sshd_config.d/pve_hardening.conf
+    owner: root
+    group: root
+    mode: "0600"
+  register: pve_baseline_sshd_conf
+  tags:
+    - phase10
+    - pve_baseline
+
+- name: Validate SSH daemon configuration prior to restart
+  ansible.builtin.command:
+    cmd: sshd -t
+  changed_when: false
+  when: pve_baseline_sshd_conf.changed
+  tags:
+    - phase10
+    - pve_baseline
+
+- name: Reload SSH service and socket unit on Debian Trixie
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    state: reloaded
+  loop:
+    - ssh.service
+    - ssh.socket
+  when: pve_baseline_sshd_conf.changed
+  failed_when: false
+  tags:
+    - phase10
+    - pve_baseline
+
+- name: Ensure APT keyring directory exists
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  tags:
+    - phase10
+    - pve_baseline
+
+# Same host as obs.sources.j2, and for the same reason: download.opensuse.org
+# redirects through MirrorBrain, which on this network can hand out an
+# IPv6-only mirror the nodes cannot reach. These key fetches have succeeded so
+# far only because their redirects happened to land somewhere usable -- that is
+# luck, not a property to depend on.
+- name: Add OpenSUSE Build Service GPG keys
+  ansible.builtin.get_url:
+    url: "https://{{ obs_repo_host }}/repositories/home:/ciriarte:/{{ item.repo }}/Debian_13/Release.key"
+    dest: "{{ item.dest }}"
+    mode: "0644"
+  loop:
+    - repo: pve-cli
+      dest: /etc/apt/keyrings/obs-home-ciriarte-pve-cli.asc
+    - repo: pve-tools
+      dest: /etc/apt/keyrings/obs-home-ciriarte-pve-tools.asc
+    - repo: network-tools
+      dest: /etc/apt/keyrings/obs-home-ciriarte-network-tools.asc
+  loop_control:
+    label: "{{ item.repo }}"
+  tags:
+    - phase10
+    - pve_baseline
+
+- name: Configure OpenSUSE Build Service APT source
+  ansible.builtin.template:
+    src: "{{ role_path }}/../pve_repos/templates/obs.sources.j2"
+    dest: /etc/apt/sources.list.d/obs-tools.sources
+    owner: root
+    group: root
+    mode: "0644"
+  register: pve_baseline_obs_source
+  tags:
+    - phase10
+    - pve_baseline
+
+- name: Install baseline operating packages
+  ansible.builtin.apt:
+    name: "{{ pve_baseline_packages }}"
+    state: present
+    update_cache: "{{ pve_baseline_obs_source.changed }}"
+  tags:
+    - phase10
+    - pve_baseline
+
+- name: Read current kernel command line
+  ansible.builtin.slurp:
+    src: /etc/kernel/cmdline
+  register: pve_baseline_cmdline_current
+  failed_when: false
+  tags:
+    - phase10
+    - pve_baseline
+
+# Every cluster member resolvable from every other, on the management network.
+#
+# Corosync and pvecm resolve peers by name, and a Proxmox cluster is built and
+# repaired at moments when DNS is exactly the thing you cannot rely on -- a node
+# booting with a half-configured network, a resolver that lives on the very
+# cluster being assembled. /etc/hosts removes that dependency for the one set of
+# names that must always work.
+#
+# The management address specifically: it is the only network configured before
+# 11-network runs, and it is the one corosync uses. Taking it from
+# networks.pve_management keeps the spreadsheet as the single source.
+#
+# Both the FQDN and the short name, FQDN first. `hostname -f` returns the first
+# name on the matching line, and PVE stores the FQDN in its cluster
+# configuration -- getting that order wrong yields a node that joins under a
+# short name and disagrees with its peers about its own identity.
+- name: Compose the cluster's name-to-address map
+  ansible.builtin.set_fact:
+    pve_cluster_hosts: >-
+      {%- set out = [] -%}
+      {%- for h in groups['pve'] | sort -%}
+      {%-   set ip = hostvars[h].networks.pve_management.ip -%}
+      {%-   set _ = out.append({'name': hostvars[h].fqdn, 'ip': ip}) -%}
+      {%-   set _ = out.append({'name': h, 'ip': ip}) -%}
+      {%- endfor -%}
+      {{ out }}
+  changed_when: false
+  tags:
+    - phase10
+    - pve_baseline
+
+- name: Ensure every cluster member resolves via /etc/hosts
+  ansible.builtin.blockinfile:
+    path: /etc/hosts
+    marker: "# {mark} ANSIBLE MANAGED: pve cluster members"
+    block: |
+      {% for host in groups['pve'] | sort %}
+      {{ hostvars[host].networks.pve_management.ip }} {{ hostvars[host].fqdn }} {{ host }}
+      {% endfor %}
+    owner: root
+    group: root
+    mode: "0644"
+  register: pve_baseline_hosts_update
+  tags:
+    - phase10
+    - pve_baseline
+
+# The installer writes its own line for this node, which the managed block above
+# now duplicates. An identical duplicate is harmless -- resolution takes the
+# first match and both say the same thing -- so it is left alone rather than
+# edited out: deleting lines from /etc/hosts to tidy it up risks removing the
+# only name resolution a node has.
+#
+# A CONTRADICTORY entry is a different matter. It wins over the managed block
+# silently and points a name at the wrong address, so it is detected and failed
+# on rather than quietly repaired.
+#
+# Checked by RESOLVING the names rather than parsing the file, because those are
+# different questions: an entry earlier in the file wins, and nsswitch may
+# consult DNS before files. getent answers what the node will actually do.
+- name: Confirm every cluster name resolves to its management address
+  ansible.builtin.command:
+    cmd: "getent ahostsv4 {{ item.name }}"
+  loop: "{{ pve_cluster_hosts }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: pve_baseline_hosts_resolve
+  changed_when: false
+  failed_when: false
+  tags:
+    - phase10
+    - pve_baseline
+
+- name: Refuse a node that resolves a cluster name to the wrong address
+  ansible.builtin.fail:
+    msg: >-
+      {{ inventory_hostname }}: '{{ item.item.name }}' resolves to
+      {{ (item.stdout_lines | first | default('')).split() | first | default('nothing') }}
+      but the inventory says {{ item.item.ip }}.
+      Entries earlier in /etc/hosts, or a DNS answer consulted first, take
+      precedence over the managed block -- corosync would then reach that peer
+      at the wrong address, or not at all. This role does not delete entries it
+      did not write, so correct the offending line or the resolver order by hand.
+  loop: "{{ pve_baseline_hosts_resolve.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+  when: item.rc != 0 or item.item.ip not in item.stdout
+  tags:
+    - phase10
+    - pve_baseline
+
+- name: Configure kernel command line preserving serial console parameters
+  ansible.builtin.copy:
+    content: "{{ pve_kernel_cmdline_default }}\n"
+    dest: /etc/kernel/cmdline
+    owner: root
+    group: root
+    mode: "0644"
+  register: pve_baseline_cmdline_update
+  tags:
+    - phase10
+    - pve_baseline
+
+- name: Refresh bootloader with updated kernel command line
+  ansible.builtin.command:
+    cmd: proxmox-boot-tool refresh
+  register: pve_baseline_boot_refresh
+  changed_when: pve_baseline_boot_refresh.rc == 0
+  when: pve_baseline_cmdline_update.changed
+  tags:
+    - phase10
+    - pve_baseline
+
+- name: Configure sysctl options in /etc/sysctl.d/
+  ansible.builtin.template:
+    src: sysctl.conf.j2
+    dest: /etc/sysctl.d/99-pve-baseline.conf
+    owner: root
+    group: root
+    mode: "0644"
+  register: pve_baseline_sysctl_update
+  tags:
+    - phase10
+    - pve_baseline
+
+- name: Apply sysctl parameters
+  ansible.builtin.command:
+    cmd: sysctl --system
+  register: pve_baseline_sysctl_apply
+  changed_when: pve_baseline_sysctl_apply.rc == 0
+  when: pve_baseline_sysctl_update.changed
+  tags:
+    - phase10
+    - pve_baseline
+
+# rp_filter must be 0 for EVPN symmetric-IRB / anycast / asymmetric return paths.
+# A systemd oneshot (not sysctl.d) so it runs AFTER frr and sweeps every interface,
+# including SDN vxlan/vrf devices created dynamically at runtime. See the
+# pve-cluster-upgrade EVPN runbook. Toggle with pve_baseline_rp_filter_off.
+- name: Install rp_filter-off systemd unit (EVPN symmetric-IRB / asymmetric routing)
+  ansible.builtin.copy:
+    src: rp-filter-off.service
+    dest: /etc/systemd/system/rp-filter-off.service
+    owner: root
+    group: root
+    mode: "0644"
+  register: pve_baseline_rpfilter_unit
+  when: pve_baseline_rp_filter_off | default(true)
+  tags:
+    - phase10
+    - pve_baseline
+
+- name: Enable and (re)start rp-filter-off.service
+  ansible.builtin.systemd_service:
+    name: rp-filter-off.service
+    enabled: true
+    state: "{{ 'restarted' if pve_baseline_rpfilter_unit.changed else 'started' }}"
+    daemon_reload: true
+  when: pve_baseline_rp_filter_off | default(true)
+  tags:
+    - phase10
+    - pve_baseline
+
+- name: Render change report payload
+  ansible.builtin.template:
+    src: report_payload.json.j2
+    dest: "/tmp/pve_baseline_report_{{ inventory_hostname }}.json"
+    mode: "0600"
+  delegate_to: localhost
+  when: >
+    pve_baseline_chrony_conf.changed or
+    pve_baseline_sshd_conf.changed or
+    pve_baseline_cmdline_update.changed or
+    pve_baseline_sysctl_update.changed
+  tags:
+    - phase10
+    - pve_baseline
+
+- name: Emit change report via tools/report.py
+  ansible.builtin.command:
+    cmd: "python3 tools/report.py render /tmp/pve_baseline_report_{{ inventory_hostname }}.json --out {{ reports_dir }}/"
+    chdir: "{{ pve_deploy_root }}"
+  delegate_to: localhost
+  register: pve_baseline_report_output
+  failed_when: pve_baseline_report_output.rc != 0
+  changed_when: true
+  when: >
+    pve_baseline_chrony_conf.changed or
+    pve_baseline_sshd_conf.changed or
+    pve_baseline_cmdline_update.changed or
+    pve_baseline_sysctl_update.changed
+  tags:
+    - phase10
+    - pve_baseline

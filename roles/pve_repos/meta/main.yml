@@ -1,0 +1,11 @@
+---
+galaxy_info:
+  author: "PVE Automation Team"
+  description: "Configures Debian Trixie deb822 APT repositories for Proxmox VE 9.2"
+  license: "MIT"
+  min_ansible_version: "2.15.0"
+  platforms:
+    - name: Debian
+      versions:
+        - trixie
+dependencies: []

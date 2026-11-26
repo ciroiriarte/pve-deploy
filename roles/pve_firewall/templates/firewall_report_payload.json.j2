@@ -1,0 +1,61 @@
+{
+  "kind": "change",
+  "slug": "pve-firewall-{{ inventory_hostname }}",
+  "title": "Proxmox VE Firewall Configuration for {{ inventory_hostname }}",
+  "element": "pve-firewall",
+  "environment": "{{ environment_name }}",
+  "operator": "{{ ansible_user_id | default('ansible') }}",
+  "tool": "pve-deploy 12-firewall.yml",
+  "outcome": "{{ pve_firewall_outcome | default('failed') }}",
+  "summary": "Prepared Proxmox VE firewall aliases, IPSets, datacenter rules, and node rules. Datacenter enable requested: {{ pve_firewall_enable | bool }}. Implementation: {{ pve_firewall_implementation }}.",
+  "targets": [
+{% for host in groups['pve'] | default([inventory_hostname]) %}
+    {
+      "host": "{{ host }}",
+      "address": "{{ hostvars[host].ansible_host | default(host) }}",
+      "role": "pve"
+    }{% if not loop.last %},{% endif %}
+{% endfor %}
+  ],
+  "changes": [
+    {
+      "host": "{{ inventory_hostname }}",
+      "description": "Converged Proxmox VE firewall objects in safe order: aliases/IPSets, datacenter rules, node rules, then optional datacenter enable.",
+      "before": "Existing firewall state read through pc api GET calls.",
+      "after": "Required management, corosync, live migration, Ceph, optional EVPN, and optional validation rules present before enable.",
+      "commands": [
+        "{{ pve_firewall_pc_bin }} api GET /cluster/firewall/aliases",
+        "{{ pve_firewall_pc_bin }} api GET /cluster/firewall/ipset",
+        "{{ pve_firewall_pc_bin }} api GET /cluster/firewall/rules",
+        "{{ pve_firewall_pc_bin }} api GET /nodes/{{ inventory_hostname }}/firewall/rules"{% if pve_firewall_enable | bool %},
+        "{{ pve_firewall_pc_bin }} api PUT /cluster/firewall/options",
+        "wait_for tcp/{{ pve_firewall_ports.ssh }} and tcp/{{ pve_firewall_ports.pve_api }}",
+        "pvecm status"{% endif %}
+      ]
+    }
+  ],
+  "verification": [
+{% for item in pve_firewall_verification | default([]) %}
+    {
+      "name": {{ item.name | to_json }},
+      "command": {{ item.command | to_json }},
+      "expected": {{ item.expected | to_json }},
+      "actual": {{ item.actual | to_json }},
+      "result": {{ item.result | to_json }}
+    }{% if not loop.last %},{% endif %}
+{% endfor %}
+  ],
+  "artifacts": [
+    {
+      "path": "{{ reports_dir }}/{{ inventory_hostname }}-firewall-change.json",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "description": "Structured firewall change payload rendered by tools/report.py"
+    }
+  ],
+  "notes": [
+    "The datacenter firewall defaults to disabled; pve_firewall_enable must be true to flip the switch.",
+    "Corosync UDP {{ pve_firewall_ports.corosync }} is explicitly allowed from the corosync segment before enable.",
+    "If post-enable SSH, API, or quorum verification fails, enable.yml immediately attempts to disable the datacenter firewall.",
+    "pc api JSON bodies marked in task comments need verification against a live Proxmox VE cluster before production enable."
+  ]
+}

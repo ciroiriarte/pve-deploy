@@ -1,0 +1,33 @@
+---
+# ansible-lint configuration for pve-deploy.
+
+profile: basic
+
+exclude_paths:
+  - .omc/
+  - .omx/
+  # Mount points for site data that lives in a separate site repository; a clean
+  # checkout holds only their READMEs. Still excluded so a default (site-less)
+  # run writing generated inventory or evidence here is not linted as source.
+  - environments/
+  - inventories/
+
+skip_list:
+  # var-naming[no-role-prefix] requires every variable set inside a role to be
+  # prefixed with that role's name. That is the wrong shape for this repo:
+  #
+  #   - Tier A roles (bmc_inventory, bios_config, raid_config) deliberately share
+  #     one connection contract -- bmc_username, bmc_password, bmc_validate_certs,
+  #     bmc_timeout -- supplied once from group_vars/bmc/vault.yml. Prefixing them
+  #     per role would mean defining and vaulting the same credential three times.
+  #   - Facts describing the machine rather than the role (boot_device_confident,
+  #     ceph_osd_candidates, physical_drives) are consumed across role boundaries
+  #     by design: raid_config establishes them and later phases read them.
+  #
+  # Role-internal scratch variables should still carry a role prefix; this skip
+  # exists for the shared contract, not as licence to name things carelessly.
+  - var-naming[no-role-prefix]
+
+# Warnings that should not fail CI but stay visible in output.
+warn_list:
+  - jinja[spacing]

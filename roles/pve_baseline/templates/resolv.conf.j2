@@ -1,0 +1,5 @@
+# Managed by Ansible role pve_baseline
+search {{ dns_search_domain }}
+{% for server in dns_servers %}
+nameserver {{ server }}
+{% endfor %}

@@ -1,0 +1,96 @@
+---
+# Catches a filesystem topology the target cannot satisfy, BEFORE the machine is
+# power cycled into an installer that will discover it the hard way.
+#
+# WHY THIS EXISTS
+#
+# On 2026-08-01 a node was asked for zfs raid1 against a disk filter that matched
+# exactly one device: the M.2 controller mirrors its two drives in hardware and
+# presents a single virtual disk. ZFS raid1 is a mirror and needs at least two
+# devices, so the auto-installer booted, read the answer, halted at an error
+# screen, and sat there. Nothing was written, nothing reported, and the run
+# looked from the outside like an install that was merely slow -- it consumed a
+# full hour of wait timeout before failing with the wrong explanation.
+#
+# proxmox-auto-install-assistant cannot catch this. validate-answer checks the
+# file's SHAPE, and how many disks a filter matches is not knowable until the
+# installer is running on the target. device-match would answer it, but it
+# reports the hardware of whatever machine it runs on -- the build host, not the
+# node being installed.
+#
+# So the count has to be stated. That is a real cost, and it is the reason this
+# only DEMANDS a count for topologies that need more than one disk: a
+# single-device layout cannot fail this way, and requiring paperwork for it
+# would be friction with no defect behind it.
+
+- name: Establish the minimum device count for the requested topology
+  ansible.builtin.set_fact:
+    os_install_topology_minimum: >-
+      {{ {
+           'raid0': 1,
+           'raid1': 2,
+           'raid10': 4,
+           'raidz-1': 3,
+           'raidz-2': 4,
+           'raidz-3': 5,
+         }[os_install_zfs_raid] | default(1) }}
+  changed_when: false
+  when: os_install_filesystem in ['zfs', 'btrfs']
+
+- name: Refuse a ZFS level this role does not know the arithmetic for
+  ansible.builtin.fail:
+    msg: >-
+      os_install_zfs_raid={{ os_install_zfs_raid }} is not one this role can
+      check. Known: raid0, raid1, raid10, raidz-1, raidz-2, raidz-3. Add it to
+      the table in validate_disk_topology.yml with its minimum device count
+      rather than removing the check.
+  when:
+    - os_install_filesystem in ['zfs', 'btrfs']
+    - os_install_zfs_raid not in ['raid0', 'raid1', 'raid10', 'raidz-1', 'raidz-2', 'raidz-3']
+
+# Demanded only where it can actually prevent something. A single-device layout
+# is satisfiable by any disk selection that matches at all, so there is nothing
+# to check and nothing to make an operator write down.
+- name: Require an expected disk count for any multi-device topology
+  ansible.builtin.assert:
+    that:
+      - os_install_expected_disk_count | int > 0
+    fail_msg: >-
+      os_install_zfs_raid={{ os_install_zfs_raid }} needs at least
+      {{ os_install_topology_minimum }} devices, but os_install_expected_disk_count
+      is unset, so this cannot be checked before the node is wiped. Set it to the
+      number of disks {{ os_install_disk_filter | default(os_install_disk_list) }}
+      is expected to match on {{ inventory_hostname }}. Phase 01's storage
+      evidence lists them -- note that a hardware RAID volume counts as ONE
+      device however many physical drives back it.
+    quiet: true
+  when:
+    - os_install_filesystem in ['zfs', 'btrfs']
+    - os_install_topology_minimum | int > 1
+  changed_when: false
+
+- name: Refuse a topology the disk selection cannot satisfy
+  ansible.builtin.fail:
+    msg: >-
+      {{ inventory_hostname }}: {{ os_install_filesystem }}
+      {{ os_install_zfs_raid }} requires at least
+      {{ os_install_topology_minimum }} devices, but
+      {{ os_install_disk_filter | default(os_install_disk_list) }} is expected to
+      match {{ os_install_expected_disk_count }}. The installer would boot, read
+      the answer, and halt at an error without writing anything.
+      If the disks are mirrored by a RAID controller they present as ONE device
+      and the redundancy is already there -- use raid0 over the volume.
+  when:
+    - os_install_filesystem in ['zfs', 'btrfs']
+    - os_install_expected_disk_count | int > 0
+    - (os_install_expected_disk_count | int) < (os_install_topology_minimum | int)
+
+- name: Report the validated disk topology
+  ansible.builtin.debug:
+    msg: >-
+      {{ os_install_filesystem }} {{ os_install_zfs_raid | default('') }} on
+      {{ inventory_hostname }}: needs {{ os_install_topology_minimum | default(1) }}
+      device(s), expecting
+      {{ (os_install_expected_disk_count | int > 0)
+         | ternary(os_install_expected_disk_count, 'unstated (single-device topology)') }}.
+  changed_when: false

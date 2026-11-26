@@ -1,0 +1,16 @@
+{
+  "host": "{{ parent_host }}",
+  "bmc_address": "{{ ansible_host }}",
+  "timestamp": "{{ stamp }}",
+  "evidence_source": "{{ bios_evidence_source }}",
+  "bios_attributes": {{ bios_attributes | to_nice_json }},
+  "bios_pending_attributes": {{ bios_pending_attributes | to_nice_json }},
+  "audit_summary": {
+    "outcome": "{{ bios_audit_outcome }}",
+    "critical_drift": {{ bios_audit_critical_count }},
+    "warning_drift": {{ bios_audit_warning_count }},
+    "matches": {{ bios_audit_match_count }},
+    "absent": {{ bios_audit_absent_count }}
+  },
+  "drift_items": {{ bios_drift_items | to_nice_json }}
+}

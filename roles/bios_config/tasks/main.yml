@@ -1,0 +1,58 @@
+---
+- name: Execute BIOS Configuration Audit Block
+  tags:
+    - audit
+    - bmc
+    - readonly
+    - bios
+  block:
+    - name: Gather current BIOS attribute evidence
+      ansible.builtin.include_tasks: gather_evidence.yml
+
+    # Before comparing anything: is the baseline itself something this firmware
+    # can accept? Both defects this role shipped were wrong baselines that the
+    # comparison logic then processed faithfully into a false pass.
+    - name: Load the firmware's BIOS attribute registry
+      ansible.builtin.include_tasks: fetch_registry.yml
+
+    - name: Validate the baseline against the registry
+      ansible.builtin.include_tasks: validate_baseline.yml
+
+    - name: Compare BIOS attributes against baseline
+      ansible.builtin.include_tasks: audit_bios.yml
+
+    - name: Generate evidence and assessment reports
+      ansible.builtin.include_tasks: generate_reports.yml
+
+  rescue:
+    - name: Record BMC unreachable or failure state
+      ansible.builtin.set_fact:
+        bios_audit_outcome: "failed"
+        bios_audit_failure_reason: "{{ ansible_failed_result.msg | default('BMC Redfish request failed') }}"
+      changed_when: false
+
+    - name: Generate failure evidence and report
+      ansible.builtin.include_tasks: generate_reports.yml
+
+# Deliberately outside the block above, which carries the `readonly` tag.
+#
+# While the apply path lived inside that block it inherited `readonly`, so
+# `--tags readonly` — the tag an operator uses to prove a run cannot write —
+# selected the mutating task as well. The tag was decorative. Apply now carries
+# `apply` and never `readonly`, so the two are selectable independently.
+#
+# `| bool` is not redundant. bios_config_audit_only can arrive as a string rather
+# than a bool — a quoted group_var, an -e on the command line — and every
+# non-empty string is truthy in Jinja, including "False". Without the filter,
+# `not bios_config_audit_only` is therefore False for any string value, so an
+# operator who set audit_only=False to request a convergence gets a silently
+# skipped apply and a green run. The filter makes the value mean what it says.
+# The bare form fails safe rather than dangerous, but "safe" here is a run that
+# reports success without doing the work it was asked to do.
+- name: Apply BIOS baseline configuration changes
+  ansible.builtin.include_tasks: apply_bios.yml
+  when: not (bios_config_audit_only | bool)
+  tags:
+    - bmc
+    - bios
+    - apply

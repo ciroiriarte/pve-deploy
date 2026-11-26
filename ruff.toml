@@ -1,0 +1,39 @@
+# Ruff configuration for pve-deploy.
+#
+# Pinned explicitly rather than left to defaults: CI installs ruff unversioned,
+# and ruff changes its default rule set between releases, so an unconfigured
+# `ruff check` turns every upstream release into a potential red build on code
+# that did not change.
+
+# Matches the 160-column limit used by .yamllint and ansible-lint.
+line-length = 160
+
+# CI runs 3.11; the deployment targets Debian 13 (3.13). Build for the older.
+target-version = "py311"
+
+[lint]
+select = [
+  "E",    # pycodestyle errors
+  "F",    # pyflakes: undefined names, unused imports
+  "I",    # import ordering
+  "UP",   # pyupgrade: modern syntax for the pinned target-version
+  "B",    # bugbear: likely bugs
+  "PERF", # obvious performance mistakes
+  "PIE",  # misc lints
+]
+
+ignore = [
+  # Broad `except Exception` is deliberate in the Google Sheets and Redfish
+  # paths: a partial read must degrade into a recorded warning, not abort a
+  # multi-host run. The handlers record what failed rather than passing silently.
+  "BLE001",
+  # The loops this flags build check/warning records with multi-line calls, some
+  # conditionally. Rewriting them as extend(...) comprehensions would be denser
+  # rather than clearer, and none is on a hot path.
+  "PERF401",
+]
+
+[lint.per-file-ignores]
+# report.py tolerates a failed optional colour/tty probe and continues without
+# styling; there is nothing useful to record and nothing to recover.
+"tools/report.py" = ["S110"]

@@ -1,0 +1,37 @@
+---
+# Apply path for raid_config. Reached only when the caller has cleared the
+# Phase 01 apply gate (hardware_apply=true plus a site-named confirmation).
+#
+# The gate is implemented; this, the thing behind it, is not yet.
+#
+# It fails rather than warning on purpose, and the stakes here are higher than
+# for bios_config: this role's mutations create and destroy virtual disks. An
+# operator who believed a green run had converged storage could hand the fleet
+# to Phase 15 with the wrong OSD topology.
+#
+# Implementing this means, per the Tier A lifecycle in README.md:
+#   1. Consume ceph_osd_candidates and ceph_raid0_findings from
+#      audit_storage.yml — already computed by the time execution reaches here.
+#   2. Refuse to touch any drive that boot_device_identifiers names, and refuse
+#      to run at all when boot_device_confident is false. The audit is
+#      deliberately conservative about which device boots the host; apply must
+#      treat "not sure" as "stop", because the failure mode is wiping the OS.
+#   3. Convert single-drive RAID0 volumes to JBOD/HBA passthrough for Ceph, one
+#      controller at a time.
+#   4. Reboot once, then re-read and verify, and re-render the report as a
+#      change report rather than an assessment.
+#
+# Destructive-by-nature steps (volume deletion) should require their own opt-in
+# beyond the Phase 01 gate. Reconfiguring a controller that already carries data
+# is not the same decision as configuring a new node, and the two should not
+# share a flag.
+
+- name: Fail because RAID apply mode is not implemented yet
+  ansible.builtin.fail:
+    msg: >-
+      raid_config was invoked in apply mode, but its apply path is not
+      implemented. Storage topology on {{ inventory_hostname }} has NOT been
+      changed ({{ ceph_raid0_findings | length }} RAID0 finding(s),
+      {{ ceph_osd_candidates | length }} OSD candidate(s) detected). Re-run
+      without hardware_apply to produce the assessment report, and configure the
+      controller by hand until this path is built.

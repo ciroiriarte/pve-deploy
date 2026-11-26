@@ -1,0 +1,11 @@
+---
+galaxy_info:
+  author: "PVE Automation Team"
+  description: "Asserts and converges system bootloader to systemd-boot on UEFI ZFS nodes"
+  license: "MIT"
+  min_ansible_version: "2.15.0"
+  platforms:
+    - name: Debian
+      versions:
+        - trixie
+dependencies: []

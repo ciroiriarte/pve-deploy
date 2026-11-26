@@ -1,0 +1,182 @@
+---
+# Phase 00 - Firmware convergence (Tier A, out-of-band)
+#
+# Converges BMC, UEFI, adapter, drive and PSU firmware to either a pinned
+# baseline or the newest version in the catalog.
+#
+#
+# WHY FIRMWARE RUNS BEFORE 01-hardware
+#
+# 1. Firmware upgrades rename BIOS attribute keys. The reference fleet already
+#    demonstrated the failure mode this causes: a baseline written against the
+#    wrong attribute spelling matched nothing on all six nodes and the audit
+#    still reported success. An attribute map is only valid for the firmware it
+#    was verified against, so firmware is pinned before the map is built.
+# 2. Firmware upgrades reset BIOS settings to factory defaults. Converging BIOS
+#    first and flashing second erases the convergence.
+# 3. Controller firmware changes which storage features exist at all --
+#    passthrough and JBOD semantics on the 940-8i are firmware-dependent.
+# 4. A re-inventory belongs between this phase and 01-hardware. Evidence
+#    captured before a flash does not describe the machine after it.
+#
+#
+# TARGET MODES
+#
+#   baseline (default) - every component moves to the version pinned in
+#                        firmware_baseline. Repeatable: two runs a month apart
+#                        converge the fleet to the same place.
+#   latest             - every component moves to the newest version in the
+#                        catalog.
+#
+# "latest available" means newest in the catalog this deployment holds, not
+# newest Lenovo has published. Resolving the latter would make the outcome
+# depend on the day the playbook ran and could not be reviewed beforehand.
+# Refreshing the catalog is a separate, deliberate step.
+#
+# The role never infers which of two Lenovo version strings is newer -- the
+# formats are inconsistent enough ("68P-6.20", "26.46.3048", "E3MQ005") that no
+# comparison orders them all correctly, and lexically "68P-6.9" sorts above
+# "68P-6.20", which would silently downgrade a BMC. Ordering comes only from the
+# catalog, which lists each component newest-first. The diff itself asks only
+# "does current differ from target".
+#
+#
+# USAGE
+#
+#   Audit (default, zero writes):
+#     ansible-playbook -i <inv> playbooks/00-firmware.yml
+#
+#   Audit against the newest catalog entries instead of the pinned baseline:
+#     ... -e firmware_target_mode=latest
+#
+#   Apply:
+#     ... -e hardware_apply=true -e hardware_apply_confirm=<site> \
+#         -e '{"hardware_apply_scope":{"firmware":true}}' \
+#         --limit pve-01-bmc
+#
+#
+# NOT YET EXERCISED AGAINST LIVE HARDWARE
+#
+# The audit path is verified; no firmware has been flashed through this phase.
+# Issue #4 records that this should land after 02-install, so a failed flash has
+# an automated reinstall as recovery. Flashing is the least reversible operation
+# in this repository.
+- name: Phase 00 - Firmware convergence (Tier A, out-of-band)
+  hosts: bmc
+  connection: local
+  gather_facts: false
+
+  # One host at a time when applying. A firmware sequence reboots the host and
+  # restarts the BMC; without serial the default is every matched host in
+  # parallel, which would take the whole fleet down together.
+  serial: "{{ (hardware_apply | bool) | ternary(1, '100%') }}"
+  any_errors_fatal: "{{ hardware_apply | bool }}"
+
+  vars:
+    hardware_apply: false
+    hardware_apply_confirm: ""
+    hardware_apply_allow_fleet: false
+    hardware_apply_scope:
+      firmware: false
+
+  pre_tasks:
+    - name: Refuse to run without a vaulted BMC password.
+      ansible.builtin.assert:
+        that:
+          - bmc_password is defined
+          - bmc_password | length > 0
+        fail_msg: "Define bmc_password in Ansible Vault, for example group_vars/bmc/vault.yml."
+        quiet: true
+      changed_when: false
+      no_log: true
+      tags:
+        - always
+
+    - name: Require an explicit, site-named confirmation before flashing firmware.
+      ansible.builtin.assert:
+        that:
+          - hardware_apply_confirm == pve_site_name
+        fail_msg: >-
+          hardware_apply=true flashes firmware and reboots every targeted host.
+          Confirm the site by re-running with
+          -e hardware_apply_confirm={{ pve_site_name }} and constrain the blast
+          radius with --limit. Refusing to continue.
+        quiet: true
+      when: hardware_apply | bool
+      changed_when: false
+      tags:
+        - always
+
+    - name: Require the firmware operation class to be selected explicitly.
+      ansible.builtin.assert:
+        that:
+          - hardware_apply_scope.firmware | default(false) | bool
+        fail_msg: >-
+          hardware_apply=true but hardware_apply_scope.firmware is false, so
+          nothing would be flashed. Re-run with
+          -e '{"hardware_apply_scope":{"firmware":true}}'. Refusing to report a
+          convergence that would not happen.
+        quiet: true
+      when: hardware_apply | bool
+      changed_when: false
+      tags:
+        - always
+
+    # Firmware changes are limited to PVE nodes, same rule as 01-hardware. The
+    # bmc group also holds the PBS node and the database server, neither of
+    # which is part of the PVE build.
+    - name: Refuse to flash a host outside the pve group.
+      ansible.builtin.assert:
+        that:
+          - parent_host is defined
+          - parent_host in groups.get('pve', [])
+        fail_msg: >-
+          {{ inventory_hostname }} belongs to {{ parent_host | default('an unknown host') }},
+          which is not in the pve inventory group. Firmware convergence is
+          limited to PVE nodes; this host may be audited but not flashed.
+        quiet: true
+      when: hardware_apply | bool
+      changed_when: false
+      tags:
+        - always
+
+    - name: Refuse to flash the whole bmc group without an explicit override.
+      ansible.builtin.assert:
+        that:
+          - (ansible_play_hosts_all | length) < (groups['bmc'] | length)
+        fail_msg: >-
+          apply mode is targeting all {{ groups['bmc'] | length }} hosts in the
+          bmc group. Narrow the run with --limit, for example
+          --limit pve-01-bmc. Override with
+          -e hardware_apply_allow_fleet=true only if flashing the entire group
+          is genuinely intended.
+        quiet: true
+      when:
+        - hardware_apply | bool
+        - not (hardware_apply_allow_fleet | bool)
+      changed_when: false
+      tags:
+        - always
+
+    - name: Announce that this run will flash firmware.
+      ansible.builtin.debug:
+        msg: >-
+          FIRMWARE APPLY on site '{{ pve_site_name }}':
+          {{ ansible_play_hosts_all | length }} host(s) in scope
+          ({{ ansible_play_hosts_all | join(', ') }}), flashed one at a time in
+          class order, each rebooting as part of the sequence.
+      when: hardware_apply | bool
+      changed_when: false
+      run_once: true
+      tags:
+        - always
+
+  roles:
+    - role: firmware_config
+      vars:
+        firmware_config_audit_only: >-
+          {{ not ((hardware_apply | bool) and (hardware_apply_scope.firmware | default(false) | bool)) }}
+      tags:
+        - phase00
+        - firmware
+        - bmc

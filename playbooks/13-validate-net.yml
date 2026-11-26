@@ -1,0 +1,463 @@
+---
+# Phase 13, environment-wide.
+#
+# This replaced a per-host playbook of the same name that ran the same
+# pve_validate role once per node and wrote one report each. The two coexisted
+# so their payloads could be compared; that comparison is done and the per-host
+# version is gone.
+#
+# It produced strictly less. The fleet-wide checks were recomputed identically
+# on every host, and the flent stage could never run at all: flent and netperf
+# are provisioned in play 1 below, so the per-host playbook always warned
+# rc=127 on missing tooling, skipped every flent task, and still reported
+# SUCCESS -- an entire measurement stage absent from runs that looked complete.
+#
+# Three plays, because the work has three different scopes:
+#   1 localhost  fleet-wide checks, computed ONCE
+#   2 pve        node-local and directional pair probes, once per source host
+#   3 localhost  aggregate, render one report, fail once
+#
+# Deliberately not run_once inside the per-host play: with serial: 1 that fires
+# once per batch, which is once per host here -- the exact duplication this
+# replaces.
+
+- name: Phase 13 - prepare run and compute fleet-wide checks once.
+  hosts: localhost
+  gather_facts: false
+  tags:
+    - phase13
+    - pve_validate
+  vars:
+    # Implicit localhost is not a member of the pve group, so it receives neither
+    # group_vars/all nor the pve_validate role defaults. Both are resolved here
+    # from the first PVE host, which does have them, so the localhost plays write
+    # to the same site paths the per-host play does.
+    pve_deploy_root: "{{ (playbook_dir ~ '/..') | realpath }}"
+    pve_reference_host: "{{ groups['pve'] | first }}"
+    pve_site_root: "{{ hostvars[pve_reference_host]['pve_site_root'] | default(pve_deploy_root) }}"
+    pve_site_name: "{{ hostvars[pve_reference_host]['pve_site_name'] | default('default') }}"
+    pve_environment: "{{ hostvars[pve_reference_host]['pve_environment'] | default('production') }}"
+    reports_dir: "{{ pve_site_root }}/reports"
+    pve_validate_hardware_versions_enabled: true
+    pve_validate_hardware_version_targets: {}
+    pve_validate_hardware_evidence_dir: "{{ pve_site_root }}/environments/{{ pve_site_name }}/evidence"
+    pve_validate_hardware_version_targets_file: >-
+      {{ pve_site_root }}/environments/{{ pve_site_name }}/hardware-version-targets.json
+    # localhost is not in the pve group, so it receives none of the pve_validate
+    # role defaults. The flent knobs are restated here because provisioning now
+    # happens in this play. A group_vars override is honoured when present; -e on
+    # the command line beats both, which is how the docs tell operators to enable
+    # flent. Keep these values in step with roles/pve_validate/defaults/main.yml.
+    pve_validate_flent_enabled: >-
+      {{ hostvars[pve_reference_host]['pve_validate_flent_enabled'] | default(false) }}
+    pve_validate_flent_packages: >-
+      {{ hostvars[pve_reference_host]['pve_validate_flent_packages']
+         | default(['flent', 'netperf']) }}
+    pve_validate_flent_install_deps: >-
+      {{ hostvars[pve_reference_host]['pve_validate_flent_install_deps'] | default(true) }}
+  tasks:
+    - name: Establish a run id shared by every artifact of this run.
+      ansible.builtin.set_fact:
+        pve_validate_run_id: "{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
+        pve_validate_started_at: "{{ lookup('pipe', 'date -uIseconds') }}"
+
+    - name: Establish the run working directory.
+      ansible.builtin.set_fact:
+        pve_validate_run_dir: "{{ reports_dir }}/phase13/runs/{{ pve_validate_run_id }}"
+
+    - name: Create run directories.
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ pve_validate_run_dir }}"
+        - "{{ pve_validate_run_dir }}/fragments"
+
+    - name: Write optional hardware version target map.
+      ansible.builtin.copy:
+        dest: "{{ pve_validate_hardware_version_targets_file }}"
+        mode: "0644"
+        content: "{{ pve_validate_hardware_version_targets | to_nice_json }}\n"
+      when: pve_validate_hardware_versions_enabled | bool
+
+    - name: Validate fleet hardware firmware version consistency once for the cluster.
+      ansible.builtin.command:
+        argv: >-
+          {{ ['python3', 'tools/validate_fleet_versions.py',
+              '--evidence-dir', pve_validate_hardware_evidence_dir,
+              '--hosts'] + groups.get('pve', [])
+             + ['--targets-file', pve_validate_hardware_version_targets_file] }}
+        chdir: "{{ pve_deploy_root }}"
+      register: pve_validate_fleet_result
+      changed_when: false
+      # A non-zero exit only means some version check failed; those must be
+      # collected as checks, not abort the run before the report exists.
+      failed_when: false
+      when: pve_validate_hardware_versions_enabled | bool
+
+    - name: Fail clearly when the fleet validator produced no usable output.
+      ansible.builtin.fail:
+        msg: >-
+          tools/validate_fleet_versions.py produced no parsable JSON
+          (rc={{ pve_validate_fleet_result.rc | default('n/a') }}).
+          stderr: {{ pve_validate_fleet_result.stderr | default('') | truncate(500) }}
+      when:
+        - pve_validate_hardware_versions_enabled | bool
+        - (pve_validate_fleet_result.stdout | default('') | trim) == ''
+
+    - name: Store fleet-wide checks for aggregation.
+      ansible.builtin.copy:
+        dest: "{{ pve_validate_run_dir }}/fleet.json"
+        mode: "0644"
+        content: "{{ pve_validate_fleet_result.stdout }}\n"
+      when: pve_validate_hardware_versions_enabled | bool
+      changed_when: false
+
+    # flent dependencies are provisioned ONCE for the whole run, here, rather than
+    # inside the per-host play. The role's task file is included by a serial: 1
+    # play, so it re-executes per host and `run_once` fires per batch -- which is
+    # per host -- so provisioning there installed and removed ~130 packages across
+    # the fleet once per node, including on the node that has no flent targets.
+    #
+    # flent runs on the client but drives netserver on the target, so netperf must
+    # exist on BOTH ends before any host's turn begins. Installing fleet-wide up
+    # front is what makes serial: 1 safe.
+    - name: Detect flent dependency state across the fleet.
+      ansible.builtin.package_facts:
+        manager: auto
+      delegate_to: "{{ item }}"
+      delegate_facts: true
+      loop: "{{ groups['pve'] }}"
+      loop_control:
+        label: "{{ item }}"
+      when: pve_validate_flent_enabled | bool
+
+    - name: Determine which flent packages each host is missing.
+      ansible.builtin.set_fact:
+        # flent_packages MINUS installed, per host. The inverse -- installed minus
+        # flent_packages -- is every package on the system, and feeding that to a
+        # removal task once tried to apt-get remove ceph-common, zfsutils-linux,
+        # pve-firmware and libc-bin. apt refused; the assert below exists so the
+        # shape of that mistake cannot reach apt again.
+        #
+        # This map is the authoritative record of what to uninstall. Play 3 must
+        # NOT recompute it: by then the packages ARE installed, so the difference
+        # is empty and nothing would ever be removed.
+        pve_validate_flent_missing_by_host: >-
+          {{ (pve_validate_flent_missing_by_host | default({}))
+             | combine({ item: pve_validate_flent_packages
+                         | reject('in', hostvars[item].ansible_facts.packages | default({}))
+                         | list }) }}
+      loop: "{{ groups['pve'] }}"
+      loop_control:
+        label: "{{ item }}"
+      changed_when: false
+      when: pve_validate_flent_enabled | bool
+
+    - name: Refuse to proceed if the removal set escapes the allowed packages.
+      ansible.builtin.assert:
+        that:
+          - (pve_validate_flent_missing_by_host | default({}) | dict2items
+             | map(attribute='value') | flatten
+             | reject('in', pve_validate_flent_packages) | list | length) == 0
+        fail_msg: >-
+          Computed flent removal set contains packages outside
+          {{ pve_validate_flent_packages }}; refusing to touch apt.
+        quiet: true
+      changed_when: false
+      when: pve_validate_flent_enabled | bool
+
+    - name: Install flent dependencies on every PVE host.
+      ansible.builtin.apt:
+        name: "{{ pve_validate_flent_packages }}"
+        state: present
+        update_cache: true
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['pve'] }}"
+      loop_control:
+        label: "{{ item }}"
+      when:
+        - pve_validate_flent_enabled | bool
+        - pve_validate_flent_install_deps | bool
+
+- name: Phase 13 - collect node-local and directional pair checks per host.
+  hosts: pve
+  gather_facts: true
+  serial: 1
+  # An unreachable host must not end the run, and this is not the same setting
+  # as any_errors_fatal below.
+  #
+  # With serial: 1 each batch holds one host. When that host goes unreachable
+  # the batch has no survivors, Ansible declares NO MORE HOSTS LEFT, and every
+  # LATER PLAY is skipped -- including play 3, which renders the report and
+  # contains the BMC probe that diagnoses whether the fault was the node or this
+  # control host's path to it. An operator VPN dropping mid-run therefore
+  # produced no report and no diagnosis, which is precisely the case the probe
+  # exists for.
+  #
+  # Ignoring unreachability does not lose the signal: the host writes no
+  # fragment, and play 3 reports it by name after probing its BMC.
+  ignore_unreachable: true
+  # Not any_errors_fatal: a failing check on one node must not stop the remaining
+  # nodes being probed, or the environment report would describe a partial
+  # cluster. Play 3 fails once, after everything has reported.
+  any_errors_fatal: false
+  tags:
+    - phase13
+    - pve_validate
+
+  pre_tasks:
+    - name: Assert play targets are limited to PVE inventory group.
+      ansible.builtin.assert:
+        that:
+          - inventory_hostname in groups.get('pve', [])
+        fail_msg: "PVE deployment phases may only modify hosts in the pve inventory group."
+        quiet: true
+      tags:
+        - always
+
+    - name: Assert generated inventory provides required PVE networks.
+      ansible.builtin.assert:
+        that:
+          - networks is mapping
+          - network_catalog is mapping
+          - pve_expected_networks is mapping
+        fail_msg: "Generated inventory is missing PVE network data. Run tools/sheet_sync.py sync --env <site> --apply --yes first."
+        quiet: true
+      tags:
+        - always
+
+  roles:
+    - role: pve_validate
+      vars:
+        # Fleet checks were computed once in play 1; recomputing them per host is
+        # the duplication being removed.
+        pve_validate_hardware_versions_enabled: false
+        pve_validate_fragment_dir: "{{ hostvars['localhost']['pve_validate_run_dir'] }}/fragments"
+        pve_validate_emit_node_report: "{{ pve_validate_legacy_node_reports | default(false) | bool }}"
+        pve_validate_fail_per_host: false
+      tags:
+        - phase13
+        - pve_validate
+
+- name: Phase 13 - aggregate, render the environment report, and fail once.
+  hosts: localhost
+  gather_facts: false
+  tags:
+    - phase13
+    - pve_validate
+  vars:
+    pve_deploy_root: "{{ (playbook_dir ~ '/..') | realpath }}"
+    pve_reference_host: "{{ groups['pve'] | first }}"
+    pve_site_root: "{{ hostvars[pve_reference_host]['pve_site_root'] | default(pve_deploy_root) }}"
+    pve_site_name: "{{ hostvars[pve_reference_host]['pve_site_name'] | default('default') }}"
+    pve_environment: "{{ hostvars[pve_reference_host]['pve_environment'] | default('production') }}"
+    reports_dir: "{{ pve_site_root }}/reports"
+    pve_validate_network_targets_file: >-
+      {{ pve_site_root }}/environments/{{ pve_site_name }}/network-targets.json
+    pve_validate_flent_enabled: >-
+      {{ hostvars[pve_reference_host]['pve_validate_flent_enabled'] | default(false) }}
+    pve_validate_flent_packages: >-
+      {{ hostvars[pve_reference_host]['pve_validate_flent_packages']
+         | default(['flent', 'netperf']) }}
+    pve_validate_flent_install_deps: >-
+      {{ hostvars[pve_reference_host]['pve_validate_flent_install_deps'] | default(true) }}
+    pve_validate_flent_remove_deps_after: >-
+      {{ hostvars[pve_reference_host]['pve_validate_flent_remove_deps_after'] | default(true) }}
+  tasks:
+    # FIRST in this play, before aggregation or rendering, so a node is never left
+    # carrying a Python/matplotlib stack because a reporting step failed. The map
+    # comes from play 1 and is NOT recomputed -- the packages are installed by now,
+    # so a fresh "wanted minus installed" would be empty and remove nothing.
+    #
+    # This does not run if the whole playbook was aborted or killed. Play 2 sets
+    # any_errors_fatal: false precisely so a failing check still reaches here.
+    - name: Remove flent dependencies from hosts that lacked them.
+      ansible.builtin.apt:
+        # Intersected with the allowed list as a second line of defence.
+        name: >-
+          {{ (hostvars['localhost']['pve_validate_flent_missing_by_host'][item] | default([]))
+             | select('in', pve_validate_flent_packages) | list }}
+        state: absent
+        autoremove: true
+        purge: false
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['pve'] }}"
+      loop_control:
+        label: "{{ item }}"
+      when:
+        - pve_validate_flent_enabled | bool
+        - pve_validate_flent_install_deps | bool
+        - pve_validate_flent_remove_deps_after | bool
+        - (hostvars['localhost']['pve_validate_flent_missing_by_host'] | default({}))[item]
+          | default([]) | length > 0
+
+    - name: Report flent dependency handling.
+      ansible.builtin.debug:
+        msg: >-
+          flent deps installed once for this run and
+          {{ 'removed from' if (pve_validate_flent_remove_deps_after | bool) else 'left in place on' }}
+          the hosts that lacked them
+          ({{ (hostvars['localhost']['pve_validate_flent_missing_by_host'] | default({}))
+              | dict2items | selectattr('value') | map(attribute='key')
+              | list | join(', ') | default('none', true) }}).
+      when: pve_validate_flent_enabled | bool
+
+    - name: Aggregate per-host fragments into one environment payload.
+      ansible.builtin.command:
+        argv: >-
+          {{ ['python3', 'tools/aggregate_phase13.py',
+              '--fragment-dir', pve_validate_run_dir ~ '/fragments',
+              '--fleet-file', pve_validate_run_dir ~ '/fleet.json',
+              '--run-id', pve_validate_run_id,
+              '--environment', pve_environment,
+              '--site', pve_site_name,
+              '--started-at', pve_validate_started_at,
+              '--out', pve_validate_run_dir ~ '/environment.json',
+              '--hosts'] + groups.get('pve', []) }}
+        chdir: "{{ pve_deploy_root }}"
+      register: pve_validate_aggregate
+      changed_when: true
+      # Exit 1 means checks failed, which is reported below; only a crash (2) is
+      # an infrastructure failure worth aborting on.
+      failed_when: pve_validate_aggregate.rc not in [0, 1]
+
+    # Applied after aggregation and before the pointer advances, so the payload
+    # of record already carries its verdicts. Advisory unless the site sets
+    # enforce: a capacity floor that fails a gate on a transient dip is worse
+    # than no floor at all.
+    - name: Evaluate measurements against per-site network targets.
+      ansible.builtin.command:
+        argv:
+          - python3
+          - tools/phase13_targets.py
+          - "{{ pve_validate_run_dir }}/environment.json"
+          - --targets-file
+          - "{{ pve_validate_network_targets_file }}"
+        chdir: "{{ pve_deploy_root }}"
+      register: pve_validate_targets_result
+      changed_when: true
+      # Exit 1 means an enforced target was breached, reported by the assert
+      # below; only a crash is worth aborting before the report exists.
+      failed_when: pve_validate_targets_result.rc not in [0, 1]
+
+    # Advanced here, not after rendering: the payload is the artifact of record
+    # and rendering is cosmetic and repeatable. When the render step failed, this
+    # left latest-run.txt pointing at the previous run, so the next reader
+    # silently got stale results.
+    - name: Publish the latest run pointer.
+      ansible.builtin.copy:
+        dest: "{{ reports_dir }}/phase13/latest-run.txt"
+        mode: "0644"
+        content: "{{ pve_validate_run_id }}\n"
+      changed_when: false
+
+    - name: Render the environment report.
+      ansible.builtin.command:
+        argv:
+          - python3
+          - tools/report.py
+          - render
+          - "{{ pve_validate_run_dir }}/environment.json"
+          - --out
+          - "{{ pve_validate_run_dir }}"
+          - --force
+        chdir: "{{ pve_deploy_root }}"
+      register: pve_validate_env_render
+      changed_when: true
+      failed_when: pve_validate_env_render.rc != 0
+
+    - name: Read the aggregated summary.
+      ansible.builtin.set_fact:
+        pve_validate_env_summary: >-
+          {{ (lookup('file', pve_validate_run_dir ~ '/environment.json') | from_json).summary }}
+
+    - name: Report where the environment artifacts landed.
+      ansible.builtin.debug:
+        msg:
+          - "Run {{ pve_validate_run_id }}: {{ pve_validate_env_summary.passed }}/{{ pve_validate_env_summary.total }} checks passed."
+          - "Report: {{ pve_validate_run_dir }}/phase13-network-validation-{{ pve_environment }}-{{ pve_validate_run_id | lower }}.html"
+          - "Compare with a previous run: python3 tools/phase13_diff.py <old>/environment.json {{ pve_validate_run_dir }}/environment.json"
+
+    # Before blaming a node, check this end of the connection.
+    #
+    # A host that reported no fragment did not necessarily fail. Ansible marks a
+    # host UNREACHABLE when its own transport dies, so an operator VPN dropping
+    # mid-run produces "unreachable" against every node still to be visited --
+    # which reads as a fleet-wide fault and is not one. That happened here, and
+    # sent the diagnosis in the wrong direction for some time.
+    #
+    # The BMC is the right reference: it sits on a different network from the
+    # node, is completely independent of the node's OS, and is reached from this
+    # same control host. If the BMC is also unreachable, the common factor is
+    # this end.
+    #
+    # Redfish over HTTPS, not ICMP: these BMCs do not answer ping at all, so a
+    # failed ping would prove nothing.
+    # A PVE host does not carry its own BMC address; the bmc inventory group
+    # does, keyed the other way round via parent_host. Inverted here so a node
+    # name resolves to the BMC in front of it.
+    - name: Map each PVE host to its BMC address.
+      ansible.builtin.set_fact:
+        pve_validate_bmc_by_host: >-
+          {{ dict(groups.get('bmc', []) | map('extract', hostvars, 'parent_host') | list
+                  | zip(groups.get('bmc', []) | map('extract', hostvars, 'ansible_host') | list)) }}
+      changed_when: false
+      when: pve_validate_env_summary.missing_hosts | default([]) | length > 0
+
+    - name: Probe the BMC of every host that produced no fragment.
+      ansible.builtin.uri:
+        url: "https://{{ pve_validate_bmc_by_host[item] }}/redfish/v1/"
+        method: GET
+        validate_certs: false
+        timeout: 15
+        status_code: [200, 401]
+      loop: "{{ pve_validate_env_summary.missing_hosts | default([]) }}"
+      loop_control:
+        label: "{{ item }} via {{ pve_validate_bmc_by_host[item] | default('no BMC in inventory') }}"
+      register: pve_validate_missing_bmc_probe
+      failed_when: false
+      changed_when: false
+      when:
+        - pve_validate_env_summary.missing_hosts | default([]) | length > 0
+        - pve_validate_bmc_by_host[item] is defined
+
+    - name: Report an incomplete run, naming which end failed.
+      vars:
+        # 200 or 401 both mean the BMC answered; 401 is a reachable BMC that
+        # simply wants credentials this play does not supply, which is fine --
+        # the question is reachability, not authentication.
+        bmcs_up: >-
+          {{ pve_validate_missing_bmc_probe.results | default([])
+             | selectattr('status', 'defined')
+             | selectattr('status', 'in', [200, 401]) | list | length }}
+        bmcs_total: "{{ pve_validate_env_summary.missing_hosts | default([]) | length }}"
+      ansible.builtin.fail:
+        msg: >-
+          Incomplete run: no fragment reported for
+          {{ pve_validate_env_summary.missing_hosts | join(', ') }}.
+          {% if bmcs_up | int == 0 and bmcs_total | int > 0 %}
+          NONE of their BMCs answered either, so this control host has lost its
+          path to the site -- the run proves nothing about those nodes. Restore
+          connectivity and re-run; do not read this as a node failure.
+          {% elif bmcs_up | int < bmcs_total | int %}
+          {{ bmcs_up }}/{{ bmcs_total }} of their BMCs answered, so the picture is
+          mixed: investigate the hosts whose BMC responded, and treat the rest as
+          a possible path problem from here.
+          {% else %}
+          Their BMCs all answered, so this control host still reaches the site and
+          the fault is with the nodes themselves.
+          {% endif %}
+          The environment report covers only the hosts that reported.
+      when: pve_validate_env_summary.missing_hosts | default([]) | length > 0
+
+    - name: Fail once if any Phase 13 validation check failed.
+      ansible.builtin.assert:
+        that:
+          - pve_validate_env_summary.failed | int == 0
+        fail_msg: >-
+          Phase 13 validation failed: {{ pve_validate_env_summary.failed }} check(s).
+          {{ pve_validate_env_summary.failed_checks | join(', ') }}
+        quiet: true
+      changed_when: false

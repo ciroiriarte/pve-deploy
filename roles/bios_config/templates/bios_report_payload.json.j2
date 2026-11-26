@@ -1,0 +1,46 @@
+{
+  "kind": "assessment",
+  "slug": "bios-audit-{{ parent_host }}",
+  "title": "BIOS Baseline Audit for {{ parent_host }}",
+  "element": "bmc",
+  "environment": "{{ environment_name }}",
+  "operator": "{{ ansible_user_id | default('ansible') }}",
+  "tool": "pve-deploy 01-hardware.yml",
+  "outcome": "{{ bios_audit_outcome }}",
+  "summary": "BIOS audit on {{ parent_host }}: {{ bios_audit_critical_count }} critical drift, {{ bios_audit_warning_count }} warning drift, {{ bios_audit_match_count }} matches.",
+  "targets": [
+    {
+      "host": "{{ parent_host }}",
+      "address": "{{ ansible_host }}",
+      "role": "bmc"
+    }
+  ],
+  "verification": [
+{% for item in bios_drift_items %}
+    {
+      "name": "BIOS Attribute {{ item.key }}",
+      "command": "Redfish GetBiosAttributes / Lenovo XCC",
+      "expected": "{{ item.desired }}",
+      "actual": "{{ item.current }}{% if item.pending_staged %} (Pending: {{ item.pending }}){% endif %}",
+      "result": "{% if item.status == 'match' %}pass{% elif item.severity == 'critical' %}fail{% else %}warn{% endif %}"
+    }{% if not loop.last %},{% endif %}
+{% endfor %}
+  ],
+  "artifacts": [
+    {
+      "path": "{{ evidence_dir }}/{{ parent_host }}-bios-{{ stamp }}.json",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "description": "BIOS attribute raw evidence and drift document"
+    },
+    {
+      "path": "{{ reports_dir }}/{{ parent_host }}-bios-drift.md",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "description": "Human-readable Markdown BIOS drift summary report"
+    }
+  ],
+  "notes": [
+    "Audit mode executed with ZERO writes.",
+    "SecureBootSetting: Disabled is a critical requirement to guarantee uniform systemd-boot derivation across Proxmox nodes.",
+    "Per-port SR-IOV settings evaluated via best-effort pattern match against ConnectX-6 NIC attributes."
+  ]
+}

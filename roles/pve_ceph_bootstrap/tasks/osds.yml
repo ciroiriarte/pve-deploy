@@ -1,0 +1,86 @@
+---
+# B5 - create OSDs on every node.
+#
+# The device SELECTION guard stays a host-side shell: it is the vetted selector
+# from the hand-run bootstrap (osd_node.sh) and must behave exactly as reviewed.
+# It discovers eligible devices (by stable by-id) and emits them; the create is
+# `pveceph osd create <by-id>` (CLI, see the create task for why not the module).
+#
+# GOTCHA: the drives sit behind a tri-mode MegaRAID and present as /dev/sdX. The
+# create passes --crush-device-class so the OSDs land on the target class
+# directly, and pve_ceph_reconcile's reclass is only a fallback for OSDs
+# bootstrapped before this was wired in.
+#
+# The selection guard is safety-critical: the boot disk is a different model AND
+# is mounted, so it can never be selected. Each eligible disk is reported by its
+# stable /dev/disk/by-id/ link (field 1) AND its kernel /dev/sdX path (field 2).
+- name: Discover eligible OSD devices on each node (guarded selection).
+  ansible.builtin.shell:
+    cmd: |
+      set -u
+      export LC_ALL=C
+      for d in $(lsblk -dn -o NAME,MODEL | awk '$2 ~ /{{ pve_ceph_osd_disk_model_match }}/ {print $1}'); do
+        sz=$(lsblk -dnb -o SIZE "/dev/$d")
+        mp=$(lsblk -no MOUNTPOINT "/dev/$d" | tr -d '\n')
+        if [ "${sz:-0}" -lt {{ pve_ceph_osd_min_size_bytes }} ] || [ -n "$mp" ]; then
+          echo "REFUSE /dev/$d (size=$sz mp=$mp)"; continue
+        fi
+        if ceph-volume lvm list "/dev/$d" 2>/dev/null | grep -qi osd; then
+          echo "SKIP /dev/$d (already OSD)"; continue
+        fi
+        byid=""
+        for i in {{ pve_ceph_osd_byid_glob }}; do
+          [ "$(readlink -f "$i" 2>/dev/null)" = "/dev/$d" ] && { byid="$i"; break; }
+        done
+        echo "ELIGIBLE ${byid:-/dev/$d} /dev/$d"
+      done
+  loop: "{{ pve_ceph_nodes }}"
+  loop_control:
+    label: "{{ item }}"
+  delegate_to: "{{ item }}"
+  register: pve_ceph_bootstrap_osd_discovery
+  # Read-only discovery: it only lists devices, it never touches them.
+  changed_when: false
+
+# Flatten the per-node discovery into {node, dev, devpath} targets. dev is the
+# STABLE /dev/disk/by-id link (what pveceph osd create addresses OSDs by);
+# devpath is the kernel /dev/sdX kept only for logs/traceability.
+- name: Build the list of eligible OSD devices to create.
+  ansible.builtin.set_fact:
+    pve_ceph_bootstrap_osd_targets: >-
+      {{ pve_ceph_bootstrap_osd_targets | default([])
+         + [{
+              'node': item.0.item,
+              'dev': item.1.split(' ')[1],
+              'devpath': item.1.split(' ')[2],
+            }] }}
+  loop: "{{ pve_ceph_bootstrap_osd_discovery.results | subelements('stdout_lines') }}"
+  loop_control:
+    label: "{{ item.0.item }}: {{ item.1 }}"
+  when: item.1 is match('^ELIGIBLE ')
+  changed_when: false
+
+# Create each discovered OSD via pveceph, addressed by its STABLE /dev/disk/by-id
+# link, setting the target CRUSH device class at create time.
+#
+# WHY CLI AND NOT proxmox_ceph_osd (safety): the module's check_dev() matches
+# `dev` against the PVE disks/list `devpath` (the kernel /dev/sdX) and rejects
+# /dev/disk/by-id. /dev/sdX is NOT stable across reboots/rescans, so feeding it
+# to a destructive OSD-create risks targeting the wrong disk. `pveceph osd
+# create <by-id>` (the form the hand-run bootstrap used) resolves the stable
+# link safely. Until the module accepts by-id/WWN, OSD create stays CLI. See
+# UPSTREAM-GAPS GAP-10.
+#
+# The discovery step excludes already-provisioned devices (ceph-volume skip), so
+# re-runs do not re-create and a partial bootstrap stays resumable.
+- name: Create each eligible OSD via pveceph, addressed by stable by-id link.
+  ansible.builtin.command:
+    cmd: >-
+      pveceph osd create {{ item.dev }}
+      --crush-device-class {{ pve_ceph_device_class }}
+  loop: "{{ pve_ceph_bootstrap_osd_targets | default([]) }}"
+  loop_control:
+    label: "{{ item.node }} {{ item.dev }}"
+  delegate_to: "{{ item.node }}"
+  register: pve_ceph_bootstrap_osd_create
+  changed_when: pve_ceph_bootstrap_osd_create.rc == 0

@@ -1,0 +1,26 @@
+---
+# Point live migration at its own network.
+#
+# datacenter.cfg is in /etc/pve, so this is cluster-wide and written once.
+#
+# PVE takes a CIDR, not an interface name: it picks the local address inside
+# that subnet on each node. That is why the value comes from network_catalog
+# rather than from this host's own address -- the setting is fleet-wide and must
+# be true from every node's point of view.
+
+- name: Set the migration network and type
+  ansible.builtin.lineinfile:
+    path: /etc/pve/datacenter.cfg
+    regexp: '^migration:'
+    line: "migration: type={{ pve_cluster_migration_type }},network={{ pve_cluster_migration_cidr }}"
+    create: true
+    mode: "0640"
+  run_once: true
+  register: pve_cluster_migration_set
+
+- name: Read back what PVE now reports
+  ansible.builtin.command:
+    cmd: pvesh get /cluster/options --output-format json
+  register: pve_cluster_options
+  changed_when: false
+  run_once: true

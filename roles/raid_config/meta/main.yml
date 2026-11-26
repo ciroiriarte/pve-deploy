@@ -1,0 +1,19 @@
+---
+galaxy_info:
+  author: pve-deploy team
+  description: Discover storage topology and derive Ceph OSD candidate drives via Redfish / Lenovo XCC
+  company: Proxmox VE Infrastructure
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: EL
+      versions:
+        - all
+    - name: GenericLinux
+      versions:
+        - all
+  galaxy_tags:
+    - system
+    - storage
+
+dependencies: []

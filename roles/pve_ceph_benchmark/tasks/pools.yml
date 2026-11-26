@@ -1,0 +1,99 @@
+---
+# G1/G2 - temporary benchmark pools. Every name carries the tst- prefix, which is
+# the guard the teardown keys off; this assert makes that invariant explicit.
+#
+# CAVEAT (EC): the EC tier is k=2 m=1, so min_size = k + 1 = 3 -- losing one shard
+# blocks I/O. EC RBD also needs allow_ec_overwrites and a replicated metadata pool
+# alongside the EC data pool. These are benchmark-only tiers, not a recommendation.
+- name: Assert every benchmark pool name carries the tst- guard prefix.
+  ansible.builtin.assert:
+    that:
+      - item.name.startswith(pve_ceph_benchmark_pool_prefix)
+      - (item.meta | length == 0) or item.meta.startswith(pve_ceph_benchmark_pool_prefix)
+    fail_msg: "Benchmark pool {{ item.name }} must start with {{ pve_ceph_benchmark_pool_prefix }}."
+    quiet: true
+  loop: "{{ pve_ceph_benchmark_pools }}"
+  loop_control:
+    label: "{{ item.name }}"
+  changed_when: false
+
+- name: Read existing erasure-code profiles.
+  ansible.builtin.command:
+    cmd: ceph osd erasure-code-profile ls
+  delegate_to: "{{ pve_ceph_first_node }}"
+  register: pve_ceph_benchmark_ec_ls
+  changed_when: false
+
+- name: Create the erasure-code profile.
+  ansible.builtin.command:
+    cmd: >-
+      ceph osd erasure-code-profile set {{ pve_ceph_benchmark_ec_profile }}
+      plugin=jerasure k={{ pve_ceph_benchmark_ec_k }} m={{ pve_ceph_benchmark_ec_m }}
+      crush-failure-domain=host crush-device-class={{ pve_ceph_device_class }} --force
+  delegate_to: "{{ pve_ceph_first_node }}"
+  when: pve_ceph_benchmark_ec_profile not in (pve_ceph_benchmark_ec_ls.stdout_lines | default([]))
+  register: pve_ceph_benchmark_ec_create
+  changed_when: pve_ceph_benchmark_ec_create.rc == 0
+
+- name: Read existing pools.
+  ansible.builtin.command:
+    cmd: ceph osd pool ls
+  delegate_to: "{{ pve_ceph_first_node }}"
+  register: pve_ceph_benchmark_pool_ls
+  changed_when: false
+
+- name: Create the replicated metadata pool for the EC RBD images.
+  ansible.builtin.shell:
+    cmd: |
+      set -u
+      P="{{ pve_ceph_benchmark_meta_pool }}"
+      case "$P" in {{ pve_ceph_benchmark_pool_prefix }}*) : ;; *) echo "REFUSE non-tst pool $P"; exit 1;; esac
+      ceph osd pool create "$P" {{ pve_ceph_benchmark_meta_pg_num }} {{ pve_ceph_benchmark_meta_pg_num }} \
+        replicated {{ pve_ceph_crush_rule }} --autoscale-mode=off
+      ceph osd pool set "$P" size 3
+      ceph osd pool application enable "$P" rbd
+      echo "CREATED $P"
+  delegate_to: "{{ pve_ceph_first_node }}"
+  when: pve_ceph_benchmark_meta_pool not in (pve_ceph_benchmark_pool_ls.stdout_lines | default([]))
+  register: pve_ceph_benchmark_meta_create
+  changed_when: "'CREATED' in (pve_ceph_benchmark_meta_create.stdout | default(''))"
+
+- name: Create each benchmark data pool (tst- guarded).
+  ansible.builtin.shell:
+    cmd: |
+      set -u
+      P="{{ item.name }}"
+      case "$P" in {{ pve_ceph_benchmark_pool_prefix }}*) : ;; *) echo "REFUSE non-tst pool $P"; exit 1;; esac
+      if ceph osd pool ls | grep -qx "$P"; then echo "EXISTS $P"; exit 0; fi
+      {% if item.type == 'replicated' %}
+      ceph osd pool create "$P" {{ pve_ceph_benchmark_pg_num }} {{ pve_ceph_benchmark_pg_num }} \
+        replicated {{ pve_ceph_crush_rule }} --autoscale-mode=off
+      ceph osd pool set "$P" size 3
+      ceph osd pool set "$P" min_size 2
+      {% else %}
+      ceph osd pool create "$P" {{ pve_ceph_benchmark_pg_num }} {{ pve_ceph_benchmark_pg_num }} \
+        erasure {{ pve_ceph_benchmark_ec_profile }} --autoscale-mode=off
+      ceph osd pool set "$P" allow_ec_overwrites true
+      {% endif %}
+      ceph osd pool application enable "$P" rbd
+      {% if item.compression == 'zstd' %}
+      ceph osd pool set "$P" compression_algorithm zstd
+      ceph osd pool set "$P" compression_mode aggressive
+      {% endif %}
+      echo "CREATED $P"
+  delegate_to: "{{ pve_ceph_first_node }}"
+  loop: "{{ pve_ceph_benchmark_pools }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: pve_ceph_benchmark_pool_create
+  changed_when: "'CREATED' in (pve_ceph_benchmark_pool_create.stdout | default(''))"
+
+- name: Wait for the cluster to reach HEALTH_OK after pool creation.
+  ansible.builtin.command:
+    cmd: ceph health detail
+  delegate_to: "{{ pve_ceph_first_node }}"
+  register: pve_ceph_benchmark_health
+  changed_when: false
+  until: "'HEALTH_OK' in (pve_ceph_benchmark_health.stdout | default(''))"
+  retries: "{{ pve_ceph_benchmark_health_retries }}"
+  delay: "{{ pve_ceph_benchmark_health_delay }}"

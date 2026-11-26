@@ -1,0 +1,128 @@
+---
+# Host services that the network phase depends on but does not itself provide.
+#
+# These are node-local service checks rather than path probes, which is a slight
+# widening of what Phase 13 means. They are here because both failures present as
+# something else: clock skew surfaces as Ceph refusing to form quorum cleanly, and
+# broken resolution surfaces as a hung apt or a backup target that will not
+# connect. Neither is visible from a ping.
+
+- name: Check time synchronisation.
+  ansible.builtin.shell: |
+    set -o pipefail
+    command -v chronyc >/dev/null 2>&1 || { echo "chronyc not installed"; exit 2; }
+    t=$(chronyc tracking 2>/dev/null) || { echo "chronyc tracking failed"; exit 2; }
+    ref=$(printf '%s\n' "$t" | awk -F': ' '/^Reference ID/{print $2}' | tr -d ' ')
+    stratum=$(printf '%s\n' "$t" | awk -F': ' '/^Stratum/{print $2}' | tr -d ' ')
+    leap=$(printf '%s\n' "$t" | awk -F': ' '/^Leap status/{print $2}')
+    # "System time : 0.000046951 seconds slow of NTP time" -- field 4 is the value,
+    # and it is unsigned here, with the direction carried in the words after it.
+    off=$(printf '%s\n' "$t" | awk '/^System time/{print $4}')
+    off_ms=$(awk -v o="${off:-0}" 'BEGIN{ v=o*1000; printf "%.3f", (v<0 ? -v : v) }')
+    # A selected source is marked "^*". Without one chrony is running but steering
+    # from nothing, which "service is active" would still report as healthy.
+    selected=$(chronyc sources 2>/dev/null | grep -c '^\^\*' || true)
+    synced=$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo unknown)
+    # Which source, not merely "a source". A node quietly steering off some other
+    # server is synchronised and wrong, and "NTPSynchronized: yes" reports it as
+    # healthy. Expected servers come from the site inventory, which mirrors the
+    # per-subnet NTP column in the working spreadsheet.
+    expected={{ (pve_validate_expected_ntp | default([]) | join(',')) | quote }}
+    source_ok=skipped
+    if [ -n "$expected" ]; then
+      source_ok=no
+      for e in ${expected//,/ }; do
+        if chronyc sources 2>/dev/null | grep -q "^\^\*[[:space:]]*$e[[:space:]]"; then
+          source_ok=yes
+          break
+        fi
+      done
+    fi
+    printf 'ref=%s stratum=%s leap=%s offset_ms=%s selected=%s synchronized=%s expected_source=%s\n' \
+      "${ref:-none}" "${stratum:-none}" "${leap:-none}" "$off_ms" "$selected" "$synced" "$source_ok"
+    test "$leap" = "Normal"
+    test "$selected" -ge 1
+    test "$source_ok" != "no"
+    awk -v v="$off_ms" -v m="{{ pve_validate_time_offset_ms_max }}" 'BEGIN{exit !(v<=m)}'
+  args:
+    executable: /bin/bash
+  register: pve_validate_timesync_result
+  changed_when: false
+  failed_when: false
+  when: pve_validate_timesync_enabled | bool
+  tags: [phase13, pve_validate]
+
+- name: Record time synchronisation validation.
+  vars:
+    fields: "{{ dict((pve_validate_timesync_result.stdout | default('')).split() | map('split', '=') | list) }}"
+  ansible.builtin.set_fact:
+    pve_validate_checks: >-
+      {{ pve_validate_checks + [
+        {
+          'name': 'time_sync on ' ~ inventory_hostname,
+          'command': 'chronyc tracking; chronyc sources',
+          'expected': ('leap normal, offset <= ' ~ pve_validate_time_offset_ms_max ~ ' ms'
+                       ~ (', synced to ' ~ (pve_validate_expected_ntp | join(' or '))
+                          if (pve_validate_expected_ntp | default([]) | length) > 0
+                          else ', a selected source')),
+          'actual': (pve_validate_timesync_result.stdout | default('') | trim
+                     or pve_validate_timesync_result.stderr | default('') | trim),
+          'result': ('pass' if pve_validate_timesync_result.rc == 0 else 'fail'),
+          'metrics': { 'time_offset_ms': (fields.offset_ms | default(0) | float) }
+        }
+      ] }}
+    pve_validate_failed_checks: >-
+      {{ pve_validate_failed_checks
+         + (['time_sync'] if pve_validate_timesync_result.rc != 0 else []) }}
+  changed_when: false
+  when: pve_validate_timesync_enabled | bool
+  tags: [phase13, pve_validate]
+
+# Resolution is checked against a name OUTSIDE the site, because the failure worth
+# catching is a resolver that cannot reach the world, not one that cannot answer
+# for its own zone. The target is configurable precisely because a site may have
+# no egress, or may object to querying a third-party domain from production.
+- name: Check DNS resolution.
+  ansible.builtin.shell: |
+    set -o pipefail
+    name={{ pve_validate_dns_probe_name | quote }}
+    servers=$(awk '/^nameserver/{printf "%s,", $2}' /etc/resolv.conf | sed 's/,$//')
+    start=$(date +%s%N)
+    answer=$(getent hosts "$name" 2>/dev/null | head -1 | awk '{print $1}')
+    end=$(date +%s%N)
+    ms=$(( (end - start) / 1000000 ))
+    printf 'name=%s answer=%s ms=%s servers=%s\n' \
+      "$name" "${answer:-none}" "$ms" "${servers:-none}"
+    test -n "$answer"
+    test "$ms" -le {{ pve_validate_dns_timeout_ms_max }}
+  args:
+    executable: /bin/bash
+  register: pve_validate_dns_result
+  changed_when: false
+  failed_when: false
+  when: pve_validate_dns_enabled | bool
+  tags: [phase13, pve_validate]
+
+- name: Record DNS resolution validation.
+  vars:
+    fields: "{{ dict((pve_validate_dns_result.stdout | default('')).split() | map('split', '=') | list) }}"
+  ansible.builtin.set_fact:
+    pve_validate_checks: >-
+      {{ pve_validate_checks + [
+        {
+          'name': 'dns_resolution on ' ~ inventory_hostname,
+          'command': 'getent hosts ' ~ pve_validate_dns_probe_name,
+          'expected': pve_validate_dns_probe_name ~ ' resolves within '
+                      ~ pve_validate_dns_timeout_ms_max ~ ' ms',
+          'actual': (pve_validate_dns_result.stdout | default('') | trim
+                     or pve_validate_dns_result.stderr | default('') | trim),
+          'result': ('pass' if pve_validate_dns_result.rc == 0 else 'fail'),
+          'metrics': { 'dns_ms': (fields.ms | default(0) | int) }
+        }
+      ] }}
+    pve_validate_failed_checks: >-
+      {{ pve_validate_failed_checks
+         + (['dns_resolution'] if pve_validate_dns_result.rc != 0 else []) }}
+  changed_when: false
+  when: pve_validate_dns_enabled | bool
+  tags: [phase13, pve_validate]

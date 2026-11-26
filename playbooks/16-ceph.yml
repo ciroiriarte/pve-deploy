@@ -1,0 +1,162 @@
+---
+# Phase 16 - Ceph. RUNS AFTER THE CLUSTER EXISTS (14-cluster) AND AFTER THE
+# FIREWALL (15-firewall).
+#
+# ORDERING
+#
+# Ceph needs the Corosync cluster and the replicated /etc/pve in place: pveceph
+# init writes ceph.conf into /etc/pve and relies on it propagating to every node,
+# which only happens once the cluster is formed (14-cluster). 15-firewall already
+# pre-allows the Ceph ports (mon 3300/6789, OSD/MDS 6800-7568) on the Ceph public
+# and cluster segments, so this phase does not touch firewall rules.
+#
+# THREE INDEPENDENT PLAYS, SELECTED BY TAG
+#
+#   --tags ceph_bootstrap          Phase B. One-shot, non-idempotent, HUMAN-GATED
+#                                  (-e pve_ceph_bootstrap_confirm=true). Creates
+#                                  mons, mgrs and OSDs. Run once.
+#   --tags ceph_reconcile          Phase C/D. Idempotent. Device class, CRUSH
+#                                  rule, autotuning, pools, CephFS. Safe to re-run.
+#   --tags ceph_benchmark          Phase G/H. Temporary, HUMAN-GATED
+#                                  (-e pve_ceph_benchmark_confirm=true). Creates
+#                                  temp pools, measures, then tears them down.
+#   --tags ceph_benchmark_teardown Teardown only (guarded, no confirm needed).
+#
+# A bare run (no tags) executes bootstrap, then reconcile, then benchmark in
+# order; in practice each phase is normally run on its own by tag.
+
+- name: Phase 16a - Ceph bootstrap (mons, mgrs, OSDs).
+  hosts: pve
+  gather_facts: true
+  any_errors_fatal: true
+  # The proxmox_ceph_* modules talk to the PVE API from the controller. Supply the
+  # shared connection contract once here so every module task inherits it; the
+  # non-secret vars come from site vars, the secret from vault or -e.
+  module_defaults:
+    group/community.proxmox.proxmox:
+      api_host: "{{ pve_api_host }}"
+      api_user: "{{ pve_api_user }}"
+      api_token_id: "{{ pve_api_token_id }}"
+      api_token_secret: "{{ pve_api_token_secret }}"
+      validate_certs: "{{ pve_api_validate_certs }}"
+      ca_path: "{{ pve_api_ca_path | default(omit) }}"
+  pre_tasks:
+    - name: Assert play targets are limited to PVE inventory group.
+      ansible.builtin.assert:
+        that:
+          - inventory_hostname in groups.get('pve', [])
+        fail_msg: "PVE deployment phases may only modify hosts in the pve inventory group."
+        quiet: true
+      changed_when: false
+      tags:
+        - always
+
+    - name: Assert the Proxmox API token secret is available.
+      ansible.builtin.assert:
+        that:
+          - pve_api_token_secret | default('') | length > 0
+        fail_msg: >-
+          pve_api_token_secret is empty. The proxmox_ceph_* modules authenticate
+          to the PVE API with a token; set it via vault or
+          -e pve_api_token_secret=... before running this phase.
+        quiet: true
+      run_once: true
+      changed_when: false
+      tags:
+        - always
+
+    - name: Read cluster membership before bootstrapping Ceph.
+      ansible.builtin.command:
+        cmd: pvecm status
+      register: pve_ceph_cluster_status
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      tags:
+        - always
+
+    # Ceph init writes into the replicated /etc/pve, which only exists and
+    # propagates once the cluster is formed. Refuse rather than warn: a Ceph
+    # bootstrap on unclustered nodes is not recoverable cleanly.
+    - name: Refuse to bootstrap Ceph before the cluster exists.
+      ansible.builtin.assert:
+        that:
+          - pve_ceph_cluster_status.rc == 0
+        fail_msg: >-
+          {{ inventory_hostname }} is not in a cluster. Ceph writes into the
+          replicated /etc/pve, which requires a formed Corosync cluster. Run
+          14-cluster first.
+        quiet: true
+      when: pve_ceph_require_cluster | default(true) | bool
+      changed_when: false
+      tags:
+        - always
+  roles:
+    - role: pve_ceph_bootstrap
+      tags:
+        - ceph_bootstrap
+        - phase16
+
+- name: Phase 16b - Ceph reconcile (device class, pools, CephFS).
+  hosts: pve
+  gather_facts: true
+  any_errors_fatal: true
+  # Same PVE API connection contract as the bootstrap play: the pool and MDS
+  # tasks run as proxmox_ceph_* modules from the controller.
+  module_defaults:
+    group/community.proxmox.proxmox:
+      api_host: "{{ pve_api_host }}"
+      api_user: "{{ pve_api_user }}"
+      api_token_id: "{{ pve_api_token_id }}"
+      api_token_secret: "{{ pve_api_token_secret }}"
+      validate_certs: "{{ pve_api_validate_certs }}"
+      ca_path: "{{ pve_api_ca_path | default(omit) }}"
+  pre_tasks:
+    - name: Assert play targets are limited to PVE inventory group.
+      ansible.builtin.assert:
+        that:
+          - inventory_hostname in groups.get('pve', [])
+        fail_msg: "PVE deployment phases may only modify hosts in the pve inventory group."
+        quiet: true
+      changed_when: false
+      tags:
+        - always
+
+    - name: Assert the Proxmox API token secret is available.
+      ansible.builtin.assert:
+        that:
+          - pve_api_token_secret | default('') | length > 0
+        fail_msg: >-
+          pve_api_token_secret is empty. The proxmox_ceph_* modules authenticate
+          to the PVE API with a token; set it via vault or
+          -e pve_api_token_secret=... before running this phase.
+        quiet: true
+      run_once: true
+      changed_when: false
+      tags:
+        - always
+  roles:
+    - role: pve_ceph_reconcile
+      tags:
+        - ceph_reconcile
+        - phase16
+
+- name: Phase 16c - Ceph benchmark and guarded teardown (temporary).
+  hosts: pve
+  gather_facts: true
+  any_errors_fatal: true
+  pre_tasks:
+    - name: Assert play targets are limited to PVE inventory group.
+      ansible.builtin.assert:
+        that:
+          - inventory_hostname in groups.get('pve', [])
+        fail_msg: "PVE deployment phases may only modify hosts in the pve inventory group."
+        quiet: true
+      changed_when: false
+      tags:
+        - always
+  roles:
+    - role: pve_ceph_benchmark
+      tags:
+        - ceph_benchmark
+        - phase16

@@ -1,0 +1,20 @@
+{
+  "host": "{{ parent_host | default(inventory_hostname) }}",
+  "bmc_address": "{{ ansible_host }}",
+  "timestamp": "{{ stamp }}",
+  "machine_type": "{{ firmware_machine_type | default('') }}",
+  "target_mode": "{{ firmware_target_mode }}",
+  "payload_source": "{{ firmware_payload_source }}",
+  "transport": "{{ firmware_transport }}",
+  "audit_summary": {
+    "outcome": "{{ firmware_config_outcome }}",
+    "up_to_date": {{ firmware_up_to_date_count | int }},
+    "update_required": {{ firmware_update_count | int }},
+    "not_actionable": {{ firmware_unknown_count | int }}
+{% if firmware_config_failure_reason is defined %},
+    "failure_reason": {{ firmware_config_failure_reason | to_json }}
+{% endif %}
+  },
+  "plan": {{ firmware_plan | to_json }},
+  "inventory": {{ firmware_inventory_items | to_json }}
+}

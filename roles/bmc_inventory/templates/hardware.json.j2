@@ -1,0 +1,150 @@
+{#
+  community.general.redfish_info wraps every result as:
+
+      entries: [ [ {resource_uri: "..."}, <payload> ], ... ]
+
+  i.e. a list of (uri, payload) PAIRS. The payload is a dict for singleton
+  resources such as Systems and Managers, and a list of dicts for collections
+  such as NICs and disks.
+
+  Taking "entries | first" therefore yields the PAIR, not the payload, and every
+  subsequent attribute lookup silently resolves to null -- which is how a run
+  against healthy hardware produced an evidence document of nothing but nulls.
+  Unwrap with "| last" to reach the payload.
+#}
+{% set _sys_entries = (((bmc_rf_system | default({})).redfish_facts | default({})).system | default({})).entries | default([]) %}
+{% set system = (_sys_entries | first | default([]) | last | default({})) if (_sys_entries | length) > 0 else {} %}
+{% set _cpu_entries = (((bmc_rf_cpu | default({})).redfish_facts | default({})).cpu | default({})).entries | default([]) %}
+{% set cpu_entries = (_cpu_entries | first | default([]) | last | default([])) if (_cpu_entries | length) > 0 else [] %}
+{% set _mem_entries = (((bmc_rf_memory | default({})).redfish_facts | default({})).memory | default({})).entries | default([]) %}
+{% set memory_entries = (_mem_entries | first | default([]) | last | default([])) if (_mem_entries | length) > 0 else [] %}
+{% set _nic_entries = (((bmc_rf_nic | default({})).redfish_facts | default({})).nic | default({})).entries | default([]) %}
+{% set nic_entries = (_nic_entries | first | default([]) | last | default([])) if (_nic_entries | length) > 0 else [] %}
+{% set _sc_entries = (((bmc_rf_storage_controller | default({})).redfish_facts | default({})).storage_controller | default({})).entries | default([]) %}
+{% set storage_controller_entries = (_sc_entries | first | default([]) | last | default([])) if (_sc_entries | length) > 0 else [] %}
+{% set _disk_entries = (((bmc_rf_disk | default({})).redfish_facts | default({})).disk | default({})).entries | default([]) %}
+{% set disk_entries = (_disk_entries | first | default([]) | last | default([])) if (_disk_entries | length) > 0 else [] %}
+{% set _vol_entries = (((bmc_rf_volume | default({})).redfish_facts | default({})).volume | default({})).entries | default([]) %}
+{% set volume_entries = (_vol_entries | first | default([]) | last | default([])) if (_vol_entries | length) > 0 else [] %}
+{% set _bios_entries = (((bmc_rf_bios | default({})).redfish_facts | default({})).bios_attribute | default({})).entries | default([]) %}
+{% set bios_attributes = (_bios_entries | first | default([]) | last | default({})) if (_bios_entries | length) > 0 else {} %}
+{% set _mgr_entries = (((bmc_rf_manager | default({})).redfish_facts | default({})).manager | default({})).entries | default([]) %}
+{% set manager = (_mgr_entries | first | default([]) | last | default({})) if (_mgr_entries | length) > 0 else {} %}
+{% set _mgrnic_entries = (((bmc_rf_manager_nic | default({})).redfish_facts | default({})).manager_nic | default({})).entries | default([]) %}
+{% set manager_nic_entries = (_mgrnic_entries | first | default([]) | last | default([])) if (_mgrnic_entries | length) > 0 else [] %}
+{% set _fw_entries = (((bmc_rf_firmware | default({})).redfish_facts | default({})).firmware | default({})).entries | default([]) %}
+{% set firmware_entries = (_fw_entries | first | default([]) | last | default([])) if (_fw_entries | length) > 0 else [] %}
+{
+  "schema_version": {{ bmc_inventory_schema_version | to_json }},
+  "generated_at": {{ bmc_inventory_stamp | to_json }},
+  "environment": {{ environment_name | to_json }},
+  "bmc_host": {{ inventory_hostname | to_json }},
+  "parent_host": {{ parent_host | to_json }},
+  "bmc_address": {{ ansible_host | to_json }},
+  "collection": {
+    "status": {{ bmc_inventory_status | default("partial") | to_json }},
+    "errors": {{ bmc_inventory_errors | default([]) | to_nice_json }},
+    "readonly": true,
+    "redfish_baseuri": {{ ansible_host | to_json }},
+    "redfish_validate_certs": {{ bmc_redfish_validate_certs | to_json }},
+    "notes": [
+      "No Redfish POST, PATCH, PUT, BIOS configuration, RAID configuration, or power action is performed.",
+      "Missing facts indicate that the corresponding endpoint or command was unavailable or unverified on this BMC."
+    ]
+  },
+  "system": {
+    "serial_number": {{ (system.SerialNumber | default(system.serial_number | default(system.Serial | default(None)))) | to_json }},
+    "manufacturer": {{ (system.Manufacturer | default(system.manufacturer | default(None))) | to_json }},
+    "model": {{ (system.Model | default(system.model | default(None))) | to_json }},
+    "sku": {{ (system.SKU | default(system.Sku | default(system.PartNumber | default(None)))) | to_json }},
+    "machine_type": {{ (system.SKU | default(system.PartNumber | default(system.Model | default(None)))) | to_json }},
+    "uuid": {{ (system.UUID | default(system.uuid | default(None))) | to_json }},
+    "bios_version": {{ (system.BiosVersion | default(system.BIOSVersion | default(system.bios_version | default(None)))) | to_json }},
+    "power_state": {{ (system.PowerState | default(system.power_state | default(None))) | to_json }},
+    "processor_model": {{ ((cpu_entries | first | default({})).Model | default((cpu_entries | first | default({})).Name | default(None))) | to_json }},
+    "processor_count": {{ cpu_entries | length }},
+    "memory_total_mib": {{ memory_entries | map(attribute='CapacityMiB') | select('number') | sum | default(0) }},
+    "health": {{ ((((bmc_rf_system_health | default({})).redfish_facts | default({})).health_report | default({})).entries | default([])) | to_nice_json }}
+  },
+  "bmc": {
+    "firmware_version": {{ (manager.FirmwareVersion | default(manager.firmware_version | default(None))) | to_json }},
+    "model": {{ (manager.Model | default(manager.model | default(None))) | to_json }},
+    "manager_type": {{ (manager.ManagerType | default(manager.manager_type | default(None))) | to_json }},
+    "mac_addresses": {{ manager_nic_entries | map(attribute='MACAddress') | list | to_nice_json }},
+    "ip_addresses": {{ manager_nic_entries | to_nice_json }},
+    "firmware_inventory": {{ firmware_entries | to_nice_json }}
+  },
+  "network_adapters": [
+{% for nic in nic_entries %}
+    {
+      "name": {{ (nic.Name | default(nic.Id | default("nic-" ~ loop.index0))) | to_json }},
+      "id": {{ (nic.Id | default(None)) | to_json }},
+      "slot": {{ (nic.Slot | default(nic.Location | default(nic.PhysicalLocation | default(None)))) | to_json }},
+      "adapter": {{ (nic.AdapterName | default(nic.Name | default(nic.Model | default(None)))) | to_json }},
+      "port_index": {{ (nic.Port | default(nic.PortId | default(nic.Id | default(loop.index0)))) | to_json }},
+      "permanent_mac": {{ (nic.PermanentMACAddress | default(nic.PermanentMacAddress | default(nic.MACAddress | default(nic.MacAddress | default(None))))) | to_json }},
+      "current_mac": {{ (nic.MACAddress | default(nic.MacAddress | default(None))) | to_json }},
+      "speed_mbps": {{ (nic.SpeedMbps | default(nic.LinkSpeedMbps | default(None))) | to_json }},
+      "raw": {{ nic | to_nice_json }}
+    }{{ "," if not loop.last else "" }}
+{% endfor %}
+  ],
+  "storage": {
+    "controllers": {{ storage_controller_entries | to_nice_json }},
+    {#
+      GetDiskInventory returns one entry per storage SUBSYSTEM, shaped
+      {StorageId, Controller, Drives: [...]} -- not one entry per drive. Treating
+      each entry as a drive yields two null-filled "drives" per node instead of
+      the six real NVMe devices, which is precisely the Ceph OSD inventory this
+      audit exists to produce. Flatten to the nested Drives list.
+    #}
+    {% set all_drives = [] %}
+    {% for subsystem in disk_entries %}
+    {%   for drive in (subsystem.Drives | default([])) %}
+    {%     set _ = all_drives.append({'subsystem': subsystem.StorageId | default(''), 'drive': drive}) %}
+    {%   endfor %}
+    {% endfor %}
+    "physical_drives": [
+{% for item in all_drives %}
+{%   set disk = item.drive %}
+      {
+        "subsystem": {{ item.subsystem | to_json }},
+        "slot": {{ (disk.PhysicalLocation | default(disk.Location | default(disk.Slot | default(disk.Id | default(None))))) | to_json }},
+        "model": {{ (disk.Model | default(disk.Name | default(None))) | to_json }},
+        "serial": {{ (disk.SerialNumber | default(disk.Serial | default(None))) | to_json }},
+        "capacity_bytes": {{ (disk.CapacityBytes | default(disk.Capacity | default(None))) | to_json }},
+        "media_type": {{ (disk.MediaType | default(disk.Media | default(None))) | to_json }},
+        "protocol": {{ (disk.Protocol | default(disk.Protocols | default(None))) | to_json }},
+        "usage": {{ (disk.Usage | default(disk.RaidStatus | default(disk.Status | default(None)))) | to_json }},
+        "failure_predicted": {{ (disk.FailurePredicted | default(none)) | to_json }},
+        {# to_json, not the bare expression: Jinja renders a Python bool as
+           True/False, which is not valid JSON and makes the entire evidence
+           document unparseable for every downstream consumer. #}
+        "is_unconfigured": {{ (((disk.Usage | default('') | string | lower) in ['raw', 'jbod', 'unconfigured', 'unconfigured good']) or ((disk.RaidStatus | default('') | string | lower) in ['jbod', 'unconfigured', 'unconfigured good'])) | to_json }},
+        "raw": {{ disk | to_nice_json }}
+      }{{ "," if not loop.last else "" }}
+{% endfor %}
+    ],
+    "volumes": {{ volume_entries | to_nice_json }}
+  },
+  "bios_attributes": {{ bios_attributes | to_nice_json }},
+  "raw_redfish": {% if bmc_inventory_include_raw_redfish | bool %}{
+    "system": {{ (bmc_rf_system | default({})) | to_nice_json }},
+    "cpu": {{ (bmc_rf_cpu | default({})) | to_nice_json }},
+    "memory": {{ (bmc_rf_memory | default({})) | to_nice_json }},
+    "nic": {{ (bmc_rf_nic | default({})) | to_nice_json }},
+    "storage_controller": {{ (bmc_rf_storage_controller | default({})) | to_nice_json }},
+    "disk": {{ (bmc_rf_disk | default({})) | to_nice_json }},
+    "volume": {{ (bmc_rf_volume | default({})) | to_nice_json }},
+    "bios": {{ (bmc_rf_bios | default({})) | to_nice_json }},
+    "system_health": {{ (bmc_rf_system_health | default({})) | to_nice_json }},
+    "chassis": {{ (bmc_rf_chassis | default({})) | to_nice_json }},
+    "manager": {{ (bmc_rf_manager | default({})) | to_nice_json }},
+    "manager_nic": {{ (bmc_rf_manager_nic | default({})) | to_nice_json }},
+    "firmware": {{ (bmc_rf_firmware | default({})) | to_nice_json }},
+    "raw_system": {{ (bmc_raw_system | default({})) | to_nice_json }},
+    "raw_host_ethernet": {{ (bmc_raw_host_ethernet | default({})) | to_nice_json }},
+    "raw_storage": {{ (bmc_raw_storage | default({})) | to_nice_json }},
+    "raw_manager_ethernet": {{ (bmc_raw_manager_ethernet | default({})) | to_nice_json }}
+  }{% else %}null{% endif %}
+}

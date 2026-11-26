@@ -1,0 +1,320 @@
+---
+- name: Build optional iperf3 client targets.
+  ansible.builtin.set_fact:
+    pve_validate_iperf_targets: >-
+      {{
+        pve_validate_iperf_targets | default([]) + [ item ]
+      }}
+  loop: "{{ pve_validate_peer_targets | default([]) }}"
+  when:
+    - pve_validate_iperf_full_mesh | bool or inventory_hostname < item.target_host
+  changed_when: false
+  tags:
+    - phase13
+    - pve_validate
+    - iperf
+
+# shell, not command: `command -v` is a POSIX shell builtin, so ansible.builtin
+# .command tries to exec a binary named `command` and returns rc=2 no matter what
+# is installed -- this check reported iperf3 missing on hosts that had it.
+- name: Validate iperf3 is installed on clients. # noqa: command-instead-of-shell
+  ansible.builtin.shell:
+    cmd: command -v iperf3
+  register: pve_validate_iperf_client_bin
+  changed_when: false
+  failed_when: false
+  tags:
+    - phase13
+    - pve_validate
+    - iperf
+
+- name: Record client iperf3 binary validation.
+  ansible.builtin.set_fact:
+    pve_validate_checks: >-
+      {{ pve_validate_checks + [
+        {
+          'name': 'iperf3_client_binary on ' ~ inventory_hostname,
+          'command': 'command -v iperf3',
+          'expected': 'rc=0',
+          'actual': 'rc=' ~ (pve_validate_iperf_client_bin.rc | string)
+                    ~ ' ' ~ (pve_validate_iperf_client_bin.stdout | default('')),
+          'result': ('pass' if pve_validate_iperf_client_bin.rc == 0 else 'fail')
+        }
+      ] }}
+    pve_validate_failed_checks: >-
+      {{ pve_validate_failed_checks
+         + (['iperf3_client_binary'] if pve_validate_iperf_client_bin.rc != 0 else []) }}
+  changed_when: false
+  tags:
+    - phase13
+    - pve_validate
+    - iperf
+
+- name: Run iperf3 throughput validation with guaranteed server cleanup.
+  tags:
+    - phase13
+    - pve_validate
+    - iperf
+  block:
+    # One persistent server per host, not one per pair.
+    #
+    # The previous shape started `iperf3 --server --daemon --one-off` once per
+    # (target, protocol) pair, all up front on the same ip:port. Only the first
+    # bind succeeded, --one-off retired it after the first TCP client, and all 72
+    # UDP pairs then failed with rc=1. A server listening on every interface
+    # serves all segments, so one per host is both correct and simpler.
+    #
+    # systemd-run rather than --daemon: a process started through the command
+    # module dies with its SSH session, which is also why netserver was never
+    # actually listening for flent. A transient unit outlives the connection and
+    # can be stopped by name.
+    - name: Start a persistent iperf3 server on every PVE host.
+      ansible.builtin.command:
+        argv:
+          - systemd-run
+          - "--unit={{ pve_validate_iperf_unit }}"
+          - --collect
+          - --description=pve-deploy iperf3 validation server
+          - iperf3
+          - --server
+          - --port
+          - "{{ pve_validate_iperf_port | string }}"
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['pve'] | map('extract', hostvars, 'ansible_host') | list }}"
+      loop_control:
+        label: "{{ item }}"
+      changed_when: true
+      failed_when: false
+      run_once: true
+
+    - name: Give the iperf3 servers a moment to bind.
+      ansible.builtin.wait_for:
+        timeout: 3
+      delegate_to: localhost
+      run_once: true
+      changed_when: false
+
+    # Bracketed around the traffic phase so both the byte split and the steering
+    # rate are measured over real load rather than an idle interval.
+    - name: Sample per-member NIC counters before the traffic phase.
+      ansible.builtin.shell: |
+        set -o pipefail
+        for bond in {{ pve_validate_bonds | join(' ') }}; do
+          [ -d "/sys/class/net/$bond/bonding" ] || continue
+          for s in $(cat "/sys/class/net/$bond/bonding/slaves"); do
+            tx=$(cat "/sys/class/net/$s/statistics/tx_bytes" 2>/dev/null || echo 0)
+            st=$(ethtool -S "$s" 2>/dev/null | awk '/rx_steer_missed_packets/{print $2; exit}')
+            echo "$bond $s $tx ${st:-0} $(date +%s)"
+          done
+        done > /run/pve-deploy-nic.before
+        wc -l < /run/pve-deploy-nic.before
+      args:
+        executable: /bin/bash
+      register: pve_validate_nic_before
+      changed_when: false
+      failed_when: false
+
+    - name: Run optional iperf3 validation pairs.
+      ansible.builtin.command:
+        argv: >-
+          {{ ['iperf3', '--client', item.0.target_ip,
+              '--bind', item.0.local_ip,
+              '--port', pve_validate_iperf_port | string,
+              '--time', pve_validate_iperf_duration | string,
+              '--parallel', pve_validate_iperf_parallel | string,
+              '--json']
+             + (['--udp', '--bandwidth', pve_validate_iperf_udp_bandwidth]
+                if item.1 == 'udp' else []) }}
+      loop: >-
+        {{ (pve_validate_iperf_targets | default([]))
+           | product(pve_validate_iperf_protocols) | list }}
+      loop_control:
+        label: "{{ item.0.network_key }} {{ item.1 }} -> {{ item.0.target_host }}"
+      register: pve_validate_iperf_results
+      changed_when: false
+      failed_when: false
+      throttle: 1
+
+    # Answers a question throughput cannot: did BOTH members actually carry
+    # traffic? A pair reporting one member's rate is usually just a hash
+    # collision, so goodput alone can never separate that from a member that is
+    # silently dead. Byte counters are direct evidence.
+    - name: Measure bond distribution and NIC steering across the traffic phase.
+      ansible.builtin.shell: |
+        set -o pipefail
+        if [ ! -r /run/pve-deploy-nic.before ]; then
+          echo "no baseline sample"
+          exit 2
+        fi
+        for bond in {{ pve_validate_bonds | join(' ') }}; do
+          [ -d "/sys/class/net/$bond/bonding" ] || continue
+          for s in $(cat "/sys/class/net/$bond/bonding/slaves"); do
+            tx=$(cat "/sys/class/net/$s/statistics/tx_bytes" 2>/dev/null || echo 0)
+            st=$(ethtool -S "$s" 2>/dev/null | awk '/rx_steer_missed_packets/{print $2; exit}')
+            echo "$bond $s $tx ${st:-0} $(date +%s)"
+          done
+        done > /run/pve-deploy-nic.after
+        awk '
+          NR==FNR { k=$1" "$2; tx0[k]=$3; st0[k]=$4; t0[k]=$5; next }
+          {
+            k=$1" "$2; b=$1
+            dtx=$3-tx0[k]; dst=$4-st0[k]; dt=$5-t0[k]
+            total[b]+=dtx; steer[b]+=dst; members[b]++
+            if (dt > secs[b]) secs[b]=dt
+            if (!(b in least) || dtx < least[b]) least[b]=dtx
+            if (dst > worst[b]) worst[b]=dst
+          }
+          END {
+            for (b in total) {
+              pct = (total[b] > 0) ? int(least[b]*100/total[b]) : -1
+              pps = (secs[b] > 0) ? worst[b]/secs[b] : 0
+              printf "bond=%s members=%d total_mib=%d minority_pct=%d steer_delta=%d steer_pps=%.2f secs=%d\n", \
+                b, members[b], total[b]/1048576, pct, steer[b], pps, secs[b]
+            }
+          }' /run/pve-deploy-nic.before /run/pve-deploy-nic.after | sort
+        rm -f /run/pve-deploy-nic.before /run/pve-deploy-nic.after
+      args:
+        executable: /bin/bash
+      register: pve_validate_nic_after
+      changed_when: false
+      failed_when: false
+
+    - name: Record bond distribution and NIC steering checks.
+      vars:
+        fields: >-
+          {{ dict(item.split() | map('split', '=') | list) }}
+        mib: "{{ fields.total_mib | int }}"
+        pct: "{{ fields.minority_pct | int }}"
+        pps: "{{ fields.steer_pps | float }}"
+        judged: "{{ (fields.total_mib | int) >= (pve_validate_bond_distribution_min_mib | int) }}"
+      ansible.builtin.set_fact:
+        pve_validate_checks: >-
+          {{ pve_validate_checks + [
+            {
+              'name': 'bond_distribution_' ~ fields.bond ~ ' on ' ~ inventory_hostname,
+              'command': 'tx_bytes delta per member of ' ~ fields.bond ~ ' across the iperf phase',
+              'expected': ('least-used member carries >= '
+                           ~ pve_validate_bond_minority_pct_min ~ '% of '
+                           ~ fields.bond ~ ' bytes'),
+              'actual': ('minority ' ~ fields.minority_pct ~ '% of ' ~ fields.total_mib
+                         ~ ' MiB across ' ~ fields.members ~ ' member(s)'
+                         ~ ('' if judged else ' (too little traffic to judge)')),
+              'result': ('pass' if (not judged
+                                    or (pct | int) >= (pve_validate_bond_minority_pct_min | int))
+                         else pve_validate_bond_distribution_severity),
+              'metrics': { 'minority_pct': (pct | int), 'moved_mib': (mib | int) }
+            },
+            {
+              'name': 'nic_steering_' ~ fields.bond ~ ' on ' ~ inventory_hostname,
+              'command': 'ethtool -S <member> rx_steer_missed_packets delta over '
+                         ~ fields.secs ~ 's',
+              'expected': 'worst member below ' ~ pve_validate_nic_steer_pps_max
+                          ~ ' missed packets/s',
+              'actual': (fields.steer_delta ~ ' missed over ' ~ fields.secs
+                         ~ 's = ' ~ fields.steer_pps ~ '/s'),
+              'result': ('pass' if (pps | float) <= (pve_validate_nic_steer_pps_max | float)
+                         else pve_validate_nic_steer_severity),
+              'metrics': { 'steer_missed_pps': (pps | float) }
+            }
+          ] }}
+      loop: "{{ pve_validate_nic_after.stdout_lines | default([]) | select('search', '^bond=') | list }}"
+      loop_control:
+        label: "{{ item.split()[0] }}"
+      changed_when: false
+
+    # TCP and UDP measure different things and must not share a throughput
+    # column. TCP capacity is measured; UDP sends a bandwidth we CONFIGURED
+    # (parallel x --bandwidth) and the useful signal is what fraction arrived,
+    # so the headline there is loss and jitter. Reporting the offered load as
+    # though it were capacity made a 2 Gbit/s constant look like a measurement.
+    #
+    # Verified against real iperf3 JSON: TCP has end.sum_received and
+    # end.sum_sent.retransmits; UDP has end.sum with lost_percent and jitter_ms.
+    - name: Record optional iperf3 validation results.
+      vars:
+        iperf_end: >-
+          {{ (item.stdout | default('{}') | from_json).end | default({}, true) }}
+        # Deliberately NOT a templated boolean. A folded-scalar "{{ x == y }}"
+        # renders to the STRING "True"/"False" and every reader needs `| bool` to
+        # get it back. That round-trip worked -- "True" is a value bool accepts --
+        # but it made ansible-lint emit "the bool filter coerced invalid value
+        # (str) to False ... removed in ansible-core 2.23" on every run, because
+        # lint evaluates the task with `item` undefined and so hands `| bool` the
+        # unrendered template itself, which genuinely is an invalid value. The
+        # protocol is compared inline at each point of use instead: no string
+        # round-trip, no warning, and one less thing to re-derive when reading it.
+        iperf_udp_bandwidth_mbps: >-
+          {{ (pve_validate_iperf_udp_bandwidth | regex_replace('[^0-9.]', '') | float)
+             * (1000 if 'G' in (pve_validate_iperf_udp_bandwidth | upper) else 1) }}
+        iperf_recv: >-
+          {{ iperf_end.sum_received | default(iperf_end.sum | default({}, true), true) }}
+        iperf_sent: >-
+          {{ iperf_end.sum_sent | default({}, true) }}
+        iperf_udp: "{{ iperf_end.sum | default({}, true) }}"
+        iperf_mbps: >-
+          {{ ((iperf_recv.bits_per_second | default(0) | float) / 1000000) | round(1) }}
+        iperf_offered_mbps: >-
+          {{ ((iperf_udp_bandwidth_mbps | float)
+              * (pve_validate_iperf_parallel | int)) | round(1) }}
+        iperf_loss_pct: "{{ (iperf_udp.lost_percent | default(0)) | float | round(3) }}"
+        iperf_jitter_ms: "{{ (iperf_udp.jitter_ms | default(0)) | float | round(3) }}"
+        iperf_retransmits: "{{ iperf_sent.retransmits | default(0) | int }}"
+        # UDP passes on delivery, not on rate: the rate was ours to choose. Written
+        # as a string of the VERDICT rather than of a boolean, so nothing needs
+        # coercing back with `| bool`.
+        iperf_verdict: >-
+          {{ 'pass' if (item.rc == 0 and (
+               ((iperf_loss_pct | float) <= (pve_validate_iperf_udp_loss_pct_max | float))
+               if item.item.1 == 'udp' else ((iperf_mbps | float) > 0))) else 'fail' }}
+      ansible.builtin.set_fact:
+        pve_validate_checks: >-
+          {{ pve_validate_checks + [
+            {
+              'name': 'iperf3_' ~ item.item.1 ~ '_' ~ item.item.0.network_key
+                      ~ '_' ~ inventory_hostname ~ '_to_' ~ item.item.0.target_host,
+              'command': 'iperf3 ' ~ item.item.1 ~ ' from ' ~ item.item.0.local_ip
+                         ~ ' to ' ~ item.item.0.target_ip,
+              'expected': ('loss <= ' ~ pve_validate_iperf_udp_loss_pct_max ~ '% at '
+                           ~ iperf_offered_mbps ~ ' Mbit/s offered'
+                           if item.item.1 == 'udp' else 'rc=0 with a measured bitrate'),
+              'actual': ('rc=' ~ (item.rc | string) ~ ', loss ' ~ iperf_loss_pct
+                         ~ '%, jitter ' ~ iperf_jitter_ms ~ ' ms'
+                         if item.item.1 == 'udp'
+                         else 'rc=' ~ (item.rc | string) ~ ', ' ~ iperf_mbps ~ ' Mbit/s'),
+              'result': iperf_verdict,
+              'metrics': ({
+                            'offered_mbps': (iperf_offered_mbps | float),
+                            'loss_pct': (iperf_loss_pct | float),
+                            'jitter_ms': (iperf_jitter_ms | float)
+                          } if item.item.1 == 'udp' else {
+                            'goodput_mbps': (iperf_mbps | float),
+                            'retransmits': (iperf_retransmits | int)
+                          })
+            }
+          ] }}
+        pve_validate_failed_checks: >-
+          {{ pve_validate_failed_checks
+             + (['iperf3_' ~ item.item.1 ~ '_' ~ item.item.0.network_key
+                 ~ '_' ~ item.item.0.target_host] if iperf_verdict != 'pass' else []) }}
+      loop: "{{ pve_validate_iperf_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.0.network_key }} {{ item.item.1 }} -> {{ item.item.0.target_host }}"
+      changed_when: false
+
+  always:
+    # Stopped by unit name so an interrupted validation cannot leave listeners on
+    # a production node -- an earlier timeout-killed run left three stray iperf3
+    # servers on each of three hosts.
+    - name: Stop the iperf3 validation servers.
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - stop
+          - "{{ pve_validate_iperf_unit }}.service"
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['pve'] | map('extract', hostvars, 'ansible_host') | list }}"
+      loop_control:
+        label: "{{ item }}"
+      changed_when: false
+      failed_when: false
+      run_once: true

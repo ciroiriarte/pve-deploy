@@ -1,0 +1,93 @@
+---
+# Regression test for the boot-mirror exclusion in raid_config.
+#
+# Fixture is a real capture from a Lenovo SR655 V3 (pve-01):
+#   - ThinkSystem RAID 940-8i  (RAID_Slot2)  : 4x 6.4TB NVMe, no volumes
+#   - ThinkSystem M.2 B540i-2i (RAID_Slot16) : 2x 480GB NVMe in a RAID1 volume
+#
+# The failure this guards against: the two M.2 devices carrying the OS boot
+# mirror being offered as Ceph OSD candidates. That happened because the audit
+# read Redfish PascalCase field names the evidence file does not use, so every
+# drive resolved to "Unknown Model / Unknown Serial" and boot detection had
+# nothing to match on.
+#
+# Run:  ansible-playbook tests/raid_config_boot_exclusion.yml
+
+- name: Verify raid_config excludes the boot mirror from OSD candidates
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    parent_host: fixture-node
+    fixture: "{{ playbook_dir }}/fixtures/lenovo_sr655v3_storage.json"
+  tasks:
+    - name: Load the fixture
+      ansible.builtin.set_fact:
+        doc: "{{ lookup('file', fixture) | from_json }}"
+
+    - name: Seed the raw evidence exactly as gather_evidence.yml parses it
+      ansible.builtin.set_fact:
+        storage_controllers: "{{ doc.storage.controllers }}"
+        physical_drives: "{{ doc.storage.physical_drives }}"
+        virtual_disks: >-
+          {%- set flattened = [] -%}
+          {%- for group in doc.storage.volumes | default([]) -%}
+          {%-   for volume in group.Volumes | default([]) -%}
+          {%-     set _ = flattened.append(volume | combine({'controller': group.Controller})) -%}
+          {%-   endfor -%}
+          {%- endfor -%}
+          {{ flattened }}
+        ceph_osd_candidates: []
+        ceph_raid0_findings: []
+
+    - name: Normalize, then audit
+      ansible.builtin.include_role:
+        name: raid_config
+        tasks_from: "{{ item }}"
+      loop:
+        - normalize_evidence.yml
+        - audit_storage.yml
+
+    - name: Show the result
+      ansible.builtin.debug:
+        msg: >-
+          {{ '%-16s %-26s %8s  %s' | format(
+               c.id, c.model[:26],
+               (c.capacity_bytes | int / 1000000000000) | round(2) | string ~ 'TB',
+               c.candidate_state) }}
+      loop: "{{ ceph_osd_candidates }}"
+      loop_control: {loop_var: c, label: "{{ c.id }}"}
+
+    - name: Report boot identification
+      ansible.builtin.debug:
+        msg:
+          - "boot_confident : {{ boot_device_confident }}"
+          - "redundancy     : {{ boot_disk_redundancy }}"
+          - "evidence       : {{ boot_device_evidence }}"
+          - "identifiers    : {{ boot_device_identifiers }}"
+
+    - name: Assert the boot mirror is excluded and the data drives are eligible
+      vars:
+        eligible: "{{ ceph_osd_candidates | selectattr('candidate_state', 'equalto', 'eligible') | list }}"
+        m2_listed: "{{ ceph_osd_candidates | selectattr('subsystem', 'equalto', 'RAID_Slot16') | list }}"
+      ansible.builtin.assert:
+        that:
+          # Boot volume identified from structure, not names.
+          - boot_device_confident
+          - boot_disk_redundancy == 'mirrored'
+          # Neither M.2 member appears in the candidate list at all.
+          - m2_listed | length == 0
+          - ceph_osd_candidates | length == 4
+          # All four data drives are eligible, and correctly identified.
+          - eligible | length == 4
+          - eligible | selectattr('subsystem', 'equalto', 'RAID_Slot2') | list | length == 4
+          - eligible | rejectattr('model', 'equalto', 'Unknown Model') | list | length == 4
+          - eligible | rejectattr('serial', 'equalto', 'Unknown Serial') | list | length == 4
+          - (eligible | first).capacity_bytes | int > 6000000000000
+        success_msg: >-
+          PASS: boot mirror excluded ({{ boot_device_evidence }});
+          4 data drives eligible with resolved identity.
+        fail_msg: >-
+          FAIL: {{ ceph_osd_candidates | length }} candidate(s),
+          {{ m2_listed | length }} of them on the M.2 boot controller,
+          boot_confident={{ boot_device_confident }}.

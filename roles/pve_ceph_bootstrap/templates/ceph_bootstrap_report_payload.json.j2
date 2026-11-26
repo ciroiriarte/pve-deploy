@@ -1,0 +1,52 @@
+{
+  "kind": "change",
+  "slug": "ceph-phaseb-bootstrap-{{ pve_cluster_name | default('clu') }}",
+  "title": "Ceph Phase B bootstrap (mon/mgr/OSD) on {{ pve_cluster_name | default('the PVE cluster') }}",
+  "element": "ceph",
+  "environment": "{{ environment_name }}",
+  "operator": "{{ ansible_user_id | default('ansible') }}",
+  "tool": "pve-deploy 16-ceph.yml (ceph_bootstrap)",
+  "outcome": "{{ pve_ceph_bootstrap_outcome | default('failed') }}",
+  "summary": "Bootstrapped a Ceph {{ pve_ceph_release }} cluster: monitors and managers on {{ pve_ceph_mon_nodes | length }} nodes, OSDs on {{ pve_ceph_nodes | length }} nodes with the guarded disk selector. Public net {{ pve_ceph_public_network }}, cluster net {{ pve_ceph_cluster_network }}.",
+  "targets": [
+{% for host in pve_ceph_nodes %}
+    {
+      "host": "{{ host }}",
+      "address": "{{ hostvars[host].ansible_host | default(host) }}",
+      "role": "{{ 'ceph-mon/mgr/osd' if host in pve_ceph_mon_nodes else 'ceph-osd' }}"
+    }{% if not loop.last %},{% endif %}
+{% endfor %}
+  ],
+  "changes": [
+    {
+      "host": "{{ pve_ceph_first_node }}",
+      "description": "One-shot Ceph bootstrap: pveceph install, init with public/cluster networks, mons + mgrs on the first three nodes, OSDs on every node from the model+size+no-mountpoint+by-id guard.",
+      "before": "PVE cluster with no Ceph cluster; /etc/pve/ceph.conf absent.",
+      "after": "Ceph {{ pve_ceph_release }} up: {{ pve_ceph_mon_nodes | length }} mons in quorum, managers active/standby, OSDs up/in, HEALTH_OK.",
+      "commands": [
+        "pveceph install --version {{ pve_ceph_release }} --repository {{ pve_ceph_repository }}   # on every node, with APT Assume-Yes drop-in",
+        "pveceph init --network {{ pve_ceph_public_network }} --cluster-network {{ pve_ceph_cluster_network }}   # first node",
+        "pveceph mon create   # first three nodes, sequential, waiting for quorum",
+        "pveceph mgr create   # first three nodes",
+        "pveceph osd create /dev/disk/by-id/scsi-2...   # every node, guarded selection"
+      ]
+    }
+  ],
+  "verification": [
+{% for item in pve_ceph_bootstrap_verification | default([]) %}
+    {
+      "name": {{ item.name | to_json }},
+      "command": {{ item.command | to_json }},
+      "expected": {{ item.expected | to_json }},
+      "actual": {{ item.actual | to_json }},
+      "result": {{ item.result | to_json }}
+    }{% if not loop.last %},{% endif %}
+{% endfor %}
+  ],
+  "notes": [
+    "This role is a one-shot, non-idempotent bootstrap gated behind pve_ceph_bootstrap_confirm; it is not meant to be re-run against a live cluster.",
+    "OSD device class is auto-detected as 'ssd' because the NVMe drives present as /dev/sdX behind the MegaRAID; pve_ceph_reconcile reclasses them to 'nvme'.",
+    "The APT Assume-Yes drop-in (/etc/apt/apt.conf.d/90ceph-assumeyes) is added before and removed after pveceph install to defeat apt's interactive confirm prompt.",
+    "Verification JSON field names from `ceph -s -f json` should be confirmed against a live cluster."
+  ]
+}

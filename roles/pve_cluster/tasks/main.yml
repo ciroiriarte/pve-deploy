@@ -1,0 +1,127 @@
+---
+# Corosync cluster formation.
+#
+# ORDERING IS LOAD-BEARING AND CANNOT BE PARALLELISED
+#
+# One node founds the cluster; the rest join it one at a time. The play must run
+# serial: 1 with the founder first, because `pvecm add` contacts an existing
+# cluster and expects it to hold quorum while the join completes. Two nodes
+# joining at once race each other for the same corosync configuration.
+#
+# WHAT JOINING DESTROYS
+#
+# `man pvecm`: "All existing configuration in /etc/pve is overwritten when
+# joining a cluster." That is the whole of the joining node's PVE state --
+# storage definitions, firewall rules, guest configuration. The guards below
+# refuse to join a node that has guests, because their IDs would collide and
+# their configuration would be gone either way.
+
+- name: Resolve the corosync and migration addresses for this node
+  ansible.builtin.set_fact:
+    pve_cluster_link0_addr: "{{ networks[pve_cluster_link0_network].ip }}"
+    pve_cluster_link1_addr: >-
+      {{ (networks[pve_cluster_link1_network].ip)
+         if (pve_cluster_link1_network | length > 0) else '' }}
+    pve_cluster_migration_cidr: "{{ network_catalog[pve_cluster_migration_network].cidr }}"
+    pve_cluster_founder: "{{ groups['pve'] | sort | first }}"
+  changed_when: false
+
+# Refusing to put corosync on the management network, explicitly.
+#
+# This is the failure the role exists to prevent, and it is silent: an
+# unqualified `pvecm create` resolves the node's hostname, gets the management
+# address, and forms a working cluster on the wrong network. Nothing complains.
+# It is discovered later, under load, as unexplained retransmits or a fence.
+#
+# Checked three ways rather than with a subnet-membership filter: `ipaddr`
+# lives in ansible.utils, which this repo does not depend on, and adding a
+# collection for one assertion is a poor trade. These cover the realistic
+# failure modes -- a key pointing at management, a network whose CIDR is
+# management's, or an address that IS the node's management address -- without
+# needing subnet arithmetic.
+- name: Refuse to run corosync or migration on the management network
+  ansible.builtin.assert:
+    that:
+      - pve_cluster_link0_network != 'pve_management'
+      - pve_cluster_migration_network != 'pve_management'
+      - network_catalog[pve_cluster_link0_network].cidr != network_catalog['pve_management'].cidr
+      - network_catalog[pve_cluster_migration_network].cidr != network_catalog['pve_management'].cidr
+      - pve_cluster_link0_addr != networks['pve_management'].ip
+    fail_msg: >-
+      Corosync link0 ({{ pve_cluster_link0_network }},
+      {{ pve_cluster_link0_addr }}) or the migration network
+      ({{ pve_cluster_migration_network }},
+      {{ network_catalog[pve_cluster_migration_network].cidr }}) resolves onto
+      pve_management ({{ network_catalog['pve_management'].cidr }},
+      {{ networks['pve_management'].ip }} on this node). Cluster messaging and
+      guest memory transfers must not share the operator network -- corosync
+      loss costs quorum, and in an HA cluster that means fencing.
+    quiet: true
+  changed_when: false
+
+- name: Read current cluster membership
+  ansible.builtin.command:
+    cmd: pvecm status
+  register: pve_cluster_status
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Record whether this node is already clustered
+  ansible.builtin.set_fact:
+    pve_cluster_joined: "{{ pve_cluster_status.rc == 0 }}"
+  changed_when: false
+
+- name: Report the plan
+  ansible.builtin.debug:
+    msg:
+      - "host       : {{ inventory_hostname }} ({{ 'already in a cluster' if pve_cluster_joined else 'standalone' }})"
+      - "role       : {{ 'FOUNDER' if inventory_hostname == pve_cluster_founder else 'joins ' ~ pve_cluster_founder }}"
+      - "cluster    : {{ pve_cluster_name }}"
+      - "corosync   : {{ pve_cluster_link0_network }} {{ pve_cluster_link0_addr }}{{ ' + ' ~ pve_cluster_link1_network ~ ' ' ~ pve_cluster_link1_addr if pve_cluster_link1_addr | length > 0 else ' (single link)' }}"
+      - "dscp       : {{ pve_cluster_corosync_dscp | default('unset') }}"
+      - "migration  : {{ pve_cluster_migration_network }} {{ pve_cluster_migration_cidr }} ({{ pve_cluster_migration_type }})"
+      - "apply      : {{ pve_cluster_apply | bool }}"
+  changed_when: false
+
+- name: Stop here unless the apply gate was cleared
+  ansible.builtin.debug:
+    msg: >-
+      DRY RUN for {{ inventory_hostname }}. Nothing has been changed. Re-run with
+      -e pve_cluster_apply=true -e pve_cluster_confirm={{ pve_site_name }} to
+      form the cluster.
+  when: not (pve_cluster_apply | bool)
+  changed_when: false
+
+- name: Form the cluster
+  when: pve_cluster_apply | bool
+  block:
+    - name: Refuse to join a node that holds guests
+      ansible.builtin.include_tasks: assert_empty.yml
+      when: not pve_cluster_joined
+
+    - name: Found the cluster on the first node
+      ansible.builtin.include_tasks: create.yml
+      when:
+        - not pve_cluster_joined
+        - inventory_hostname == pve_cluster_founder
+
+    - name: Join this node to the cluster
+      ansible.builtin.include_tasks: join.yml
+      when:
+        - not pve_cluster_joined
+        - inventory_hostname != pve_cluster_founder
+
+    # Applied after membership, not before: both write into /etc/pve, which a
+    # join overwrites. Setting them on a standalone node would be undone the
+    # moment it joined -- the same trap that moved the firewall phase after
+    # cluster creation.
+    - name: Configure corosync QoS marking
+      ansible.builtin.include_tasks: corosync_dscp.yml
+      when: pve_cluster_corosync_dscp | length > 0
+
+    - name: Configure the live migration network
+      ansible.builtin.include_tasks: migration.yml
+
+    - name: Verify quorum and the addresses actually in use
+      ansible.builtin.include_tasks: verify.yml

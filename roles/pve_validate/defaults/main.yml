@@ -1,0 +1,232 @@
+---
+pve_deploy_root: "{{ (playbook_dir ~ '/..') | realpath }}"
+
+# Site data root: where per-deployment records are written. Defaults to this
+# checkout; point it at a site repository to keep records out of the tool repo.
+pve_site_root: "{{ pve_deploy_root }}"
+reports_dir: "{{ pve_site_root }}/reports"
+
+# Directory name under environments/ holding this site's evidence. Deliberately
+# NOT pve_environment: that names the deployment tier and is stamped into report
+# metadata ("production"), while this selects a path. Overloading one variable
+# for both meant setting pve_environment inventory-wide would silently redirect
+# the hardware-evidence lookup at a directory that does not exist.
+pve_site_name: "default"
+
+pve_environment: "production"
+
+# Output mode. The defaults still reproduce the older per-node behaviour, which
+# is what a bare `include_role` gets. 13-validate-net.yml overrides them to
+# aggregate instead, and is the only supported caller -- the per-node playbook
+# that relied on these defaults has been removed.
+#
+#   pve_validate_fragment_dir   when set, write this host's raw checks there for
+#                               environment aggregation
+#   pve_validate_emit_node_report  render the per-node Markdown/HTML report
+#   pve_validate_fail_per_host  assert at the end of each host, rather than once
+#                               after aggregation
+pve_validate_fragment_dir: ""
+pve_validate_emit_node_report: true
+pve_validate_fail_per_host: true
+
+# Validate only PVE host networks by default. BMC/backup/database are out of this play's scope.
+pve_validate_network_keys:
+  - pve_management
+  - pve_corosync
+  - pve_live_migration
+  - pve_underlay
+  - pve_ceph_access
+  - pve_ceph_replica
+
+pve_validate_bonds:
+  - bond0
+  - bond1
+  - bond2
+  - bond3
+
+pve_validate_ping_count: 2
+pve_validate_ping_timeout: 2
+pve_validate_mtu_probe: true
+# IPv4 ping payload is MTU - 20 byte IP header - 8 byte ICMP header.
+pve_validate_mtu_ipv4_overhead: 28
+# Avoid pathological/empty sizes if inventory is wrong.
+pve_validate_min_ping_payload: 56
+
+# Optional active throughput validation. Disabled by default because it starts temporary
+# iperf3 listener processes and may require temporary firewall allowance on TCP/UDP 5201.
+pve_validate_iperf_enabled: false
+pve_validate_iperf_port: 5201
+# Transient unit name, so the server can be stopped deterministically.
+pve_validate_iperf_unit: "pve-deploy-iperf3srv"
+pve_validate_iperf_duration: 5
+# Enough streams that the measurement is reproducible on a multi-member LACP bond.
+#
+# At 2 streams on a 2-member bond the chance both hash to the same link is
+# 2*(1/2)^2 = 50%, and the ephemeral source ports re-roll that hash every run, so
+# per-pair goodput was a coin flip between one link and two -- half the pairs
+# reported 24.7 Gbit/s of a 2x25G bond and the run-to-run diff flagged 35
+# "regressions" that were nothing but re-placed flows. Measured on one pair:
+#   --parallel 2  ->  49436 / 24733 / 49440 Mbit/s
+#   --parallel 8  ->  49468 / 49446 / 49474 Mbit/s
+# Raise this if a bond ever has more than two members; the requirement is simply
+# enough concurrent flows that every member is statistically certain to be used.
+pve_validate_iperf_parallel: 8
+pve_validate_iperf_udp_bandwidth: "1G"
+# UDP sends a bandwidth we chose, so the verdict is delivery, not rate.
+pve_validate_iperf_udp_loss_pct_max: 1.0
+pve_validate_iperf_protocols:
+  - tcp
+  - udp
+# Full ordered mesh by default when enabled; set false for only current host -> higher hostnames.
+pve_validate_iperf_full_mesh: true
+
+# Host services the network phase depends on but does not provide.
+#
+# Both failures present as something else. Clock skew surfaces as Ceph refusing to
+# form quorum cleanly -- it flags "clock skew detected" once drift passes its own
+# mon_clock_drift_allowed of 50 ms -- and broken resolution surfaces as a hung apt
+# or a backup target that will not connect. Neither is visible from a ping.
+pve_validate_timesync_enabled: true
+
+# Measured across this fleet: system time offsets of 0.05 to 9.0 ms with an RMS
+# around 6 ms, all four nodes synced to the site NTP server at stratum 4. The
+# ceiling is set below Ceph's 50 ms complaint threshold so this warns BEFORE Ceph
+# does, while keeping roughly 2.8x headroom over the worst offset observed.
+pve_validate_time_offset_ms_max: 25
+
+# Servers the nodes are expected to be steering from. Defaults to the site's
+# ntp_servers, which mirrors the per-subnet NTP column in the working spreadsheet.
+# Set to [] to accept any source: the check then only asserts that one is selected.
+pve_validate_expected_ntp: "{{ ntp_servers | default([]) }}"
+
+pve_validate_dns_enabled: true
+# Deliberately a name OUTSIDE the site. The failure worth catching is a resolver
+# that cannot reach the world, not one that cannot answer for its own zone.
+# Override per site: an air-gapped environment has no egress, and some operators
+# will not query a third-party domain from production.
+pve_validate_dns_probe_name: "hola.com"
+# Loose on purpose. Measured 343 ms on a cold cache against 7 ms warm on the same
+# fleet minutes apart, so any tight figure would flap. This catches a resolver
+# that hangs, which is the failure that actually stalls a deployment.
+pve_validate_dns_timeout_ms_max: 5000
+
+# Bond distribution and NIC steering health, sampled across the iperf traffic phase.
+#
+# Minimum share of a bond's transmitted bytes that the least-used member must
+# carry. This is NOT a per-flow check: it covers the whole iperf phase, which is
+# dozens of runs over many 5-tuples, so a single LACP hash collision cannot
+# explain a low figure. Direct measurement on this fleet put a single 8-stream
+# run at 49%; anything near zero across the entire phase means a member is
+# carrying nothing at all. 5 leaves a very wide margin and still catches that.
+pve_validate_bond_minority_pct_min: 5
+# Only judge distribution once enough bytes moved for the ratio to mean anything.
+pve_validate_bond_distribution_min_mib: 1000
+
+# rx_steer_missed_packets per second, per member, averaged over the traffic phase.
+#
+# This is the counter that identifies the ConnectX-6/mlx5 fault where a NIC stops
+# admitting unicast to the bond MAC after an ifreload and only a reboot restores
+# it. The reachability probes already FAIL in that state, but they
+# cannot say why -- a dead cable, a missing switch VLAN and this fault look
+# identical from a ping. A climbing steering counter names it.
+#
+# Nonzero is normal: measured across 32 healthy interfaces the rate was 0 to 0.2/s
+# from stray flooded frames, with lifetime totals in the thousands. So the signal
+# is RATE, not presence. During the fault every inbound unicast is missed, so the
+# counter climbs at traffic rate -- orders of magnitude above this ceiling.
+pve_validate_nic_steer_pps_max: 10
+
+# Fleet hardware/software version validation. Hardware validation consumes the latest
+# read-only Phase 01 BMC evidence for each PVE node and verifies that BIOS, BMC, NIC,
+# disk, and HBA firmware versions are homogeneous across the PVE fleet. Optional
+# target versions can be supplied as a JSON-shaped mapping, for example:
+#
+# pve_validate_hardware_version_targets:
+#   bios: KAE142G
+#   bmc: KAX368P 6.20 2025-12-19
+#   nic:
+#     default: 26.46.3048
+#   hba:
+#     "SAS3908 @ Slot 2": 52.32.0-5990
+#   disk:
+#     "MTFDKCC6T4TGQ-1BK1DABYY @ RAID_Slot2": E3MQ005
+
+# Optional flent (FLExible Network Tester) characterisation.
+#
+# Off by default and deliberately outside the pass/fail gate: flent measures
+# latency under load rather than asserting a verdict, and an RRUL run costs tens
+# of seconds per pair, so a full mesh is a campaign rather than a validation
+# step. Results are a baseline to compare between runs; a failed run warns.
+#
+# Dependencies are provisioned and removed by the role (see below). If the
+# datacenter firewall is enforcing, the control/data ports need allowing -- the
+# same opt-in as iperf3 via pve_firewall_allow_validation.
+pve_validate_flent_enabled: false
+
+# Dependency handling. flent pulls netperf and a Python/matplotlib stack, so
+# unlike iperf3 -- which Phase 10 installs permanently because it is small and
+# broadly useful -- it is provisioned for the test and removed afterwards. Only
+# packages this run installs are removed; anything already present is left alone,
+# and the removal runs even if the measurements fail.
+pve_validate_flent_packages:
+  - flent
+  - netperf
+pve_validate_flent_install_deps: true
+pve_validate_flent_remove_deps_after: true
+
+pve_validate_flent_test: "rrul"
+pve_validate_flent_length: 30
+pve_validate_flent_control_port: 12865
+# Transient unit name so netserver can be stopped deterministically.
+pve_validate_flent_unit: "pve-deploy-netserver"
+# One direction per pair by default, and unlike iperf3 that is not a coverage
+# gap: RRUL saturates both directions simultaneously, so a single run reports
+# download_mbps AND upload_mbps for the pair. A reverse run re-measures the same
+# two bond hashes with different ephemeral ports. Turn it on only to sample that
+# port variation; it doubles an already expensive run for little new signal.
+pve_validate_flent_full_mesh: false
+# Every segment that is validated at all, tracking pve_validate_network_keys.
+#
+# Previously restricted to underlay + ceph_replica on cost grounds, which left
+# the most latency-sensitive segment in the design -- corosync -- with no
+# latency-under-load data whatsoever. Since all segments share the same physical
+# LACP bonds, iperf3 proving a segment can move 49 Gbit/s says nothing about what
+# a ceph backfill does to corosync RTT, and that (token timeout -> fence) is the
+# failure mode that actually bites. Narrow this list if run duration matters more
+# than coverage; at 4 nodes and 6 segments it is 36 pairs, roughly 25 minutes.
+pve_validate_flent_networks: "{{ pve_validate_network_keys }}"
+pve_validate_flent_evidence_dir: >-
+  {{ pve_site_root }}/environments/{{ pve_site_name }}/evidence/flent
+# On-node scratch root. One subdirectory per pair, so the produced data file can
+# be discovered rather than guessed from flent's naming, and one directory to
+# remove afterwards instead of loose files in /tmp.
+pve_validate_flent_data_root: /tmp/pve-deploy-flent
+
+pve_validate_hardware_versions_enabled: true
+pve_validate_hardware_evidence_dir: "{{ pve_site_root }}/environments/{{ pve_site_name }}/evidence"
+pve_validate_hardware_version_targets: {}
+# Materialised next to the site's evidence, not under reports_dir. It is an
+# input to the validator, and reports_dir holds generated output that is safe to
+# wipe and regenerate; a config file living there invites losing it.
+pve_validate_hardware_version_targets_file: >-
+  {{ pve_site_root }}/environments/{{ pve_site_name }}/hardware-version-targets.json
+
+# Severity for a breach of the two node-scope traffic checks.
+#
+# nic_steering FAILS. rx_steer_missed_packets counts frames the NIC received and
+# then dropped because no steering rule matched, so a sustained rate is packet
+# loss the host is inflicting on itself -- invisible to a ping, and exactly the
+# fault that once killed a VLAN underlay silently on this hardware. A warn does
+# not fail a run, which meant a run could report SUCCESS while the NIC dropped
+# traffic under load. Measured at 0.19/s worst case on this fleet against a
+# 10/s threshold, so the margin is wide and a breach means something changed.
+#
+# bond_distribution WARNS, deliberately, and this is the weaker signal of the
+# two: an unbalanced bond is a hashing outcome, not a fault. A workload with few
+# flows can legitimately land on one member, and the check already suppresses
+# itself below pve_validate_bond_distribution_min_mib. Failing on it would train
+# people to ignore the result.
+#
+# Both accept 'pass', 'warn' or 'fail' so a site can make its own call.
+pve_validate_nic_steer_severity: "fail"
+pve_validate_bond_distribution_severity: "warn"

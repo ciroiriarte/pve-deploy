@@ -1,0 +1,168 @@
+---
+- name: Build desired firewall segment objects from network_catalog.
+  ansible.builtin.set_fact:
+    pve_firewall_segment_objects: >-
+      {{
+        pve_firewall_segment_objects | default([]) + [
+          {
+            'role': item.key,
+            'catalog_key': item.value.catalog_key,
+            'ipset': item.value.ipset,
+            'alias': item.value.alias,
+            'name': network_catalog[item.value.catalog_key].name,
+            'cidr': network_catalog[item.value.catalog_key].cidr,
+            'vlan_id': network_catalog[item.value.catalog_key].vlan_id,
+            'role_bonds': network_catalog[item.value.catalog_key].role_bonds
+          }
+        ]
+      }}
+  loop: "{{ pve_firewall_segments | dict2items }}"
+  changed_when: false
+  run_once: true
+  delegate_to: localhost
+  tags:
+    - firewall
+    - phase15
+
+- name: Refuse empty firewall segment CIDRs.
+  ansible.builtin.assert:
+    that:
+      - item.cidr is string
+      - item.cidr | length > 0
+    fail_msg: "network_catalog entry {{ item.catalog_key }} for {{ item.role }} has an empty CIDR."
+    quiet: true
+  loop: "{{ pve_firewall_segment_objects }}"
+  changed_when: false
+  run_once: true
+  delegate_to: localhost
+  tags:
+    - firewall
+    - phase15
+
+- name: Read current datacenter firewall aliases.
+  ansible.builtin.command:
+    argv:
+      - "{{ pve_firewall_pc_bin }}"
+      - "api"
+      - "GET"
+      - "/cluster/firewall/aliases"
+  delegate_to: localhost
+  register: pve_firewall_aliases_get
+  changed_when: false
+  failed_when: pve_firewall_aliases_get.rc != 0
+  no_log: "{{ pve_firewall_pc_no_log }}"
+  run_once: true
+  tags:
+    - firewall
+    - phase15
+
+- name: Read current datacenter firewall IPSets.
+  ansible.builtin.command:
+    argv:
+      - "{{ pve_firewall_pc_bin }}"
+      - "api"
+      - "GET"
+      - "/cluster/firewall/ipset"
+  delegate_to: localhost
+  register: pve_firewall_ipsets_get
+  changed_when: false
+  failed_when: pve_firewall_ipsets_get.rc != 0
+  no_log: "{{ pve_firewall_pc_no_log }}"
+  run_once: true
+  tags:
+    - firewall
+    - phase15
+
+- name: Normalize current firewall alias and IPSet state.
+  ansible.builtin.set_fact:
+    pve_firewall_current_aliases: "{{ ((pve_firewall_aliases_get.stdout | default('{\"data\": []}') | from_json).data | default([])) }}"
+    pve_firewall_current_ipsets: "{{ ((pve_firewall_ipsets_get.stdout | default('{\"data\": []}') | from_json).data | default([])) }}"
+  changed_when: false
+  run_once: true
+  delegate_to: localhost
+  tags:
+    - firewall
+    - phase15
+
+- name: Create missing datacenter firewall aliases.
+  # pve-cli v0.13 accepts REST parameters through repeatable --data flags
+  # and wraps JSON responses under a top-level data field.
+  ansible.builtin.command:
+    cmd: >-
+      {{ pve_firewall_pc_bin }} api POST /cluster/firewall/aliases --yes
+      --data {{ ('name=' ~ item.alias) | quote }}
+      --data {{ ('cidr=' ~ item.cidr) | quote }}
+      --data {{ ('comment=pve-deploy ' ~ item.name ~ ' VLAN ' ~ (item.vlan_id | string)) | quote }}
+  delegate_to: localhost
+  loop: "{{ pve_firewall_segment_objects }}"
+  when:
+    - not ansible_check_mode
+    - item.alias not in (pve_firewall_current_aliases | map(attribute='name') | list)
+  register: pve_firewall_alias_create
+  changed_when: true
+  failed_when: pve_firewall_alias_create.rc != 0
+  no_log: "{{ pve_firewall_pc_no_log }}"
+  run_once: true
+  tags:
+    - firewall
+    - phase15
+
+- name: Create missing datacenter firewall IPSets.
+  # pve-cli v0.13 accepts REST parameters through repeatable --data flags.
+  ansible.builtin.command:
+    cmd: >-
+      {{ pve_firewall_pc_bin }} api POST /cluster/firewall/ipset --yes
+      --data {{ ('name=' ~ item.ipset) | quote }}
+      --data {{ ('comment=pve-deploy ' ~ item.name) | quote }}
+  delegate_to: localhost
+  loop: "{{ pve_firewall_segment_objects }}"
+  when:
+    - not ansible_check_mode
+    - item.ipset not in (pve_firewall_current_ipsets | map(attribute='name') | list)
+  register: pve_firewall_ipset_create
+  changed_when: true
+  failed_when: pve_firewall_ipset_create.rc != 0
+  no_log: "{{ pve_firewall_pc_no_log }}"
+  run_once: true
+  tags:
+    - firewall
+    - phase15
+
+- name: Read current IPSet entries for each segment.
+  ansible.builtin.command:
+    argv:
+      - "{{ pve_firewall_pc_bin }}"
+      - "api"
+      - "GET"
+      - "/cluster/firewall/ipset/{{ item.ipset }}"
+  delegate_to: localhost
+  loop: "{{ pve_firewall_segment_objects }}"
+  register: pve_firewall_ipset_entries_get
+  changed_when: false
+  failed_when: pve_firewall_ipset_entries_get.rc != 0
+  no_log: "{{ pve_firewall_pc_no_log }}"
+  run_once: true
+  tags:
+    - firewall
+    - phase15
+
+- name: Add segment CIDRs to their IPSets when missing.
+  # PVE IPSet entry API accepts cidr and optional comment through pc --data.
+  ansible.builtin.command:
+    cmd: >-
+      {{ pve_firewall_pc_bin }} api POST /cluster/firewall/ipset/{{ item.item.ipset }} --yes
+      --data {{ ('cidr=' ~ item.item.cidr) | quote }}
+      --data {{ ('comment=pve-deploy ' ~ item.item.name) | quote }}
+  delegate_to: localhost
+  loop: "{{ pve_firewall_ipset_entries_get.results }}"
+  when:
+    - not ansible_check_mode
+    - "item.item.cidr not in (((item.stdout | default('{\"data\": []}') | from_json).data | default([])) | map(attribute='cidr') | list)"
+  register: pve_firewall_ipset_entry_create
+  changed_when: true
+  failed_when: pve_firewall_ipset_entry_create.rc != 0
+  no_log: "{{ pve_firewall_pc_no_log }}"
+  run_once: true
+  tags:
+    - firewall
+    - phase15

@@ -1,0 +1,16 @@
+{
+  "host": "{{ parent_host }}",
+  "bmc_address": "{{ ansible_host }}",
+  "timestamp": "{{ stamp }}",
+  "evidence_source": "{{ raid_evidence_source }}",
+  "storage_controllers": {{ storage_controllers | to_nice_json }},
+  "physical_drives": {{ physical_drives | to_nice_json }},
+  "virtual_disks": {{ virtual_disks | to_nice_json }},
+  "boot_device_analysis": {
+    "confident": {{ boot_device_confident | to_json }},
+    "redundancy": "{{ boot_disk_redundancy }}",
+    "identifiers": {{ boot_device_identifiers | to_nice_json }}
+  },
+  "ceph_osd_candidates": {{ ceph_osd_candidates | to_nice_json }},
+  "ceph_raid0_findings": {{ ceph_raid0_findings | to_nice_json }}
+}

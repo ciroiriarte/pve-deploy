@@ -1,0 +1,74 @@
+---
+# pve_ceph_benchmark defaults.
+#
+# Phase G/H: TEMPORARY, gated benchmark of pool-tier variants (replica3 / EC2+1 x
+# none / zstd-aggressive) with `rados bench` + `fio` librbd, followed by a GUARDED
+# teardown that only ever touches pools carrying the tst- prefix. Every temp
+# object is created and removed; production pools are untouched.
+
+# Human gate. The role refuses to run the benchmark unless this is true.
+pve_ceph_benchmark_confirm: false
+
+# Deterministic first node (all ceph commands + the benchmark script run here).
+pve_ceph_first_node: "{{ (groups['pve'] | default([]) | sort | first) | default('') }}"
+pve_ceph_nodes: "{{ groups['pve'] | default([]) | sort }}"
+
+# CRUSH placement for the temp pools (matches the production class rule).
+pve_ceph_crush_rule: "repl-nvme-host"
+pve_ceph_device_class: "nvme"
+
+# Erasure-coding profile for the EC tier.
+#
+# CAVEAT: EC k=2 m=1 means min_size = k + 1 = 3, so losing a single shard blocks
+# I/O. EC is a capacity-tier candidate only, never for VM/random workloads.
+pve_ceph_benchmark_ec_profile: "ec21"
+pve_ceph_benchmark_ec_k: 2
+pve_ceph_benchmark_ec_m: 1
+
+# The tst- prefix is the teardown guard: nothing without it is ever deleted.
+pve_ceph_benchmark_pool_prefix: "tst-"
+pve_ceph_benchmark_pg_num: 128
+pve_ceph_benchmark_meta_pg_num: 32
+pve_ceph_benchmark_meta_pool: "tst-ec-meta"
+
+# Benchmark pools. label / name / type / compression / meta (empty = replicated
+# image, so no separate metadata pool). All names carry the tst- prefix.
+pve_ceph_benchmark_pools:
+  - label: "replica3"
+    name: "tst-nvme-replica3"
+    type: "replicated"
+    compression: "none"
+    meta: ""
+  - label: "replica3-compressed"
+    name: "tst-nvme-replica3-compressed"
+    type: "replicated"
+    compression: "zstd"
+    meta: ""
+  - label: "ec2+1"
+    name: "tst-nvme-ec2+1"
+    type: "erasure"
+    compression: "none"
+    meta: "tst-ec-meta"
+  - label: "ec2+1-compressed"
+    name: "tst-nvme-ec2+1-compressed"
+    type: "erasure"
+    compression: "zstd"
+    meta: "tst-ec-meta"
+
+# Measurement knobs.
+pve_ceph_benchmark_rounds: 4
+pve_ceph_benchmark_image: "bench"
+pve_ceph_benchmark_image_size: "256G"
+pve_ceph_benchmark_rados_secs: 20
+pve_ceph_benchmark_fio_runtime: 60
+# Where the benchmark script writes its result bundle on the first node.
+pve_ceph_benchmark_results_root: "/root"
+pve_ceph_benchmark_health_retries: 30
+pve_ceph_benchmark_health_delay: 10
+
+# Reporting (same contract as pve_firewall / pve_repos).
+environment_name: "production"
+pve_environment: "production"
+pve_deploy_root: "{{ (playbook_dir ~ '/..') | realpath }}"
+pve_site_root: "{{ pve_deploy_root }}"
+reports_dir: "{{ pve_site_root }}/reports"

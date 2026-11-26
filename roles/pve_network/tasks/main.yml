@@ -1,0 +1,293 @@
+---
+# Proxmox VE API (POST /nodes/{node}/network) only supports standard bonding parameters
+# (bond_mode, bond_xmit_hash_policy, slaves) and omits production requirements such as
+# bond-miimon and bond-lacp-rate. Network topology is therefore rendered via SSH template.
+
+# Deterministic SDN bond MAC pin: ifreload nondeterministically
+# reassigns the LACP bond MAC to a different slave's permanent address, and the ConnectX-6
+# then drops RX-unicast for the bond MAC (rx_steer_missed) -> the VXLAN underlay goes 100%
+# RX loss, silently (mgmt rides a different bond). Pinning `hwaddress` to the SDN bond's
+# first slave's PERMANENT MAC freezes it across ifreload/reboot. Read it live (ethtool -P)
+# so it re-derives after a NIC replacement instead of hardcoding a stale value.
+- name: Determine the SDN bond's first slave
+  ansible.builtin.set_fact:
+    pve_network_sdn_bond_first_slave: >-
+      {{ (cabling | default([]) | selectattr('os_device', 'defined') | selectattr('os_device')
+          | selectattr('bond', 'equalto', pve_network_vm_bridge_parent)
+          | map(attribute='os_device') | list | sort | first) | default('', true) }}
+  when: pve_network_pin_sdn_bond_mac | default(true)
+  tags:
+    - phase11
+    - pve_network
+
+- name: Read the SDN bond first-slave permanent MAC
+  ansible.builtin.command:
+    cmd: "ethtool -P {{ pve_network_sdn_bond_first_slave }}"
+  register: pve_network_sdn_slave_perm
+  changed_when: false
+  when:
+    - pve_network_pin_sdn_bond_mac | default(true)
+    - pve_network_sdn_bond_first_slave | default('') | length > 0
+  tags:
+    - phase11
+    - pve_network
+
+- name: Set the pinned SDN bond MAC fact
+  ansible.builtin.set_fact:
+    pve_network_sdn_bond_mac: "{{ pve_network_sdn_slave_perm.stdout | regex_search('[0-9a-fA-F:]{17}') | default('', true) }}"
+  when:
+    - pve_network_pin_sdn_bond_mac | default(true)
+    - pve_network_sdn_slave_perm is defined
+    - pve_network_sdn_slave_perm.stdout is defined
+  tags:
+    - phase11
+    - pve_network
+
+- name: Render network interface configuration to staging file
+  ansible.builtin.template:
+    src: interfaces.j2
+    dest: "{{ pve_network_staging_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+  register: pve_network_render
+  tags:
+    - phase11
+    - pve_network
+
+# ifquery, not `ifup --no-act`.
+#
+# `ifup --no-act` is the intended way to validate a candidate config, and it
+# CANNOT SUCCEED HERE. On a node that does not yet have this topology it fails
+# two ways, neither of them a fault in the config:
+#
+#   error: NetlinkListenerWithCache.link_add_vlan_dry_run() takes from 4 to 5
+#          positional arguments but 6 were given
+#   error: vmbr1: netlink: failed to set mtu to 9216: operation failed with
+#          'No such device' (19)
+#
+# The first is a TypeError inside ifupdown2's own dry-run path (3.3.0-1+pmx12).
+# The second is inherent to dry-run: MTU is set on a bridge that dry-run never
+# creates. So the gate rejected every greenfield node -- exactly the case phase
+# 11 exists for -- while the same file parses and applies correctly.
+#
+# `ifquery -i <file> -a` parses the file and exits 0 on valid input, which is a
+# genuine syntax gate. Be clear that it is WEAKER: it catches malformed stanzas
+# and unknown options, not semantic errors like naming a NIC that is absent.
+# What covers those is the on-node rollback timer armed below, which restores
+# the previous config if the management path does not come back -- and that is
+# the real safety net regardless of which validator runs here.
+#
+# Do not "fix" this by ignoring the dry-run's exit code: that would accept a
+# genuinely broken file as readily as a working one.
+- name: Validate staged network configuration syntax
+  ansible.builtin.command:
+    cmd: "ifquery -i {{ pve_network_staging_path }} -a"
+  register: pve_network_validation
+  changed_when: false
+  failed_when: pve_network_validation.rc != 0
+  tags:
+    - phase11
+    - pve_network
+
+- name: Display planned network interface diff
+  ansible.builtin.command:
+    cmd: "diff -u /etc/network/interfaces {{ pve_network_staging_path }}"
+  register: pve_network_diff
+  changed_when: false
+  # rc 1 means the files differ, which is the normal "there is work to do" case.
+  # rc >1 is a real diff error (missing file, unreadable) and must not be treated
+  # as drift, or the role would apply a config it never managed to compare.
+  failed_when: pve_network_diff.rc > 1
+  tags:
+    - phase11
+    - pve_network
+
+- name: Detect PVE's own pending network changes
+  ansible.builtin.stat:
+    path: /etc/network/interfaces.new
+  register: pve_network_pve_pending
+  changed_when: false
+  tags:
+    - phase11
+    - pve_network
+
+- name: Warn that PVE has its own pending network changes staged
+  ansible.builtin.debug:
+    msg: >-
+      /etc/network/interfaces.new exists on {{ inventory_hostname }}. That is PVE's
+      pending-changes file, written by the web UI and committed on boot by
+      pvenetcommit.service. It is not managed here and will be applied
+      independently of this role. Resolve or remove it before relying on Phase 11.
+  when: pve_network_pve_pending.stat.exists
+  tags:
+    - phase11
+    - pve_network
+
+- name: Safe network application block
+  when:
+    - pve_network_diff.rc == 1
+    - pve_network_apply | bool
+  tags:
+    - phase11
+    - pve_network
+  block:
+    # Timestamp comes from the node, not from ansible_date_time: with fact
+    # caching enabled (see ansible.cfg) a cached date would make successive
+    # "timestamped" backups collide and overwrite each other.
+    - name: Stamp this apply run from the target clock
+      ansible.builtin.command:
+        cmd: date -u +%Y%m%dT%H%M%SZ
+      register: pve_network_stamp
+      changed_when: false
+
+    - name: Create timestamped backup of current interfaces file
+      ansible.builtin.copy:
+        src: /etc/network/interfaces
+        dest: "/etc/network/interfaces.bak.{{ pve_network_stamp.stdout | trim }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+      register: pve_network_backup
+
+    # systemd-run refuses to create a unit name that already exists, so a unit
+    # left behind by an interrupted run would block arming on the retry.
+    #
+    # noqa command-instead-of-module: ansible.builtin.systemd_service can stop a
+    # unit but has no reset-failed equivalent, and a *failed transient* unit is
+    # exactly what lingers here and blocks systemd-run. The module would also
+    # error on a unit that does not exist, which is the normal case.
+    - name: Clear any rollback unit left by a previous run # noqa: command-instead-of-module
+      ansible.builtin.shell:
+        cmd: |
+          systemctl stop {{ pve_network_rollback_unit }}.timer 2>/dev/null || true
+          systemctl reset-failed {{ pve_network_rollback_unit }}.timer 2>/dev/null || true
+          systemctl reset-failed {{ pve_network_rollback_unit }}.service 2>/dev/null || true
+          exit 0
+      changed_when: false
+
+    # Armed BEFORE the apply and disarmed only after reachability is proven.
+    # If the new config cuts the management path, the controller cannot reach
+    # the node to fix it; the node restores itself when this timer fires.
+    #
+    # AccuracySec is not optional here. systemd defaults it to 1min and coalesces
+    # timers to save wakeups, so without this an --on-active=120 rollback was
+    # measured firing late and could drift up to a minute -- a minute of extra
+    # outage on a node that is already unreachable.
+    - name: Arm on-node rollback timer before touching the management path
+      ansible.builtin.command:
+        argv:
+          - systemd-run
+          - "--unit={{ pve_network_rollback_unit }}"
+          - "--on-active={{ pve_network_rollback_delay }}"
+          - "--timer-property=AccuracySec={{ pve_network_rollback_accuracy }}"
+          - "--description=pve-deploy automatic network rollback"
+          - /bin/sh
+          - -c
+          - "cp -f {{ pve_network_backup.dest | quote }} /etc/network/interfaces && ifreload -a"
+      changed_when: true
+
+    - name: Confirm the rollback timer is armed before applying
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - is-active
+          - "{{ pve_network_rollback_unit }}.timer"
+      register: pve_network_rollback_armed
+      changed_when: false
+      failed_when: pve_network_rollback_armed.stdout | trim != "active"
+
+    - name: Overwrite /etc/network/interfaces with staged configuration
+      ansible.builtin.copy:
+        src: "{{ pve_network_staging_path }}"
+        dest: /etc/network/interfaces
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Apply network interface changes using ifreload
+      ansible.builtin.command:
+        cmd: ifreload -a
+      register: pve_network_ifreload
+      changed_when: pve_network_ifreload.rc == 0
+
+    # ignore_unreachable lets a severed management path surface as a failed task
+    # this block can rescue, instead of an unreachable host that Ansible removes
+    # from the play, which would skip the rescue entirely.
+    - name: Verify management reachability following apply
+      ansible.builtin.ping:
+      register: pve_network_ping_check
+      until: pve_network_ping_check is succeeded
+      retries: "{{ pve_network_verify_retries }}"
+      delay: "{{ pve_network_verify_delay }}"
+      ignore_unreachable: true
+
+    - name: Fail when the node is no longer reachable after apply
+      ansible.builtin.fail:
+        msg: >-
+          Management reachability lost after applying network configuration.
+          The on-node rollback timer '{{ pve_network_rollback_unit }}' will restore
+          {{ pve_network_backup.dest }} within {{ pve_network_rollback_delay }}s.
+      when: pve_network_ping_check is unreachable or pve_network_ping_check is failed
+
+    - name: Disarm on-node rollback timer after confirmed reachability
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - stop
+          - "{{ pve_network_rollback_unit }}.timer"
+      register: pve_network_rollback_disarm
+      changed_when: pve_network_rollback_disarm.rc == 0
+      failed_when: false
+
+    - name: Confirm the rollback timer is no longer pending
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - is-active
+          - "{{ pve_network_rollback_unit }}.timer"
+      register: pve_network_rollback_state
+      changed_when: false
+      failed_when: pve_network_rollback_state.stdout | trim == "active"
+
+  rescue:
+    # Deliberately does NOT try to restore over SSH. If the apply cut the
+    # management path the node is unreachable and any recovery task here would
+    # fail too; the on-node timer armed above is what actually restores service.
+    - name: Report that recovery is delegated to the on-node rollback timer
+      ansible.builtin.fail:
+        msg: >-
+          Phase 11 failed on {{ inventory_hostname }} after arming the rollback timer.
+          The node restores {{ pve_network_backup.dest | default('the pre-apply backup') }}
+          automatically within {{ pve_network_rollback_delay }}s of the apply.
+          If the node stays unreachable past that window, recover via BMC serial console.
+
+- name: Render change report payload
+  ansible.builtin.template:
+    src: report_payload.json.j2
+    dest: "/tmp/pve_network_report_{{ inventory_hostname }}.json"
+    mode: "0600"
+  delegate_to: localhost
+  when:
+    - pve_network_diff.rc == 1
+    - pve_network_apply | bool
+  tags:
+    - phase11
+    - pve_network
+
+- name: Emit change report via tools/report.py
+  ansible.builtin.command:
+    cmd: "python3 tools/report.py render /tmp/pve_network_report_{{ inventory_hostname }}.json --out {{ reports_dir }}/"
+    chdir: "{{ pve_deploy_root }}"
+  delegate_to: localhost
+  register: pve_network_report_output
+  failed_when: pve_network_report_output.rc != 0
+  changed_when: true
+  when:
+    - pve_network_diff.rc == 1
+    - pve_network_apply | bool
+  tags:
+    - phase11
+    - pve_network

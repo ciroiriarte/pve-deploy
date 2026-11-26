@@ -1,0 +1,196 @@
+---
+# Attaches an image via the Lenovo XClarity Controller OEM RemoteMap service.
+#
+# WHY THIS IS NOT VirtualMedia.InsertMedia
+#
+# XCC exposes ten virtual-media slots (EXT1-4, Remote1-4, RDOC1-2) and every one
+# of them reports `Actions: []` on firmware KAX368P 6.20. The standard DMTF
+# insert action does not exist on this hardware, so a role written against the
+# specification alone would find nothing to call.
+#
+# The OEM path is a two-step operation, which is the part worth remembering:
+#
+#   1. POST the image into the MountImages collection -- this REGISTERS it and
+#      returns an Id, but mounts nothing (Mounted: false).
+#   2. POST LenovoRemoteMapService.Mount -- which takes NO PARAMETERS and mounts
+#      whatever is currently registered.
+#
+# Calling Mount with a URL-shaped payload returns HTTP 204 and mounts nothing.
+# It looks like success and is not, so the verification at the end of this file
+# is load-bearing rather than decorative.
+
+- name: Set the RemoteMap endpoints
+  ansible.builtin.set_fact:
+    xcc_remotemap: "https://{{ ansible_host }}/redfish/v1/Managers/1/Oem/Lenovo/RemoteMap"
+  changed_when: false
+
+- name: Read what is currently registered
+  ansible.builtin.uri:
+    url: "{{ xcc_remotemap }}/MountImages"
+    method: GET
+    user: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_validate_certs }}"
+    timeout: "{{ bmc_timeout }}"
+  register: xcc_mounted_before
+  no_log: true
+  changed_when: false
+
+# Cleared before registering, not after.
+#
+# The collection is small and shared, and a leftover entry from an interrupted
+# run points at a stale image -- possibly another host's, since the images are
+# per-host. Mount takes no arguments and mounts what is registered, so a stale
+# entry is not inert: it is what would get mounted.
+- name: Release any previously registered image
+  ansible.builtin.uri:
+    url: "{{ xcc_remotemap }}/Actions/LenovoRemoteMapService.UMount"
+    method: POST
+    body_format: json
+    body: {}
+    user: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_validate_certs }}"
+    timeout: "{{ bmc_timeout }}"
+    status_code: [200, 202, 204]
+  no_log: true
+  changed_when: true
+  when: (xcc_mounted_before.json | default({}))['Members@odata.count'] | default(0) | int > 0
+
+# UMount also removes the registration -- a following DELETE on the entry
+# returns 404 because it is already gone, not because anything failed. This
+# sweep therefore usually finds nothing, and exists for the case where an entry
+# was registered but never mounted, which UMount does not clear.
+- name: Sweep any registration UMount left behind
+  ansible.builtin.uri:
+    url: "https://{{ ansible_host }}{{ item['@odata.id'] }}"
+    method: DELETE
+    user: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_validate_certs }}"
+    timeout: "{{ bmc_timeout }}"
+    status_code: [200, 202, 204, 404]
+  loop: "{{ (xcc_mounted_before.json | default({})).Members | default([]) }}"
+  loop_control:
+    label: "{{ item['@odata.id'] }}"
+  no_log: true
+  changed_when: true
+
+- name: Register the image
+  ansible.builtin.uri:
+    url: "{{ xcc_remotemap }}/MountImages"
+    method: POST
+    body_format: json
+    body:
+      FilePath: "{{ os_install_media_url }}"
+      Type: "{{ os_install_media_protocol }}"
+      Readonly: true
+    user: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_validate_certs }}"
+    timeout: "{{ bmc_timeout }}"
+    status_code: [200, 201, 202]
+  register: xcc_register
+  no_log: true
+  changed_when: true
+
+- name: Mount whatever is registered
+  # No body by design. The action's own schema declares "parameters": {} -- it
+  # does not take the image, it takes nothing and acts on the collection.
+  ansible.builtin.uri:
+    url: "{{ xcc_remotemap }}/Actions/LenovoRemoteMapService.Mount"
+    method: POST
+    body_format: json
+    body: {}
+    user: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_validate_certs }}"
+    timeout: "{{ bmc_timeout }}"
+    status_code: [200, 202, 204]
+  no_log: true
+  changed_when: true
+
+- name: Confirm the image reports itself mounted
+  ansible.builtin.uri:
+    url: "{{ xcc_remotemap }}/MountImages"
+    method: GET
+    user: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_validate_certs }}"
+    timeout: "{{ bmc_timeout }}"
+  register: xcc_mounted_after
+  no_log: true
+  until: (xcc_mounted_after.json | default({}))['Members@odata.count'] | default(0) | int > 0
+  retries: 6
+  delay: 5
+  changed_when: false
+
+- name: Read the registered entry back
+  ansible.builtin.uri:
+    url: "https://{{ ansible_host }}{{ ((xcc_mounted_after.json | default({})).Members | default([{}]) | first)['@odata.id'] | default('') }}"
+    method: GET
+    user: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_validate_certs }}"
+    timeout: "{{ bmc_timeout }}"
+  register: xcc_entry
+  no_log: true
+  changed_when: false
+  when: (xcc_mounted_after.json | default({}))['Members@odata.count'] | default(0) | int > 0
+
+# Verified independently of the mount call's own return code.
+#
+# Mount answers 204 whether or not it mounted anything -- an empty collection
+# and a URL-shaped payload both produce 204 with nothing attached. The only
+# trustworthy evidence is the resulting state: the entry says Mounted, and a
+# VirtualMedia slot reports the image inserted.
+- name: Read the virtual media slots
+  ansible.builtin.uri:
+    url: "https://{{ ansible_host }}/redfish/v1/Managers/1/VirtualMedia?$expand=."
+    method: GET
+    user: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_validate_certs }}"
+    timeout: "{{ bmc_timeout }}"
+  register: xcc_vmedia
+  no_log: true
+  changed_when: false
+
+- name: Identify the slot holding this image
+  ansible.builtin.set_fact:
+    os_install_media_slot: >-
+      {{ ((xcc_vmedia.json | default({})).Members | default([]))
+         | selectattr('Inserted', 'defined')
+         | selectattr('Inserted')
+         | selectattr('Image', 'defined')
+         | selectattr('Image', 'equalto', os_install_media_url)
+         | map(attribute='Id') | list | first | default('') }}
+  changed_when: false
+
+- name: Fail when the image did not actually attach
+  ansible.builtin.fail:
+    msg: >-
+      RemoteMap reported success but {{ inventory_hostname }} has no virtual
+      media slot holding {{ os_install_media_url }}.
+      Registered entry Mounted={{ (xcc_entry.json | default({})).Mounted | default('unknown') }}.
+      Check that the BMC can resolve and reach the URL, and that the publishing
+      server honours HTTP Range requests -- the BMC reads the image sparsely and
+      a server without 206 support fails at exactly this point.
+  when: os_install_media_slot | length == 0
+
+- name: Report the attached media
+  ansible.builtin.debug:
+    msg:
+      - "host  : {{ inventory_hostname }} ({{ ansible_host }})"
+      - "slot  : {{ os_install_media_slot }}"
+      - "image : {{ os_install_media_url }}"
+      - "mounted: {{ (xcc_entry.json | default({})).Mounted | default('unknown') }}"
+  changed_when: false

@@ -1,0 +1,146 @@
+---
+# Waits for the node to come back as an installed system.
+#
+# WHAT IS ACTUALLY BEING OBSERVED
+#
+# Nothing reports progress. The installer has no channel back to the control
+# node here -- [post-installation-webhook] fails for exactly the reason
+# --fetch-from http fails, because it is sent by the INSTALLER over the same
+# single untagged link facing an LACP port that will not pass its traffic.
+#
+# So the first observable moment is SSH answering on the management address,
+# which happens only after: the disk was written, the bootloader works, the
+# first-boot hook laid down the bond and VLAN, and the system finished booting.
+# That is a strong signal -- it clears the whole chain at once -- but it is a
+# LATE one, and a coarse one: a timeout here means "something in that chain did
+# not work", not "the installation failed". Distinguishing them needs the
+# Serial-over-LAN console.
+
+- name: Assert the completion check is one this role implements
+  ansible.builtin.assert:
+    that:
+      - os_install_completion_check in ['ssh', 'none']
+    fail_msg: >-
+      os_install_completion_check={{ os_install_completion_check }} is not
+      implemented. Use 'ssh' to poll the management address, or 'none' to return
+      as soon as the machine is powered on and watch the install over SoL.
+    quiet: true
+  changed_when: false
+
+- name: Explain how to watch an install that reports nothing
+  ansible.builtin.debug:
+    msg:
+      - "{{ inventory_hostname }}: installing. Nothing reports progress until the node is up."
+      - "watch: ipmitool -I lanplus -H {{ ansible_host }} -U {{ bmc_username }} -P '<password>' sol activate"
+      - "waiting for: {{ os_install_mgmt_ip }}:{{ os_install_mgmt_port }}"
+      - "timeout: {{ os_install_wait_timeout }}s"
+  changed_when: false
+
+- name: Return without waiting
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }} was power cycled into the installer.
+      os_install_completion_check=none, so this run does not wait for it.
+      The media is still attached and will be detached by a later run or by
+      hand -- see the cleanup tags.
+  when: os_install_completion_check == 'none'
+  changed_when: false
+
+- name: Wait for the installed system to answer
+  when: os_install_completion_check == 'ssh'
+  block:
+    # The delay matters more than it looks. Polling immediately would find the
+    # port closed and, on a machine that had a previous OS, could instead find
+    # the OLD system still answering during the seconds before it goes down --
+    # reporting an install complete that has not started.
+    - name: Poll the management address
+      ansible.builtin.wait_for:
+        host: "{{ os_install_mgmt_ip }}"
+        port: "{{ os_install_mgmt_port }}"
+        delay: "{{ os_install_wait_delay }}"
+        timeout: "{{ os_install_wait_timeout }}"
+        sleep: "{{ os_install_wait_interval }}"
+        state: started
+      changed_when: false
+
+    - name: Record the installed system as reachable
+      ansible.builtin.set_fact:
+        os_install_outcome: "installed"
+      changed_when: false
+
+  rescue:
+    # Before blaming the target, check this end of the connection.
+    #
+    # wait_for polls FROM THE CONTROL NODE. If the control node loses its path
+    # to the site mid-wait -- a dropped VPN, a routing change, a laptop moving
+    # networks -- the port reads closed no matter what the node is doing, and
+    # the run reports a failed installation on a machine that may have installed
+    # perfectly. That happened on 2026-08-01 and sent the diagnosis in entirely
+    # the wrong direction for some time.
+    #
+    # The BMC is the right reference: it is on the same path from here, it is
+    # completely independent of the target's OS state, and this role is already
+    # authenticated to it. If the BMC is reachable, the control node's path is
+    # fine and the silence is genuinely the target's.
+    - name: Check whether this control node can still reach the BMC
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}/redfish/v1/Systems/1"
+        method: GET
+        user: "{{ bmc_username }}"
+        password: "{{ bmc_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ bmc_validate_certs }}"
+        timeout: "{{ bmc_timeout }}"
+      register: os_install_path_check
+      no_log: true
+      failed_when: false
+      changed_when: false
+
+    - name: Record that the node never came back
+      ansible.builtin.set_fact:
+        os_install_outcome: >-
+          {{ (os_install_path_check.status | default(0) == 200)
+             | ternary('timeout', 'control-path-lost') }}
+      changed_when: false
+
+    # A different failure with a different remedy, so it gets its own message.
+    # Re-running is the right move here; investigating the node is not.
+    - name: Report that the control node lost its path to the site
+      ansible.builtin.debug:
+        msg:
+          - "{{ inventory_hostname }}: this control node can no longer reach the BMC at {{ ansible_host }} either."
+          - "The wait therefore proves NOTHING about the installation -- the poll"
+          - "runs from here, and from here nothing at this site is reachable."
+          - "Check the VPN/routing on the control node, then re-run with"
+          - "-e os_install_dry_run=false to resume waiting. The node has been left"
+          - "alone and its media is still attached."
+      when: os_install_outcome == 'control-path-lost'
+      changed_when: false
+
+    - name: Report what a timeout does and does not mean
+      ansible.builtin.debug:
+        msg:
+          - "{{ inventory_hostname }} did not answer on {{ os_install_mgmt_ip }}:{{ os_install_mgmt_port }} within {{ os_install_wait_timeout }}s."
+          - "This does NOT establish that the installation failed. It fails the same way when:"
+          - "  - the install succeeded but the first-boot hook did not configure the bond/VLAN"
+          - "  - the install succeeded but the switch side of the LACP bond is not up"
+          - "  - the installer is still running and simply needs longer"
+          - "  - the installer stopped on a prompt (a bad answer file reaches an interactive screen)"
+          - "Check the SoL console before re-running anything: it is the only view of which of these happened."
+      changed_when: false
+
+    - name: Fail the host
+      ansible.builtin.fail:
+        msg: >-
+          {{ inventory_hostname }}: installation not confirmed within
+          {{ os_install_wait_timeout }}s. Media has been left attached
+          deliberately -- see the cleanup step.
+
+- name: Report the installed node
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }} answered on {{ os_install_mgmt_ip }}:{{ os_install_mgmt_port }}.
+      Disk written, bootloader working, first-boot hook applied and network up.
+      Next: phase 10 baseline, then 11-network for the full topology.
+  when: os_install_outcome | default('') == 'installed'
+  changed_when: false

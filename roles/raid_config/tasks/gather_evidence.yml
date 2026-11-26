@@ -1,0 +1,110 @@
+---
+- name: Initialize storage evidence collection variables
+  ansible.builtin.set_fact:
+    storage_controllers: []
+    physical_drives: []
+    virtual_disks: []
+    raid_evidence_source: "none"
+  changed_when: false
+
+- name: Locate existing companion bmc_inventory evidence document
+  ansible.builtin.find:
+    paths: "{{ evidence_dir }}"
+    patterns: "{{ parent_host }}-hardware-*.json"
+  delegate_to: localhost
+  register: existing_storage_evidence_files
+  changed_when: false
+
+- name: Read pre-existing bmc_inventory storage evidence if present
+  when: existing_storage_evidence_files.matched > 0
+  block:
+    - name: Select newest storage evidence document
+      ansible.builtin.set_fact:
+        target_storage_evidence_file: "{{ (existing_storage_evidence_files.files | sort(attribute='mtime') | last).path }}"
+      changed_when: false
+
+    - name: Read storage evidence file contents
+      ansible.builtin.slurp:
+        src: "{{ target_storage_evidence_file }}"
+      register: slurped_storage_evidence
+      delegate_to: localhost
+      changed_when: false
+
+    # Key paths must track the bmc_inventory schema, which nests everything
+    # under a top-level "storage" object and names volumes "volumes".
+    #
+    # These used to read top-level .storage_controllers / .physical_drives /
+    # .virtual_disks — keys bmc_inventory has never written. All three
+    # | default([]) fired on every host, so the role reported 0 controllers,
+    # 0 drives and 0 Ceph OSD candidates while the evidence file beside it held
+    # 2 controllers, 6 drives and 2 volume groups. boot_device_confident came
+    # out false fleet-wide as a direct result, and the audit called it success.
+    #
+    # storage.volumes is a per-controller wrapper, [{Controller, Volumes[]}],
+    # so volumes are flattened out of it here and stamped with the owning
+    # controller name. Doing it at parse time keeps the wrapper shape from
+    # leaking into audit_storage.yml.
+    - name: Parse storage inventory from evidence document
+      vars:
+        storage_evidence_doc: "{{ slurped_storage_evidence.content | b64decode | from_json }}"
+      ansible.builtin.set_fact:
+        storage_controllers: "{{ storage_evidence_doc.storage.controllers | default([]) }}"
+        physical_drives: "{{ storage_evidence_doc.storage.physical_drives | default([]) }}"
+        virtual_disks: >-
+          {%- set flattened = [] -%}
+          {%- for group in storage_evidence_doc.storage.volumes | default([]) -%}
+          {%-   for volume in group.Volumes | default([]) -%}
+          {%-     set _ = flattened.append(volume | combine({'controller': group.Controller})) -%}
+          {%-   endfor -%}
+          {%- endfor -%}
+          {{ flattened }}
+        raid_evidence_source: "bmc_inventory_file"
+      changed_when: false
+
+- name: Query Redfish directly when companion storage evidence is absent
+  when: storage_controllers | length == 0 and physical_drives | length == 0
+  block:
+    - name: Fetch storage collection via Redfish info module
+      community.general.redfish_info:
+        category: Systems
+        command: GetStorage
+        baseuri: "{{ ansible_host }}"
+        username: "{{ bmc_username }}"
+        password: "{{ bmc_password }}"
+        timeout: "{{ bmc_timeout }}"
+        validate_certs: "{{ bmc_validate_certs }}"
+      register: redfish_storage_info
+      no_log: true
+      changed_when: false
+
+    # Fallback to direct Redfish URI endpoint if module returns incomplete data
+    # needs verification against a live XCC
+    - name: Fetch Redfish storage collection endpoint directly
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}/redfish/v1/Systems/1/Storage"
+        method: GET
+        user: "{{ bmc_username }}"
+        password: "{{ bmc_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ bmc_validate_certs }}"
+        status_code: [200, 404]
+      register: redfish_storage_uri
+      no_log: true
+      failed_when: false
+      changed_when: false
+
+    - name: Extract physical drives and controllers from Redfish response
+      ansible.builtin.set_fact:
+        storage_controllers: "{{ redfish_storage_info.redfish_facts.storage.entries[0].StorageControllers | default([]) }}"
+        physical_drives: "{{ redfish_storage_info.redfish_facts.storage.entries[0].Drives | default([]) }}"
+        virtual_disks: "{{ redfish_storage_info.redfish_facts.storage.entries[0].Volumes | default([]) }}"
+        raid_evidence_source: "redfish_direct"
+      when:
+        - redfish_storage_info.redfish_facts is defined
+        - redfish_storage_info.redfish_facts.storage is defined
+      changed_when: false
+
+# Runs last, after either source has populated the lists, so everything
+# downstream sees one schema regardless of where the evidence came from.
+- name: Normalize storage evidence to a single canonical shape
+  ansible.builtin.include_tasks: normalize_evidence.yml

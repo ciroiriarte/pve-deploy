@@ -1,0 +1,49 @@
+---
+# Ansible Galaxy Collection Requirements
+# Install via: ansible-galaxy collection install -r requirements.yml
+
+collections:
+  # Proxmox management collection (requires proxmoxer >= 2.3.0 on control host)
+  - name: community.proxmox
+    version: ">=2.0.0"
+
+  # Standard POSIX utility modules (mount, sysctl, firewalld, ACLs)
+  - name: ansible.posix
+    version: ">=1.5.0"
+
+  # General community modules (general utility, XML, JSON, archive operations)
+  - name: community.general
+    version: ">=8.0.0"
+
+# External Dependency Pins & System Tooling Notes
+# -----------------------------------------------------------------------------
+# The following binary utilities MUST be pre-installed on the Ansible Control Host:
+#
+# 1. pc (PVE CLI REST client):
+#    Repo: https://github.com/ciroiriarte/pve-cli
+#    Min Version: v0.13.0
+#    Binary location: /usr/local/bin/pc
+#    Pre-1.0, so the CLI surface and JSON output may change between minor
+#    releases. Pin exactly in production and re-test on upgrade.
+#
+# 2. pve-tools (Proxmox VE Operational Scripts):
+#    Repo: https://github.com/ciroiriarte/pve-tools
+#    Min Version: v1.11.0
+#    Installed on the hypervisor node: /usr/sbin via the OBS .deb, or
+#    /usr/local/sbin for a manual copy. This is the bundle version; each
+#    script also carries its own VERSION string.
+#
+# 3. Python libraries (installed in active Python environment on control host):
+#    - proxmoxer >= 2.3.0
+#    - requests >= 2.31.0
+#    - netaddr >= 0.9.0
+#
+# Deliberately NOT required: jmespath. The json_query filter needs it and it is
+# absent from a stock control host, so roles build structures with plain Jinja
+# instead. If you introduce json_query anywhere, add jmespath here first --
+# otherwise it fails at template-render time, late in a long play.
+#
+# tools/report.py and tools/sheet_sync.py: report.py is stdlib-only by design.
+# sheet_sync.py needs google-api-python-client, google-auth-oauthlib and
+# google-auth-httplib2, and is only used to regenerate inventory from the
+# spreadsheet -- deployment runs read the committed inventory and need none of it.

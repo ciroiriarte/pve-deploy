@@ -1,0 +1,29 @@
+# BIOS Audit Report: {{ parent_host }}
+
+- **Target Host**: {{ parent_host }} (`{{ ansible_host }}`)
+- **Environment**: {{ environment_name }}
+- **Audit Outcome**: {{ bios_audit_outcome | upper }}
+- **Evidence Source**: {{ bios_evidence_source }}
+- **Audit Mode**: ZERO WRITES PERFORMED
+
+## Summary
+
+| Critical Drift | Warning Drift | Matches | Absent Attributes |
+|----------------|---------------|---------|-------------------|
+| {{ bios_audit_critical_count }} | {{ bios_audit_warning_count }} | {{ bios_audit_match_count }} | {{ bios_audit_absent_count }} |
+
+> [!IMPORTANT]
+> **Bootloader Derivation Precondition**: `SecureBootConfiguration.SecureBootSetting: Disabled` is a structural requirement. Under UEFI + ZFS root, enabling Secure Boot forces the Proxmox installer to select **GRUB** instead of **systemd-boot**, causing silent bootloader divergence across nodes. Drift on this attribute is marked **CRITICAL**.
+
+## BIOS Baseline Drift Assessment
+
+| Attribute Name | Desired Baseline | Current Applied | Pending Staged | Status | Severity | Notes |
+|----------------|------------------|-----------------|----------------|--------|----------|-------|
+{% for item in bios_drift_items %}
+| `{{ item.key }}` | `{{ item.desired }}` | `{{ item.current }}` | `{{ item.pending }}` | **{{ item.status }}** | {{ item.severity | upper }} | {{ item.note }} |
+{% endfor %}
+
+{% if bios_pending_attributes | length > 0 %}
+> [!WARNING]
+> **Pending Settings Detected**: Staged values exist on Lenovo XCC that will take effect upon the next reboot. They have been recorded separately above to avoid reporting unapplied settings as active state.
+{% endif %}

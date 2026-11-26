@@ -1,0 +1,31 @@
+{
+  "_comment": [
+    "Example firmware catalog for firmware_config. Copy to <site>/firmware/catalog.json.",
+    "",
+    "ORDER IS THE CONTRACT. Each component's versions are listed NEWEST FIRST, and",
+    "that order is the ONLY source of truth for what firmware_target_mode=latest",
+    "resolves to. The role never infers which of two Lenovo version strings is",
+    "newer: the formats are inconsistent ('68P-6.20', '26.46.3048', 'E3MQ005') and",
+    "lexically '68P-6.9' sorts above '68P-6.20', which would silently downgrade a BMC.",
+    "",
+    "machine_type must match the host's Redfish SKU. A catalog built for another",
+    "model is refused rather than applied.",
+    "",
+    "'file' names a payload in firmware_payload_dir. Component ids must match the",
+    "BMC's FirmwareInventory ids exactly - note adapters update via 'Slot_N.Bundle',",
+    "not the read-only 'Slot_N.1' view."
+  ],
+  "generated_at": "2026-07-31T0900",
+  "machine_type": "7D9ECTO1WW",
+  "components": {
+    "BMC-Primary": [
+      {"version": "68P-6.20", "file": "lnvgy_fw_xcc_68p-6.20_anyos_noarch.uxz"}
+    ],
+    "UEFI": [
+      {"version": "42G-5.81", "file": "lnvgy_fw_uefi_42g-5.81_anyos_noarch.uxz"}
+    ],
+    "Slot_1.Bundle": [
+      {"version": "26.46.3048", "file": "lnvgy_fw_nic_cx6-26.46.3048_anyos_x86-64.uxz"}
+    ]
+  }
+}

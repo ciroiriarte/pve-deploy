@@ -1,0 +1,61 @@
+---
+pve_deploy_root: "{{ (playbook_dir ~ '/..') | realpath }}"
+
+# Site data root: where per-deployment records are written (reports/,
+# environments/<site>/evidence/). Defaults to this checkout so a standalone
+# clone keeps working; point it at a separate site repository to keep
+# deployment records out of the tool repo.
+pve_site_root: "{{ pve_deploy_root }}"
+reports_dir: "{{ pve_site_root }}/reports"
+
+pve_environment: "production"
+
+# Site-specific service addresses, empty by default so this repo carries no
+# one deployment's addressing. Supply them from the site inventory, the same
+# way pve_firewall already expects for its own equivalents. Leaving them empty
+# writes a chrony.conf with no servers and a resolv.conf with no nameservers.
+ntp_servers: []
+dns_servers: []
+dns_search_domain: ""
+ssh_public_keys:
+  - "{{ lookup('ansible.builtin.file', lookup('ansible.builtin.env', 'HOME') ~ '/.ssh/id_ed25519.pub') }}"
+pve_baseline_packages:
+  - chrony
+  - lldpd
+  - nic-xray
+  - pve-cli
+  - pve-tools
+  - iperf3
+pve_kernel_cmdline_default: "root=ZFS=rpool/ROOT/pve-1 boot=zfs console=tty0 console=ttyS0,115200n8"
+sysctl_settings:
+  net.ipv4.ip_forward: 1
+  net.core.somaxconn: 4096
+  fs.inotify.max_user_watches: 1048576
+
+# Install + enable the rp-filter-off systemd unit (rp_filter=0 on every interface,
+# incl. dynamically-created SDN vxlan/vrf devices). Required for EVPN symmetric-IRB /
+# anycast / asymmetric return paths. Set false on non-EVPN clusters.
+pve_baseline_rp_filter_off: true
+
+# OBS host for the ciriarte pve-cli / pve-tools / network-tools packages.
+#
+# downloadcontent.opensuse.org is the canonical origin and serves content
+# DIRECTLY. download.opensuse.org runs MirrorBrain and redirects to a nearby
+# mirror, which on this network resolved to an IPv6-only host -- unreachable,
+# with no IPv4 address for Acquire::ForceIPv4 to fall back to.
+#
+# Override only if a local mirror is available that is known to answer over IPv4.
+obs_repo_host: "downloadcontent.opensuse.org"
+
+# SHA-512 crypt hash for root, replacing the install-time password phase 02 put
+# in the answer file.
+#
+# A HASH, never a cleartext password: ansible.builtin.user writes this value
+# into /etc/shadow verbatim, so cleartext here is stored as though it were
+# already hashed -- which does not set that password and leaves the account
+# unable to authenticate. The role asserts the format rather than trusting it.
+#
+# Empty means "not managed here": the rotation is skipped and the role warns
+# that the install-time password is still live. Generate a hash with
+# `mkpasswd -m sha512crypt`; see docs/OPERATOR.md.
+pve_root_password_hash: ""

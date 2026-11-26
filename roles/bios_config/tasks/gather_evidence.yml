@@ -1,0 +1,107 @@
+---
+- name: Initialize BIOS evidence collection variables
+  ansible.builtin.set_fact:
+    bios_attributes: {}
+    bios_pending_attributes: {}
+    bios_evidence_source: "none"
+  changed_when: false
+
+- name: Locate existing companion bmc_inventory evidence document
+  ansible.builtin.find:
+    paths: "{{ evidence_dir }}"
+    patterns: "{{ parent_host }}-hardware-*.json"
+  delegate_to: localhost
+  register: existing_evidence_files
+  changed_when: false
+
+- name: Read pre-existing bmc_inventory evidence file if present
+  when: existing_evidence_files.matched > 0
+  block:
+    - name: Select newest evidence document
+      ansible.builtin.set_fact:
+        target_evidence_file: "{{ (existing_evidence_files.files | sort(attribute='mtime') | last).path }}"
+      changed_when: false
+
+    - name: Read evidence file contents
+      ansible.builtin.slurp:
+        src: "{{ target_evidence_file }}"
+      register: slurped_evidence
+      delegate_to: localhost
+      changed_when: false
+
+    - name: Parse BIOS attributes from evidence document
+      ansible.builtin.set_fact:
+        bios_attributes: "{{ (slurped_evidence.content | b64decode | from_json).bios_attributes | default({}) }}"
+        bios_pending_attributes: "{{ (slurped_evidence.content | b64decode | from_json).bios_pending_attributes | default({}) }}"
+        bios_evidence_source: "bmc_inventory_file"
+      changed_when: false
+
+- name: Query Redfish directly when companion evidence is absent
+  when: bios_attributes | length == 0
+  block:
+    - name: Fetch current BIOS attributes via Redfish info module
+      community.general.redfish_info:
+        # Category is Systems, NOT Bios. GetBiosAttributes lives under the
+        # Systems category in redfish_info; "Bios" is not a valid category and
+        # makes the module fail on every host.
+        category:
+          - Systems
+        command:
+          - GetBiosAttributes
+        baseuri: "{{ ansible_host }}"
+        username: "{{ bmc_username }}"
+        password: "{{ bmc_password }}"
+        timeout: "{{ bmc_timeout }}"
+        validate_certs: "{{ bmc_validate_certs }}"
+      register: redfish_bios_info
+      # no_log hides the credentials in the module args, but it also hides the
+      # failure message, which makes a broken call impossible to diagnose from
+      # the run output. Tolerate the failure here and surface a sanitized
+      # message in the next task instead.
+      no_log: true
+      failed_when: false
+      changed_when: false
+
+    - name: Surface a sanitized Redfish error when the BIOS query failed
+      # msg carries the module's error text, not the credentials, so this can
+      # safely run without no_log.
+      ansible.builtin.fail:
+        msg: >-
+          Redfish BIOS attribute query failed on
+          {{ parent_host | default(inventory_hostname) }}:
+          {{ redfish_bios_info.msg | default('no message returned') }}
+      when: redfish_bios_info.failed | default(false)
+
+    - name: Extract attributes from Redfish info response
+      ansible.builtin.set_fact:
+        bios_attributes: "{{ redfish_bios_info.redfish_facts.bios_attribute.entries[0] | default({}) }}"
+        bios_evidence_source: "redfish_direct"
+      when:
+        - redfish_bios_info.redfish_facts is defined
+        - redfish_bios_info.redfish_facts.bios_attribute is defined
+      changed_when: false
+
+    # Fetch pending/staged settings endpoint directly via URI module
+    # needs verification against a live XCC
+    - name: Fetch pending BIOS settings from XCC Redfish endpoint
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}/redfish/v1/Systems/1/Bios/Settings"
+        method: GET
+        user: "{{ bmc_username }}"
+        password: "{{ bmc_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ bmc_validate_certs }}"
+        status_code: [200, 404]
+      register: redfish_bios_pending_uri
+      no_log: true
+      failed_when: false
+      changed_when: false
+
+    - name: Extract pending attributes if available
+      ansible.builtin.set_fact:
+        bios_pending_attributes: "{{ redfish_bios_pending_uri.json.Attributes | default({}) }}"
+      when:
+        - redfish_bios_pending_uri.status == 200
+        - redfish_bios_pending_uri.json is defined
+        - redfish_bios_pending_uri.json.Attributes is defined
+      changed_when: false

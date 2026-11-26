@@ -1,0 +1,65 @@
+# BMC Hardware Audit Summary
+
+Environment: `{{ environment_name }}`
+Generated: `{{ bmc_inventory_stamp }}`
+Schema: `{{ bmc_inventory_schema_version }}`
+
+This is a read-only assessment. It performs no Redfish POST/PATCH/PUT, no BIOS changes, no storage changes, and no power actions.
+
+| Host | Serial | Model | BMC firmware | NIC count | Disk count | Unconfigured disk count |
+| :--- | :--- | :--- | :--- | ---: | ---: | ---: |
+{% for host in ansible_play_hosts_all %}
+{% set hv = hostvars[host] %}
+{% set system_entries = (((hv.bmc_rf_system | default({})).redfish_facts | default({})).system | default({})).entries | default([]) %}
+{% set system = system_entries | first | default({}) %}
+{% set manager_entries = (((hv.bmc_rf_manager | default({})).redfish_facts | default({})).manager | default({})).entries | default([]) %}
+{% set manager = manager_entries | first | default({}) %}
+{% set nic_entries = (((hv.bmc_rf_nic | default({})).redfish_facts | default({})).nic | default({})).entries | default([]) %}
+{% set disk_entries = (((hv.bmc_rf_disk | default({})).redfish_facts | default({})).disk | default({})).entries | default([]) %}
+{% set ns = namespace(unconfigured=0) %}
+{% for disk in disk_entries %}
+{% if ((disk.Usage | default('') | string | lower) in ['raw', 'jbod', 'unconfigured', 'unconfigured good']) or ((disk.RaidStatus | default('') | string | lower) in ['jbod', 'unconfigured', 'unconfigured good']) %}
+{% set ns.unconfigured = ns.unconfigured + 1 %}
+{% endif %}
+{% endfor %}
+| {{ hv.parent_host | default(host) }} | {{ system.SerialNumber | default('missing') }} | {{ system.Model | default('missing') }} | {{ manager.FirmwareVersion | default('missing') }} | {{ nic_entries | length }} | {{ disk_entries | length }} | {{ ns.unconfigured }} |
+{% endfor %}
+
+## Candidate Ceph OSD Devices
+
+The following drives are marked as raw, JBOD, unconfigured, or unconfigured good by the available Redfish fields. Treat this as the candidate list for later Ceph OSD validation, not as permission to modify storage.
+
+{% for host in ansible_play_hosts_all %}
+{% set hv = hostvars[host] %}
+{% set disk_entries = (((hv.bmc_rf_disk | default({})).redfish_facts | default({})).disk | default({})).entries | default([]) %}
+### {{ hv.parent_host | default(host) }}
+
+| Slot | Model | Serial | Capacity | Media | Protocol | Usage |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+{% set ns = namespace(found=false) %}
+{% for disk in disk_entries %}
+{% if ((disk.Usage | default('') | string | lower) in ['raw', 'jbod', 'unconfigured', 'unconfigured good']) or ((disk.RaidStatus | default('') | string | lower) in ['jbod', 'unconfigured', 'unconfigured good']) %}
+{% set ns.found = true %}
+| {{ disk.PhysicalLocation | default(disk.Location | default(disk.Slot | default(disk.Id | default('missing')))) }} | {{ disk.Model | default(disk.Name | default('missing')) }} | {{ disk.SerialNumber | default(disk.Serial | default('missing')) }} | {{ disk.CapacityBytes | default(disk.Capacity | default('missing')) }} | {{ disk.MediaType | default(disk.Media | default('missing')) }} | {{ disk.Protocol | default(disk.Protocols | default('missing')) }} | {{ disk.Usage | default(disk.RaidStatus | default('missing')) }} |
+{% endif %}
+{% endfor %}
+{% if not ns.found %}
+| missing | missing | missing | missing | missing | missing | No candidate drives found or disk state was unavailable. |
+{% endif %}
+
+{% endfor %}
+
+## Artifacts
+
+| Host | Evidence JSON | SHA256 | Collection status |
+| :--- | :--- | :--- | :--- |
+{% for host in ansible_play_hosts_all %}
+{% set hv = hostvars[host] %}
+| {{ hv.parent_host | default(host) }} | `{{ hv.bmc_inventory_evidence_path | default('missing') }}` | `{{ hv.bmc_inventory_evidence_sha256 | default('missing') }}` | {{ hv.bmc_inventory_status | default('missing') }} |
+{% endfor %}
+
+## Notes
+
+- BMC credentials must come from vaulted `bmc_password`; generated evidence does not include credentials.
+- Lenovo XCC-specific slot, adapter, and disk-state fields should be verified on the first live run and then tightened if firmware exposes better OEM fields.
+- Missing data on one BMC is recorded for that host and does not invalidate the other hosts' evidence.

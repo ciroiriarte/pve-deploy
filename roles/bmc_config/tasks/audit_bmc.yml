@@ -1,0 +1,263 @@
+---
+# Compares collected BMC state against bmc_baseline.
+#
+# Three statuses, not two. "absent" means the BMC does not expose the setting at
+# all, and must stay distinguishable from "match" — conflating them is what let
+# the BIOS baseline report a fleet-wide pass while matching nothing. A baseline
+# key left undefined or empty is skipped entirely rather than counted either way,
+# so a partial baseline narrows what is checked instead of silently passing
+# things it never looked at.
+#
+# Each evaluation delegates to record_item.yml with vars set on the include.
+# Semantic keys ("protocols.ipmi_over_lan") never appear in the Redfish lookups;
+# the vendor spelling is confined to the lookup expression, so a second vendor
+# replaces those without touching the baseline an operator writes.
+
+- name: Initialize BMC configuration audit results
+  ansible.builtin.set_fact:
+    bmc_config_drift_items: []
+    bmc_config_match_count: 0
+    bmc_config_drift_count: 0
+    bmc_config_absent_count: 0
+    bmc_config_outcome: "success"
+  changed_when: false
+
+# ---------------------------------------------------------------------------
+# Time synchronisation
+# ---------------------------------------------------------------------------
+- name: Evaluate NTP enablement
+  ansible.builtin.include_tasks: record_item.yml
+  vars:
+    item_key: "ntp.enabled"
+    item_desired: "{{ bmc_baseline.ntp.enabled }}"
+    item_current: "{{ bmc_network_protocol.NTP.ProtocolEnabled | default(none) }}"
+    item_severity: "warning"
+    item_note: "BMC clock drift corrupts every timestamp in the event log"
+  when: bmc_baseline.ntp.enabled is defined
+
+- name: Evaluate NTP servers
+  ansible.builtin.include_tasks: record_item.yml
+  vars:
+    item_key: "ntp.servers"
+    item_desired: "{{ bmc_baseline.ntp.servers | sort }}"
+    item_current: >-
+      {{ ((bmc_network_protocol.NTP | default({})).NTPServers | default([]))
+         | select() | list | sort
+         if bmc_network_protocol.NTP is defined else none }}
+    item_severity: "warning"
+    item_note: "Time sources the BMC synchronises against"
+  when:
+    - bmc_baseline.ntp.servers is defined
+    - bmc_baseline.ntp.servers | length > 0
+
+# ---------------------------------------------------------------------------
+# Name resolution
+# ---------------------------------------------------------------------------
+#
+# DNS lives on the ethernet interface, not on NetworkProtocol.
+#
+# Restricted to ENABLED interfaces. XCC exposes a disabled 'ToHost' USB
+# interface carrying placeholder addressing (0.0.0.0 / 169.254.x) alongside the
+# real management NIC. Including it polluted the resolver set and made a
+# DHCP-configured BMC look partly static.
+- name: Select enabled BMC management interfaces
+  ansible.builtin.set_fact:
+    bmc_mgmt_interfaces: >-
+      {{ bmc_ethernet_interfaces
+         | selectattr('InterfaceEnabled', 'defined')
+         | selectattr('InterfaceEnabled')
+         | list }}
+  changed_when: false
+
+# Where resolvers come from, before what they are.
+#
+# When the interface takes its address dynamically, DNS comes from DHCP and
+# StaticNameServers is inert — it commonly still holds stale values the BMC
+# never uses. Comparing it there would report drift on every correctly
+# configured host. What matters under DHCP is that the interface is actually
+# accepting DHCP-supplied resolvers rather than ignoring them.
+- name: Evaluate DNS source mode
+  ansible.builtin.include_tasks: record_item.yml
+  vars:
+    item_key: "dns.mode"
+    item_desired: "{{ bmc_baseline.dns.mode }}"
+    item_current: >-
+      {%- set modes = [] -%}
+      {%- for iface in bmc_mgmt_interfaces -%}
+      {%-   set v4 = iface.DHCPv4 | default({}) -%}
+      {%-   if v4.DHCPEnabled | default(false) and v4.UseDNSServers | default(false) -%}
+      {%-     if 'dhcp' not in modes -%}{%- set _ = modes.append('dhcp') -%}{%- endif -%}
+      {%-   else -%}
+      {%-     if 'static' not in modes -%}{%- set _ = modes.append('static') -%}{%- endif -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ modes | sort | join('+') if bmc_mgmt_interfaces | length > 0 else none }}
+    item_severity: "warning"
+    item_note: "Whether the BMC takes resolvers from DHCP or from pinned static entries"
+  when: bmc_baseline.dns.mode | default('') | length > 0
+
+# Static resolvers are only compared when the baseline says addressing is
+# manual. Under dhcp mode this is deliberately not evaluated at all — see above.
+- name: Evaluate static DNS servers
+  ansible.builtin.include_tasks: record_item.yml
+  vars:
+    item_key: "dns.servers"
+    item_desired: "{{ bmc_baseline.dns.servers | sort }}"
+    # Absent (no enabled interface exposes StaticNameServers) is distinct from
+    # empty (the property exists and holds no real resolver). The first means
+    # the audit could not see the setting; the second is real drift.
+    item_current: >-
+      {%- set found = [] -%}
+      {%- set saw_property = [] -%}
+      {%- for iface in bmc_mgmt_interfaces -%}
+      {%-   if 'StaticNameServers' in iface -%}
+      {%-     set _ = saw_property.append(1) -%}
+      {%-     for ns in iface.StaticNameServers | default([]) -%}
+      {%-       if ns and ns not in bmc_dns_placeholders and ns not in found -%}
+      {%-         set _ = found.append(ns) -%}
+      {%-       endif -%}
+      {%-     endfor -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ found | sort if saw_property | length > 0 else none }}
+    item_severity: "warning"
+    item_note: "Pinned resolvers, audited only when dns.mode is static"
+  when:
+    - bmc_baseline.dns.mode | default('') == 'static'
+    - bmc_baseline.dns.servers is defined
+    - bmc_baseline.dns.servers | length > 0
+
+# ---------------------------------------------------------------------------
+# Management protocol posture
+# ---------------------------------------------------------------------------
+- name: Evaluate management protocol posture
+  ansible.builtin.include_tasks: record_item.yml
+  vars:
+    item_key: "protocols.{{ protocol_item.key }}"
+    item_desired: "{{ bmc_baseline.protocols[protocol_item.key] }}"
+    item_current: >-
+      {{ (bmc_network_protocol[protocol_item.value] | default({})).ProtocolEnabled
+         | default(none) }}
+    item_severity: "{{ 'critical' if protocol_item.key == 'ipmi_over_lan' else 'warning' }}"
+    item_note: >-
+      {{ 'MANDATORY: the out-of-band recovery path. Serial-over-LAN rides on it,
+          and SoL is what reaches a host with no working network. Disabled here
+          means a failed install or a bad network change needs physical access.'
+         if protocol_item.key == 'ipmi_over_lan'
+         else 'Management protocol posture' }}
+    # Unsupported means the firmware advertises the protocol object but omits the
+    # standard ProtocolEnabled toggle entirely -- not that the toggle is null.
+    #
+    # This XCC returns SNMP as {"EnableSNMPv3": false, "EngineId": {...},
+    # "Port": 161}: the slot is there, the DMTF on/off switch is not. Testing
+    # for a null value instead of a missing key silently fails, because Jinja
+    # yields Undefined for a missing attribute and `Undefined is none` is false.
+    item_supported: >-
+      {{ not (protocol_item.value in bmc_network_protocol
+              and 'ProtocolEnabled' not in bmc_network_protocol[protocol_item.value]) }}
+  # Semantic name -> Redfish NetworkProtocol property.
+  loop: >-
+    {{ {'ssh': 'SSH',
+        'https': 'HTTPS',
+        'ipmi_over_lan': 'IPMI',
+        'virtual_media': 'VirtualMedia',
+        'snmp': 'SNMP',
+        'kvmip': 'KVMIP',
+        'dhcp': 'DHCP',
+        'dhcpv6': 'DHCPv6',
+        'http': 'HTTP',
+        'ssdp': 'SSDP'} | dict2items }}
+  loop_control:
+    loop_var: protocol_item
+    label: "{{ protocol_item.key }}"
+  when: bmc_baseline.protocols[protocol_item.key] is defined
+
+# ---------------------------------------------------------------------------
+# Account policy
+# ---------------------------------------------------------------------------
+- name: Evaluate account policy
+  ansible.builtin.include_tasks: record_item.yml
+  vars:
+    item_key: "account_policy.{{ policy_item.key }}"
+    item_desired: "{{ bmc_baseline.account_policy[policy_item.key] }}"
+    item_current: "{{ bmc_account_service[policy_item.value] | default(none) }}"
+    item_severity: "warning"
+    item_note: "Redfish AccountService policy"
+  # Semantic name -> Redfish AccountService property.
+  loop: >-
+    {{ {'min_password_length': 'MinPasswordLength',
+        'max_password_length': 'MaxPasswordLength',
+        'lockout_threshold': 'AccountLockoutThreshold',
+        'lockout_duration': 'AccountLockoutDuration',
+        'lockout_counter_reset_after': 'AccountLockoutCounterResetAfter',
+        'lockout_counter_reset_enabled': 'AccountLockoutCounterResetEnabled',
+        'local_account_auth': 'LocalAccountAuth',
+        'service_enabled': 'ServiceEnabled'} | dict2items }}
+  loop_control:
+    loop_var: policy_item
+    label: "{{ policy_item.key }}"
+  when: bmc_baseline.account_policy[policy_item.key] is defined
+
+# ---------------------------------------------------------------------------
+# Accounts present
+# ---------------------------------------------------------------------------
+#
+# Reported, never changed. Creating, deleting or re-passwording BMC users is
+# destructive in a way that toggling a lockout threshold is not, and locking
+# yourself out of a BMC is unrecoverable without physical access.
+- name: Evaluate enabled accounts against the expected set
+  ansible.builtin.include_tasks: record_item.yml
+  vars:
+    item_key: "accounts.enabled"
+    item_desired: "{{ bmc_expected_accounts | sort }}"
+    item_current: >-
+      {%- set names = [] -%}
+      {%- for acct in bmc_accounts -%}
+      {%-   if acct.Enabled and acct.UserName -%}
+      {%-     set _ = names.append(acct.UserName) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ names | sort if bmc_accounts | length > 0 else none }}
+    item_severity: "warning"
+    item_note: "Enabled BMC accounts; reported only, this role never creates or deletes users"
+
+# ---------------------------------------------------------------------------
+# Outcome
+# ---------------------------------------------------------------------------
+# Keyed on "nothing matched AND something was unreadable", not on
+# "zero drift". An earlier version also required drift_count == 0, which a
+# single spurious drift was enough to defeat — a synthetic BMC exposing none of
+# the expected properties still reported success because one key happened to
+# render as an empty list instead of absent.
+#
+# A BMC that is genuinely 100% non-compliant (match=0, absent=0, drift=N) does
+# NOT trip this: that is real drift, and the report should say so.
+- name: Fail when no baseline key resolved against this BMC
+  ansible.builtin.fail:
+    msg: >-
+      No BMC baseline key matched any collected property on
+      {{ parent_host | default(inventory_hostname) }}:
+      {{ bmc_config_match_count }} matched, {{ bmc_config_drift_count }} drifted,
+      {{ bmc_config_absent_count }} absent. With nothing matching and
+      {{ bmc_config_absent_count }} propert(ies) unreadable, the names this role
+      looks for most likely do not correspond to what this BMC exposes. Check
+      the Redfish resource shape before trusting any result. Refusing to report
+      a vacuous pass.
+  when:
+    - bmc_config_drift_items | length > 0
+    - bmc_config_match_count | int == 0
+    - bmc_config_absent_count | int > 0
+
+# Absent counts toward a non-success outcome. An audit that could not see the
+# settings it was asked to check must never report the BMC as compliant.
+# unsupported is deliberately NOT part of this. A property the vendor advertises
+# and does not implement is not something an operator can converge, so letting it
+# hold the outcome at partial forever would train everyone to ignore the field.
+# absent still counts: that means the baseline names something this firmware does
+# not have, so a check is silently measuring nothing.
+- name: Determine overall BMC configuration audit outcome
+  ansible.builtin.set_fact:
+    bmc_config_outcome: >-
+      {{ (bmc_config_drift_count | int > 0
+          or bmc_config_absent_count | int > 0) | ternary('partial', 'success') }}
+  changed_when: false

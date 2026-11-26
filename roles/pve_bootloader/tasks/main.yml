@@ -1,0 +1,179 @@
+---
+- name: Query proxmox-boot-tool status
+  ansible.builtin.command:
+    cmd: proxmox-boot-tool status
+  register: pve_bootloader_status
+  changed_when: false
+  failed_when: false
+  # Read-only probe, so run it under --check too. Skipped, it yields no stdout,
+  # pve_bootloader_is_systemd_boot below evaluates false, and a dry run then
+  # plans a GRUB migration on nodes that are already systemd-boot/UEFI.
+  check_mode: false
+  tags:
+    - phase10
+    - pve_bootloader
+
+- name: Determine current bootloader mechanism
+  ansible.builtin.set_fact:
+    pve_bootloader_is_systemd_boot: >-
+      {{
+        'systemd-boot' in pve_bootloader_status.stdout
+        or 'configured with: uefi' in pve_bootloader_status.stdout
+        or 'System currently booted with uefi' in pve_bootloader_status.stdout
+      }}
+  tags:
+    - phase10
+    - pve_bootloader
+
+- name: Report bootloader status and drift warning
+  ansible.builtin.debug:
+    msg: >-
+      Node {{ inventory_hostname }} bootloader is currently {{ 'systemd-boot/UEFI' if pve_bootloader_is_systemd_boot else 'GRUB (Drift detected)' }}.
+      Migration enabled: {{ pve_bootloader_migrate }}. Preferred bootloader: systemd-boot/UEFI.
+  tags:
+    - phase10
+    - pve_bootloader
+
+- name: Assert bootloader state when migration is disabled
+  ansible.builtin.assert:
+    that:
+      - pve_bootloader_is_systemd_boot
+    fail_msg: "Bootloader drift detected (node uses GRUB instead of systemd-boot). Set pve_bootloader_migrate=true to perform migration."
+  when: not pve_bootloader_migrate | bool
+  tags:
+    - phase10
+    - pve_bootloader
+
+- name: Clean stale proxmox boot UUID entries reported by proxmox-boot-tool
+  ansible.builtin.command:
+    cmd: proxmox-boot-tool clean
+  register: pve_bootloader_stale_clean
+  changed_when: pve_bootloader_stale_clean.rc == 0
+  when:
+    - pve_bootloader_is_systemd_boot
+    - "'does not exist' in pve_bootloader_status.stdout or 'does not exist' in pve_bootloader_status.stderr"
+  tags:
+    - phase10
+    - pve_bootloader
+
+- name: Refresh bootloader entries after stale UUID cleanup
+  ansible.builtin.command:
+    cmd: proxmox-boot-tool refresh
+  register: pve_bootloader_stale_refresh
+  changed_when: pve_bootloader_stale_refresh.rc == 0
+  when: pve_bootloader_stale_clean is changed
+  tags:
+    - phase10
+    - pve_bootloader
+
+- name: Detect EFI System Partition for bootloader migration
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      if [ "{{ pve_esp_partition }}" != "auto" ]; then
+        printf '%s\n' "{{ pve_esp_partition }}"
+        exit 0
+      fi
+      findmnt -no SOURCE /boot/efi 2>/dev/null || true
+      if [ -e /dev/disk/by-partlabel/EFI\x20System\x20Partition ]; then
+        readlink -f /dev/disk/by-partlabel/EFI\x20System\x20Partition
+        exit 0
+      fi
+      lsblk -prno NAME,PARTTYPE | awk '$2 == "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" { print $1; exit }'
+  args:
+    executable: /bin/bash
+  register: pve_bootloader_esp_detect
+  changed_when: false
+  failed_when: pve_bootloader_esp_detect.stdout_lines | length == 0
+  # Detection only reads findmnt/lsblk/readlink; nothing here writes.
+  check_mode: false
+  when:
+    - not pve_bootloader_is_systemd_boot
+    - pve_bootloader_migrate | bool
+  tags:
+    - phase10
+    - pve_bootloader
+
+- name: Set effective EFI System Partition for bootloader migration
+  ansible.builtin.set_fact:
+    pve_bootloader_effective_esp_partition: "{{ pve_bootloader_esp_detect.stdout_lines[0] }}"
+  when:
+    - not pve_bootloader_is_systemd_boot
+    - pve_bootloader_migrate | bool
+  tags:
+    - phase10
+    - pve_bootloader
+
+- name: Perform GRUB to systemd-boot migration sequence
+  when:
+    - not pve_bootloader_is_systemd_boot
+    - pve_bootloader_migrate | bool
+  tags:
+    - phase10
+    - pve_bootloader
+  block:
+    - name: Clean stale UUID entries from proxmox-boot-uuids
+      ansible.builtin.command:
+        cmd: proxmox-boot-tool clean
+      register: pve_bootloader_clean
+      changed_when: pve_bootloader_clean.rc == 0
+
+    - name: Format EFI System Partition for systemd-boot
+      ansible.builtin.command:
+        cmd: "proxmox-boot-tool format {{ pve_bootloader_effective_esp_partition }} --force"
+      register: pve_bootloader_format
+      changed_when: pve_bootloader_format.rc == 0
+
+    - name: Initialize systemd-boot on EFI System Partition
+      ansible.builtin.command:
+        cmd: "proxmox-boot-tool init {{ pve_bootloader_effective_esp_partition }}"
+      register: pve_bootloader_init
+      changed_when: pve_bootloader_init.rc == 0
+
+    - name: Refresh bootloader entries
+      ansible.builtin.command:
+        cmd: proxmox-boot-tool refresh
+      register: pve_bootloader_refresh
+      changed_when: pve_bootloader_refresh.rc == 0
+
+    - name: Pre-reboot verification - proxmox-boot-tool status
+      ansible.builtin.command:
+        cmd: proxmox-boot-tool status
+      register: pve_bootloader_verify_status
+      changed_when: false
+      failed_when: "'systemd-boot' not in pve_bootloader_verify_status.stdout"
+
+    - name: Pre-reboot verification - efibootmgr entries
+      ansible.builtin.command:
+        cmd: efibootmgr -v
+      register: pve_bootloader_verify_efibootmgr
+      changed_when: false
+      failed_when: "'systemd-boot' not in pve_bootloader_verify_efibootmgr.stdout and 'Linux Boot Manager' not in pve_bootloader_verify_efibootmgr.stdout"
+
+    - name: Pre-reboot verification - Mount ESP and check serial console setting
+      ansible.builtin.shell:
+        cmd: |
+          set -e
+          MOUNT_DIR=$(mktemp -d)
+          mount {{ pve_bootloader_effective_esp_partition }} "$MOUNT_DIR"
+          grep -q "console=ttyS0" "$MOUNT_DIR"/loader/entries/*.conf
+          umount "$MOUNT_DIR"
+          rmdir "$MOUNT_DIR"
+      register: pve_bootloader_verify_console
+      changed_when: false
+
+    - name: Render change report payload
+      ansible.builtin.template:
+        src: report_payload.json.j2
+        dest: "/tmp/pve_bootloader_report_{{ inventory_hostname }}.json"
+        mode: "0600"
+      delegate_to: localhost
+
+    - name: Emit change report via tools/report.py
+      ansible.builtin.command:
+        cmd: "python3 tools/report.py render /tmp/pve_bootloader_report_{{ inventory_hostname }}.json --out {{ reports_dir }}/"
+        chdir: "{{ pve_deploy_root }}"
+      delegate_to: localhost
+      register: pve_bootloader_report_output
+      failed_when: pve_bootloader_report_output.rc != 0
+      changed_when: true

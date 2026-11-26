@@ -1,0 +1,82 @@
+---
+# Classifies one baseline key and appends it to bmc_config_drift_items.
+#
+# Callers set item_key, item_desired, item_current, item_severity and item_note
+# as vars on the include. item_current is `none` when the BMC did not expose the
+# property at all — which is why the absent test is `is none` rather than a
+# falsiness check: `false` and `0` are legitimate values that must compare, not
+# be mistaken for a missing property.
+
+- name: "Normalize the comparison for: {{ item_key }}"
+  ansible.builtin.set_fact:
+    # Compared as strings. Redfish returns JSON booleans and integers while YAML
+    # baselines may carry either, and `true != "True"` in Jinja. Both sides go
+    # through the same rendering so the comparison reflects value rather than
+    # type. Lists are sorted by the callers before arriving here.
+    eval_desired_norm: "{{ item_desired | string }}"
+    eval_current_norm: "{{ item_current | string }}"
+  changed_when: false
+
+# Two different kinds of "no value", and conflating them is what made every run
+# report partial forever.
+#
+#   unsupported - the BMC exposes the property but does not implement it. On this
+#                 XCC, SNMP appears under NetworkProtocol with a port but a null
+#                 ProtocolEnabled: the vendor advertises the slot and fills in
+#                 nothing. Nothing an operator can do changes that, so counting
+#                 it as a finding is noise, and a signal that is always partial
+#                 stops being read.
+#
+#   absent      - the property is not there at all. That IS worth reporting: it
+#                 usually means the baseline names something this firmware does
+#                 not have, so the check is silently measuring nothing.
+#
+# Callers pass item_supported=false for the first case.
+- name: "Classify as unsupported: {{ item_key }}"
+  ansible.builtin.set_fact:
+    eval_status: "unsupported"
+    bmc_config_unsupported_count: "{{ bmc_config_unsupported_count | int + 1 }}"
+  when:
+    - item_current is none
+    - not (item_supported | default(true) | bool)
+  changed_when: false
+
+- name: "Classify as absent: {{ item_key }}"
+  ansible.builtin.set_fact:
+    eval_status: "absent"
+    bmc_config_absent_count: "{{ bmc_config_absent_count | int + 1 }}"
+  when:
+    - item_current is none
+    - item_supported | default(true) | bool
+  changed_when: false
+
+- name: "Classify as matching baseline: {{ item_key }}"
+  ansible.builtin.set_fact:
+    eval_status: "match"
+    bmc_config_match_count: "{{ bmc_config_match_count | int + 1 }}"
+  when:
+    - item_current is not none
+    - eval_desired_norm == eval_current_norm
+  changed_when: false
+
+- name: "Classify as drifted from baseline: {{ item_key }}"
+  ansible.builtin.set_fact:
+    eval_status: "drift"
+    bmc_config_drift_count: "{{ bmc_config_drift_count | int + 1 }}"
+  when:
+    - item_current is not none
+    - eval_desired_norm != eval_current_norm
+  changed_when: false
+
+- name: "Record the evaluated item for: {{ item_key }}"
+  ansible.builtin.set_fact:
+    bmc_config_drift_items: >-
+      {{ bmc_config_drift_items + [{
+           'key': item_key,
+           'desired': item_desired,
+           'current': (item_current if item_current is not none else 'ABSENT'),
+           'status': eval_status,
+           'severity': item_severity | default('warning'),
+           'note': item_note | default('')
+         }] }}
+  changed_when: false

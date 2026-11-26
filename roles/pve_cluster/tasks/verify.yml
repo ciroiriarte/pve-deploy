@@ -1,0 +1,58 @@
+---
+# Verify what is actually in use, not what was requested.
+#
+# `pvecm status` reporting Quorate is necessary but not sufficient: a cluster
+# formed on the wrong network is perfectly quorate. The address corosync is
+# really bound to is the thing worth asserting, because getting it wrong is
+# silent and expensive.
+
+- name: Read cluster status
+  ansible.builtin.command:
+    cmd: pvecm status
+  register: pve_cluster_final_status
+  changed_when: false
+
+- name: Read the corosync ring addresses actually in use
+  ansible.builtin.command:
+    cmd: corosync-cfgtool -s
+  register: pve_cluster_rings
+  changed_when: false
+  failed_when: false
+
+- name: Confirm corosync is bound to the intended network, not management
+  ansible.builtin.assert:
+    that:
+      - pve_cluster_link0_addr in pve_cluster_rings.stdout
+      - networks['pve_management'].ip not in pve_cluster_rings.stdout
+    fail_msg: >-
+      Corosync on {{ inventory_hostname }} is not bound where it should be.
+      Expected link0 {{ pve_cluster_link0_addr }}
+      ({{ pve_cluster_link0_network }}); management address
+      {{ networks['pve_management'].ip }} must NOT appear.
+      corosync-cfgtool -s reported:
+      {{ pve_cluster_rings.stdout_lines | default([]) | join(' | ') }}
+    quiet: true
+  changed_when: false
+
+- name: Confirm the cluster is quorate with every node present
+  ansible.builtin.assert:
+    that:
+      - "'Quorate:' in pve_cluster_final_status.stdout"
+      - (pve_cluster_final_status.stdout | regex_search('Nodes:\\s+(\\d+)', '\\1') | first | int)
+        == (groups['pve'] | length)
+    fail_msg: >-
+      Cluster is not fully formed from {{ inventory_hostname }}'s point of view.
+      Expected {{ groups['pve'] | length }} nodes.
+      pvecm status said:
+      {{ pve_cluster_final_status.stdout_lines | default([]) | join(' | ') }}
+    quiet: true
+  changed_when: false
+
+- name: Report the formed cluster
+  ansible.builtin.debug:
+    msg:
+      - "{{ inventory_hostname }}: quorate, {{ groups['pve'] | length }} nodes"
+      - "corosync : {{ pve_cluster_link0_addr }} ({{ pve_cluster_link0_network }})"
+      - "migration: {{ pve_cluster_migration_cidr }} ({{ pve_cluster_migration_type }})"
+      - "dscp     : {{ pve_cluster_corosync_dscp | default('unset') }}"
+  changed_when: false

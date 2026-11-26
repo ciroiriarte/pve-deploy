@@ -1,0 +1,550 @@
+---
+- name: Initialize validation state.
+  ansible.builtin.set_fact:
+    pve_validate_checks: []
+    pve_validate_failed_checks: []
+  changed_when: false
+  tags:
+    - phase13
+    - pve_validate
+
+- name: Build local PVE validation network list.
+  ansible.builtin.set_fact:
+    pve_validate_local_networks: >-
+      {{
+        pve_validate_local_networks | default([]) + [
+          networks[item]
+          | combine({
+              'key': item,
+              'catalog': network_catalog[item],
+              'mtu': (network_catalog[item].mtu | default(1500) | int),
+              'gateway': (network_catalog[item].gateway | default('')),
+              'vlan_id': (network_catalog[item].vlan_id | default(networks[item].vlan_id | default(''))),
+              'interface': ((pve_network_vm_bridge | default('vmbr1'))
+                            if networks[item].bond == (pve_network_vm_bridge_parent | default('bond1'))
+                            else networks[item].bond)
+                           ~ '.' ~ ((network_catalog[item].vlan_id | default(networks[item].vlan_id)) | string)
+            })
+        ]
+      }}
+  loop: "{{ pve_validate_network_keys }}"
+  when:
+    - item in networks
+    - item in network_catalog
+    - networks[item].ip is defined
+    - networks[item].ip | length > 0
+    - networks[item].bond | default('') != 'BMC'
+  changed_when: false
+  tags:
+    - phase13
+    - pve_validate
+
+- name: Refuse missing PVE validation networks.
+  ansible.builtin.assert:
+    that:
+      - (pve_validate_local_networks | default([]) | length) == (pve_validate_network_keys | length)
+    fail_msg: >-
+      {{ inventory_hostname }} is missing one or more required PVE validation networks:
+      {{ pve_validate_network_keys
+         | difference((pve_validate_local_networks | default([])) | map(attribute='key') | list) }}
+    quiet: true
+  changed_when: false
+  tags:
+    - phase13
+    - pve_validate
+
+- name: Detect staged interface file.
+  ansible.builtin.stat:
+    path: /etc/network/interfaces.new
+  register: pve_validate_interfaces_staged
+  changed_when: false
+  tags:
+    - phase13
+    - pve_validate
+
+# PVE writes /etc/network/interfaces.new only while network edits are pending;
+# it is consumed and removed once the config is applied. No staged file is the
+# converged state, so only compare when one is actually present.
+- name: Validate active and staged interface files match.
+  ansible.builtin.command:
+    cmd: diff -u /etc/network/interfaces /etc/network/interfaces.new
+  register: pve_validate_interfaces_diff
+  when: pve_validate_interfaces_staged.stat.exists
+  changed_when: false
+  failed_when: false
+  tags:
+    - phase13
+    - pve_validate
+
+- name: Record interface drift validation.
+  ansible.builtin.set_fact:
+    pve_validate_checks: >-
+      {{ pve_validate_checks + [
+        {
+          'name': 'active_staged_interfaces_match on ' ~ inventory_hostname,
+          'command': 'diff -u /etc/network/interfaces /etc/network/interfaces.new',
+          'expected': 'no staged interfaces.new, or staged file identical to active',
+          'actual': (
+            'no staged /etc/network/interfaces.new'
+            if not pve_validate_interfaces_staged.stat.exists
+            else 'staged file present, diff rc=' ~ (pve_validate_interfaces_diff.rc | string)
+          ),
+          'result': (
+            'pass'
+            if (not pve_validate_interfaces_staged.stat.exists or pve_validate_interfaces_diff.rc == 0)
+            else 'fail'
+          )
+        }
+      ] }}
+    pve_validate_failed_checks: >-
+      {{ pve_validate_failed_checks + ([ 'active_staged_interfaces_match' ]
+         if (pve_validate_interfaces_staged.stat.exists and pve_validate_interfaces_diff.rc != 0)
+         else []) }}
+  changed_when: false
+  tags:
+    - phase13
+    - pve_validate
+
+- name: Gather LACP bond status.
+  ansible.builtin.shell: |
+    set -o pipefail
+    bond={{ item | quote }}
+    file="/proc/net/bonding/$bond"
+    if [ ! -r "$file" ]; then
+      echo "missing $file"
+      exit 2
+    fi
+    mii=$(awk -F': ' '/MII Status:/ {print $2; exit}' "$file")
+    slave_down=$(awk -F': ' '/Slave Interface:/ {slave=$2} /MII Status:/ && slave != "" && $2 != "up" {print slave":"$2}' "$file" | paste -sd, -)
+    aggregators=$(awk -F': ' '/Aggregator ID:/ {print $2}' "$file" | sort -u | paste -sd, -)
+    slave_count=$(awk '/Slave Interface:/ {count++} END {print count+0}' "$file")
+    agg_count=$(awk -F': ' '/Aggregator ID:/ {seen[$2]=1} END {print length(seen)}' "$file")
+    # 802.3ad actor/partner port state, IEEE 802.1AX 6.4.2.2 bits:
+    #   0x04 Aggregation  0x08 Synchronization  0x10 Collecting  0x20 Distributing
+    # All four must be set at BOTH ends before a member actually carries traffic.
+    # mii=up only reports the PHY: a member can be link-up yet excluded from the
+    # aggregate -- wrong switch port-channel, key mismatch, far end not in LACP --
+    # and slave/aggregator counts alone do not reveal it. A healthy member here
+    # reads 61 (0x3D). Both the actor and partner blocks contain a line called
+    # "port state", so the section has to be tracked while parsing.
+    bad_state=$(awk '
+      /^Slave Interface:/        { slave=$3 }
+      /details actor lacp pdu/   { sect="actor" }
+      /details partner lacp pdu/ { sect="partner" }
+      /port state:/ {
+        st=$3+0
+        if (and(st,60) != 60) printf "%s/%s=%d ", slave, sect, st
+      }' "$file" | sed 's/ *$//')
+    # An all-zero partner system MAC means no LACP PDUs are arriving at all,
+    # which is a silently half-open aggregate rather than a down link.
+    partner_null=$(awk '
+      /^Slave Interface:/        { slave=$3; sect="" }
+      /details partner lacp pdu/ { sect="partner" }
+      sect=="partner" && /system mac address:/ && $4=="00:00:00:00:00:00" { printf "%s ", slave }
+      ' "$file" | sed 's/ *$//')
+    partners=$(awk '
+      /^Slave Interface:/        { sect="" }
+      /details partner lacp pdu/ { sect="partner" }
+      sect=="partner" && /system mac address:/ { print $4 }' "$file" | sort -u | paste -sd, -)
+    printf 'bond=%s mii=%s slaves=%s slave_down=%s aggregators=%s agg_count=%s partner_sys=%s bad_lacp_state=%s partner_null=%s\n' \
+      "$bond" "$mii" "$slave_count" "${slave_down:-none}" "$aggregators" "$agg_count" \
+      "${partners:-none}" "${bad_state:-none}" "${partner_null:-none}"
+    test "$mii" = up
+    test "$slave_count" -ge 2
+    test -z "$slave_down"
+    test "$agg_count" -eq 1
+    test -z "$bad_state"
+    test -z "$partner_null"
+  args:
+    executable: /bin/bash
+  loop: "{{ pve_validate_bonds }}"
+  register: pve_validate_bond_results
+  changed_when: false
+  failed_when: false
+  tags:
+    - phase13
+    - pve_validate
+
+- name: Record LACP bond validation.
+  ansible.builtin.set_fact:
+    pve_validate_checks: >-
+      {{ pve_validate_checks + [
+        {
+          'name': 'lacp_bond_' ~ item.item ~ ' on ' ~ inventory_hostname,
+          'command': 'inspect /proc/net/bonding/' ~ item.item,
+          'expected': 'mii=up, >=2 slaves, no slave down, one aggregator id, '
+                      ~ 'actor+partner Collecting|Distributing set, partner MAC learned',
+          'actual': item.stdout | default(item.stderr | default('')),
+          'result': ('pass' if item.rc == 0 else 'fail')
+        }
+      ] }}
+    pve_validate_failed_checks: >-
+      {{ pve_validate_failed_checks + ([ 'lacp_bond_' ~ item.item ] if item.rc != 0 else []) }}
+  loop: "{{ pve_validate_bond_results.results }}"
+  changed_when: false
+  tags:
+    - phase13
+    - pve_validate
+
+- name: Validate VLAN interfaces and addresses exist.
+  ansible.builtin.shell: |
+    set -o pipefail
+    iface={{ item.interface | quote }}
+    ipaddr={{ item.ip | quote }}
+    ip -o addr show dev "$iface" | grep -F " $ipaddr/"
+  args:
+    executable: /bin/bash
+  loop: "{{ pve_validate_local_networks }}"
+  register: pve_validate_interface_addr_results
+  changed_when: false
+  failed_when: false
+  tags:
+    - phase13
+    - pve_validate
+
+- name: Record VLAN interface validation.
+  ansible.builtin.set_fact:
+    pve_validate_checks: >-
+      {{ pve_validate_checks + [
+        {
+          'name': 'interface_' ~ item.item.interface ~ '_address on ' ~ inventory_hostname,
+          'command': 'ip -o addr show dev ' ~ item.item.interface,
+          'expected': item.item.ip,
+          'actual': item.stdout | default(item.stderr | default('')),
+          'result': ('pass' if item.rc == 0 else 'fail')
+        }
+      ] }}
+    pve_validate_failed_checks: >-
+      {{ pve_validate_failed_checks + ([ 'interface_' ~ item.item.interface ~ '_address' ] if item.rc != 0 else []) }}
+  loop: "{{ pve_validate_interface_addr_results.results }}"
+  changed_when: false
+  tags:
+    - phase13
+    - pve_validate
+
+- name: Validate configured gateways from local source addresses.
+  ansible.builtin.command:
+    argv:
+      - ping
+      - -c
+      - "{{ pve_validate_ping_count | string }}"
+      - -W
+      - "{{ pve_validate_ping_timeout | string }}"
+      - -I
+      - "{{ item.ip }}"
+      - "{{ item.gateway }}"
+  loop: "{{ pve_validate_local_networks | selectattr('gateway', 'defined') | rejectattr('gateway', 'equalto', '') | list }}"
+  register: pve_validate_gateway_results
+  changed_when: false
+  failed_when: false
+  tags:
+    - phase13
+    - pve_validate
+
+- name: Record gateway reachability validation.
+  ansible.builtin.set_fact:
+    pve_validate_checks: >-
+      {{ pve_validate_checks + [
+        {
+          'name': 'gateway_' ~ item.item.key ~ ' on ' ~ inventory_hostname,
+          'command': 'ping -I ' ~ item.item.ip ~ ' ' ~ item.item.gateway,
+          'expected': 'rc=0',
+          'actual': 'rc=' ~ (item.rc | string) ~ ' ' ~ (item.stdout_lines[-2:] | default([]) | join(' | ')),
+          'result': ('pass' if item.rc == 0 else 'fail')
+        }
+      ] }}
+    pve_validate_failed_checks: >-
+      {{ pve_validate_failed_checks + ([ 'gateway_' ~ item.item.key ] if item.rc != 0 else []) }}
+  loop: "{{ pve_validate_gateway_results.results | default([]) }}"
+  changed_when: false
+  tags:
+    - phase13
+    - pve_validate
+
+- name: Build peer validation targets.
+  ansible.builtin.set_fact:
+    pve_validate_peer_targets: >-
+      {{
+        pve_validate_peer_targets | default([]) + [
+          {
+            'network_key': item.0.key,
+            'network_name': item.0.name,
+            'local_ip': item.0.ip,
+            'target_host': item.1,
+            'target_ip': hostvars[item.1].networks[item.0.key].ip,
+            'target_ssh_host': (hostvars[item.1].ansible_host | default(item.1)),
+            'mtu': item.0.mtu,
+            'payload': ([ (item.0.mtu | int) - (pve_validate_mtu_ipv4_overhead | int), (pve_validate_min_ping_payload | int) ] | max)
+          }
+        ]
+      }}
+  loop: "{{ pve_validate_local_networks | product(groups.get('pve', [])) | list }}"
+  when:
+    - item.1 != inventory_hostname
+    - item.0.key in hostvars[item.1].networks
+    - hostvars[item.1].networks[item.0.key].ip is defined
+    - hostvars[item.1].networks[item.0.key].ip | length > 0
+  changed_when: false
+  tags:
+    - phase13
+    - pve_validate
+
+- name: Validate peer ICMP reachability per PVE network.
+  ansible.builtin.command:
+    argv:
+      - ping
+      - -c
+      - "{{ pve_validate_ping_count | string }}"
+      - -W
+      - "{{ pve_validate_ping_timeout | string }}"
+      - -I
+      - "{{ item.local_ip }}"
+      - "{{ item.target_ip }}"
+  loop: "{{ pve_validate_peer_targets | default([]) }}"
+  register: pve_validate_peer_ping_results
+  changed_when: false
+  failed_when: false
+  tags:
+    - phase13
+    - pve_validate
+
+- name: Record peer ICMP validation.
+  ansible.builtin.set_fact:
+    pve_validate_checks: >-
+      {{ pve_validate_checks + [
+        {
+          'name': 'icmp_' ~ item.item.network_key ~ '_' ~ inventory_hostname ~ '_to_' ~ item.item.target_host,
+          'command': 'ping -I ' ~ item.item.local_ip ~ ' ' ~ item.item.target_ip,
+          'expected': 'rc=0',
+          'actual': 'rc=' ~ (item.rc | string) ~ ' ' ~ (item.stdout_lines[-2:] | default([]) | join(' | ')),
+          'result': ('pass' if item.rc == 0 else 'fail')
+        }
+      ] }}
+    pve_validate_failed_checks: >-
+      {{ pve_validate_failed_checks + ([ 'icmp_' ~ item.item.network_key ~ '_' ~ item.item.target_host ] if item.rc != 0 else []) }}
+  loop: "{{ pve_validate_peer_ping_results.results | default([]) }}"
+  changed_when: false
+  tags:
+    - phase13
+    - pve_validate
+
+- name: Validate peer MTU with do-not-fragment probes.
+  ansible.builtin.command:
+    argv:
+      - ping
+      - -c
+      - "1"
+      - -W
+      - "{{ pve_validate_ping_timeout | string }}"
+      - -M
+      - do
+      - -s
+      - "{{ item.payload | string }}"
+      - -I
+      - "{{ item.local_ip }}"
+      - "{{ item.target_ip }}"
+  loop: "{{ pve_validate_peer_targets | default([]) }}"
+  when: pve_validate_mtu_probe | bool
+  register: pve_validate_peer_mtu_results
+  changed_when: false
+  failed_when: false
+  tags:
+    - phase13
+    - pve_validate
+
+- name: Record peer MTU validation.
+  ansible.builtin.set_fact:
+    pve_validate_checks: >-
+      {{ pve_validate_checks + [
+        {
+          'name': 'mtu_' ~ item.item.network_key ~ '_' ~ inventory_hostname ~ '_to_' ~ item.item.target_host,
+          'command': 'ping -M do -s ' ~ (item.item.payload | string) ~ ' -I ' ~ item.item.local_ip ~ ' ' ~ item.item.target_ip,
+          'expected': 'rc=0 for mtu ' ~ (item.item.mtu | string),
+          'actual': 'rc=' ~ (item.rc | string) ~ ' ' ~ (item.stdout_lines[-2:] | default([]) | join(' | ')),
+          'result': ('pass' if item.rc == 0 else 'fail')
+        }
+      ] }}
+    pve_validate_failed_checks: >-
+      {{ pve_validate_failed_checks + ([ 'mtu_' ~ item.item.network_key ~ '_' ~ item.item.target_host ] if item.rc != 0 else []) }}
+  loop: "{{ pve_validate_peer_mtu_results.results | default([]) }}"
+  when: pve_validate_mtu_probe | bool
+  changed_when: false
+  tags:
+    - phase13
+    - pve_validate
+
+- name: Validate PVE firewall runtime state.
+  ansible.builtin.command:
+    cmd: pve-firewall status
+  register: pve_validate_firewall_status
+  changed_when: false
+  failed_when: false
+  tags:
+    - phase13
+    - pve_validate
+
+- name: Record PVE firewall runtime state.
+  ansible.builtin.set_fact:
+    pve_validate_checks: >-
+      {{ pve_validate_checks + [
+        {
+          'name': 'pve_firewall_status on ' ~ inventory_hostname,
+          'command': 'pve-firewall status',
+          'expected': 'status command rc=0',
+          'actual': pve_validate_firewall_status.stdout | default(pve_validate_firewall_status.stderr | default('')),
+          'result': ('pass' if pve_validate_firewall_status.rc == 0 else 'fail')
+        }
+      ] }}
+    pve_validate_failed_checks: >-
+      {{ pve_validate_failed_checks + (['pve_firewall_status'] if pve_validate_firewall_status.rc != 0 else []) }}
+  changed_when: false
+  tags:
+    - phase13
+    - pve_validate
+
+- name: Write optional hardware version target map.
+  ansible.builtin.copy:
+    dest: "{{ pve_validate_hardware_version_targets_file }}"
+    mode: "0644"
+    content: "{{ pve_validate_hardware_version_targets | to_nice_json }}\n"
+  delegate_to: localhost
+  changed_when: false
+  when: pve_validate_hardware_versions_enabled | bool
+  tags:
+    - phase13
+    - pve_validate
+    - hardware_versions
+
+- name: Validate fleet hardware firmware version consistency from BMC evidence.
+  ansible.builtin.command:
+    argv: >-
+      {{ ['python3', 'tools/validate_fleet_versions.py',
+          '--evidence-dir', pve_validate_hardware_evidence_dir,
+          '--hosts'] + groups.get('pve', [])
+         + ['--targets-file', pve_validate_hardware_version_targets_file] }}
+    chdir: "{{ pve_deploy_root }}"
+  delegate_to: localhost
+  register: pve_validate_hardware_versions_result
+  changed_when: false
+  failed_when: false
+  when: pve_validate_hardware_versions_enabled | bool
+  tags:
+    - phase13
+    - pve_validate
+    - hardware_versions
+
+# The task above sets failed_when: false because a non-zero exit only means some
+# version check failed, and those failures must be collected as checks rather
+# than aborting the play. That also swallows a genuine crash, so the payload is
+# validated here instead of letting from_json raise an opaque template error on
+# empty stdout.
+- name: Fail clearly when the version validator produced no usable output.
+  ansible.builtin.fail:
+    msg: >-
+      tools/validate_fleet_versions.py produced no parsable JSON on
+      {{ inventory_hostname }} (rc={{ pve_validate_hardware_versions_result.rc | default('n/a') }}).
+      stderr: {{ pve_validate_hardware_versions_result.stderr | default('') | truncate(500) }}
+  when:
+    - pve_validate_hardware_versions_enabled | bool
+    - (pve_validate_hardware_versions_result.stdout | default('') | trim) == ''
+  tags:
+    - phase13
+    - pve_validate
+    - hardware_versions
+
+- name: Record fleet hardware firmware version validation.
+  ansible.builtin.set_fact:
+    pve_validate_hardware_versions_payload: "{{ pve_validate_hardware_versions_payload_parsed }}"
+    pve_validate_checks: "{{ pve_validate_checks + (pve_validate_hardware_versions_payload_parsed.checks | default([])) }}"
+    pve_validate_failed_checks: >-
+      {{ pve_validate_failed_checks + (pve_validate_hardware_versions_payload_parsed.failed_checks | default([])) }}
+  vars:
+    pve_validate_hardware_versions_payload_parsed: "{{ pve_validate_hardware_versions_result.stdout | from_json }}"
+  when: pve_validate_hardware_versions_enabled | bool
+  changed_when: false
+  tags:
+    - phase13
+    - pve_validate
+    - hardware_versions
+
+- name: Validate host services the network phase depends on.
+  ansible.builtin.include_tasks: host_services.yml
+  when: (pve_validate_timesync_enabled | bool) or (pve_validate_dns_enabled | bool)
+  tags:
+    - phase13
+    - pve_validate
+
+- name: Run optional iperf3 mesh validation.
+  ansible.builtin.include_tasks: iperf.yml
+  when: pve_validate_iperf_enabled | bool
+  tags:
+    - phase13
+    - pve_validate
+    - iperf
+
+- name: Run optional flent latency-under-load characterisation.
+  ansible.builtin.include_tasks: flent.yml
+  when: pve_validate_flent_enabled | bool
+  tags:
+    - phase13
+    - pve_validate
+    - flent
+
+# The v2 environment flow collects raw checks per host and aggregates them once,
+# so it asks for a fragment instead of a rendered per-node report. Writing the
+# fragment is independent of rendering: a run may do both during migration.
+- name: Write per-host validation fragment for environment aggregation.
+  ansible.builtin.copy:
+    dest: "{{ pve_validate_fragment_dir }}/{{ inventory_hostname }}.json"
+    mode: "0644"
+    content: "{{ {'host': inventory_hostname, 'checks': pve_validate_checks} | to_nice_json }}\n"
+  delegate_to: localhost
+  when: pve_validate_fragment_dir | length > 0
+  changed_when: false
+  tags:
+    - phase13
+    - pve_validate
+
+- name: Render network validation report payload.
+  ansible.builtin.template:
+    src: report_payload.json.j2
+    dest: "{{ reports_dir }}/{{ inventory_hostname }}-network-validation.json"
+    mode: "0644"
+  delegate_to: localhost
+  when: pve_validate_emit_node_report | bool
+  tags:
+    - phase13
+    - pve_validate
+
+- name: Emit network validation report via tools/report.py.
+  ansible.builtin.command:
+    cmd: >-
+      python3 tools/report.py render
+      {{ reports_dir }}/{{ inventory_hostname }}-network-validation.json
+      --out {{ reports_dir }}/
+      --force
+    chdir: "{{ pve_deploy_root }}"
+  delegate_to: localhost
+  register: pve_validate_report_render
+  failed_when: pve_validate_report_render.rc != 0
+  changed_when: true
+  when: pve_validate_emit_node_report | bool
+  tags:
+    - phase13
+    - pve_validate
+
+# The v2 flow defers this: with serial: 1 a per-host assert aborts the play on the
+# first bad node, so later nodes are never probed and the environment report would
+# describe a partial cluster while looking complete. The aggregate play fails once,
+# after every host has reported.
+- name: Fail if any Phase 13 validation check failed.
+  ansible.builtin.assert:
+    that:
+      - pve_validate_failed_checks | length == 0
+    fail_msg: "Phase 13 validation failed on {{ inventory_hostname }}: {{ pve_validate_failed_checks }}"
+    quiet: true
+  when: pve_validate_fail_per_host | bool
+  changed_when: false
+  tags:
+    - phase13
+    - pve_validate

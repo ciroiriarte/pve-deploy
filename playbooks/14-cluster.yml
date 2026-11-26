@@ -1,0 +1,96 @@
+---
+# Phase 14 - Corosync cluster formation.
+#
+# WHY THIS RUNS serial: 1 AND WHY THE ORDER MATTERS
+#
+# One node founds the cluster and the rest join it. `pvecm add` contacts an
+# existing cluster and needs it quorate while the join completes, so joins
+# cannot overlap: two nodes joining at once race for the same corosync
+# configuration. The founder is groups['pve'] | sort | first, deterministically,
+# so a re-run picks the same node rather than whichever host Ansible reached
+# first.
+#
+# WHAT THIS PHASE DESTROYS
+#
+# `man pvecm`: "All existing configuration in /etc/pve is overwritten when
+# joining a cluster." For a joining node that is the whole of its PVE state.
+# The role refuses to join a node holding guests, and this phase runs against
+# nodes that have never had any.
+#
+# WHY IT COMES BEFORE 15-firewall
+#
+# For exactly the same reason: the firewall lives in /etc/pve too, so rules
+# written before the cluster exists are discarded on join. 15-firewall asserts
+# cluster membership and refuses to run until this phase has completed.
+#
+# THE TWO NETWORKS THIS PHASE EXISTS TO GET RIGHT
+#
+# Left to itself, `pvecm create` resolves the node's hostname and puts corosync
+# on whatever that returns -- the management network. Nothing warns. The cluster
+# works, until a migration or a backup saturates the link and corosync starts
+# missing tokens; in an HA cluster that ends in fencing, with running guests
+# rebooted.
+#
+# So corosync is pinned to its own VLAN with --link0, and live migration to
+# another with datacenter.cfg. Both are asserted afterwards against what is
+# actually in use, not against what was requested.
+
+- name: Phase 14 - Corosync cluster formation
+  hosts: pve
+  gather_facts: true
+  serial: 1
+  any_errors_fatal: true
+  vars:
+    pve_cluster_apply: false
+    pve_cluster_confirm: ""
+
+  pre_tasks:
+    - name: Assert play targets are limited to PVE inventory group.
+      ansible.builtin.assert:
+        that:
+          - inventory_hostname in groups.get('pve', [])
+        fail_msg: "PVE deployment phases may only modify hosts in the pve inventory group."
+        quiet: true
+      changed_when: false
+      tags:
+        - always
+
+    - name: Assert the inventory provides the networks this phase pins.
+      ansible.builtin.assert:
+        that:
+          - networks is mapping
+          - network_catalog is mapping
+          - networks[pve_cluster_link0_network] is defined
+          - network_catalog[pve_cluster_migration_network] is defined
+        fail_msg: >-
+          Generated inventory is missing the corosync
+          ({{ pve_cluster_link0_network }}) or migration
+          ({{ pve_cluster_migration_network }}) network. Run
+          tools/sheet_sync.py sync --env <site> --apply --yes first.
+        quiet: true
+      changed_when: false
+      tags:
+        - always
+
+    # Same two-key shape as phases 01, 02 and 11. Forming a cluster overwrites
+    # /etc/pve on every joining node, so it needs a confirmation that names the
+    # site and cannot arrive from an inherited -e.
+    - name: Require an explicit, site-named confirmation before forming a cluster.
+      ansible.builtin.assert:
+        that:
+          - pve_cluster_confirm == pve_site_name
+        fail_msg: >-
+          pve_cluster_apply=true forms a Corosync cluster and OVERWRITES /etc/pve
+          on every node that joins. Confirm the site by re-running with
+          -e pve_cluster_confirm={{ pve_site_name }}. Refusing to continue.
+        quiet: true
+      when: pve_cluster_apply | bool
+      changed_when: false
+      tags:
+        - always
+
+  roles:
+    - role: pve_cluster
+      tags:
+        - phase14
+        - pve_cluster

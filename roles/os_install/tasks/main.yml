@@ -1,0 +1,145 @@
+---
+# Bare-metal install orchestration.
+#
+# THE DIVIDING LINE
+#
+# Everything up to and including "set the one-time boot override" is reversible:
+# a prepared ISO can be deleted, mounted media can be unmounted, a boot override
+# can be cleared, and the running system is untouched throughout. The power
+# cycle is where that stops. From that point the disks are being rewritten.
+#
+# So the role stops before the power cycle by default. Committing to the
+# destructive half needs os_install_dry_run=false stated explicitly, on top of
+# the phase gate that already had to be cleared to get here at all.
+#
+# That ordering is not caution for its own sake: it means the whole chain --
+# render, build, publish, register, mount, boot override -- can be exercised
+# against a live node without consequence, which is the only way to find out
+# whether it works before it matters.
+
+# The way back out.
+#
+# A dry run deliberately leaves the image attached and the boot override set, so
+# that the state it built can be inspected. This is how that state is undone
+# without going anywhere near the install path, and it runs before the input
+# assertions because detaching needs none of them -- UMount takes no arguments.
+- name: Detach media and clear the boot override, then stop
+  ansible.builtin.include_tasks: cleanup_media.yml
+  when: os_install_cleanup_only | default(false) | bool
+
+- name: End this host's run after cleanup
+  ansible.builtin.meta: end_host
+  when: os_install_cleanup_only | default(false) | bool
+
+- name: Assert the install target and its inputs are fully specified
+  # Checked as a set, before anything is built. A missing address discovered
+  # after the ISO is mounted and the boot order changed is a worse place to stop.
+  ansible.builtin.assert:
+    that:
+      - os_install_fqdn | length > 0
+      - os_install_cidr | length > 0
+      - os_install_gateway | length > 0
+      - os_install_root_password | length > 0
+      - os_install_source_iso | length > 0
+      - os_install_build_host | length > 0
+      - (os_install_disk_filter | length > 0) or (os_install_disk_list | length > 0)
+    fail_msg: >-
+      Incomplete install specification for {{ inventory_hostname }}. Required:
+      fqdn, cidr, gateway, root password, source ISO, build host, and a disk
+      filter or list. os_install_root_password is deliberately unset in
+      inventory and must be supplied at run time or from the vault.
+    quiet: true
+  changed_when: false
+
+# The installer will not choose a NIC for you.
+#
+# Checked here rather than left to the installer because the installer's version
+# of this failure is expensive: it aborts at the network step, before disk setup,
+# after the machine has already been power cycled and taken several minutes to
+# POST and boot. Nothing reports it -- the run simply waits out its timeout. Two
+# installs were lost to that before it was diagnosed from the graphical console.
+- name: Assert an install-time NIC filter is defined
+  ansible.builtin.assert:
+    that:
+      - os_install_nic_filter | length > 0
+    fail_msg: >-
+      os_install_network_source={{ os_install_network_source }} requires
+      os_install_nic_filter, and it is empty. The installer aborts with
+      "Installation failed: no filter defined" and writes nothing. Set it to a
+      udev property identifying the install-time NIC, for example
+      {'ID_NET_NAME': 'ens13f0np0'}. List what the target offers with
+      `proxmox-auto-install-assistant device-info --type network`.
+    quiet: true
+  when: os_install_network_source != 'from-dhcp'
+  changed_when: false
+
+- name: Assert the answer delivery method is one this role implements
+  ansible.builtin.assert:
+    that:
+      - os_install_answer_source in ['iso', 'http']
+    fail_msg: >-
+      os_install_answer_source={{ os_install_answer_source }} is not recognised.
+      Use 'iso' (answer embedded per host) or 'http' (fetched at install time).
+    quiet: true
+  changed_when: false
+
+# http needs the install-time NIC to have working L2/L3 before the OS exists.
+# Where the port is an LACP member carrying tagged VLANs, that never happens, and
+# the installer would sit waiting for an answer it cannot fetch. Refusing here
+# is better than discovering it from a console.
+- name: Warn that http answer delivery requires a usable install-time network
+  ansible.builtin.debug:
+    msg: >-
+      os_install_answer_source=http: the installer must reach
+      {{ os_install_answer_url }} on a single untagged interface, before the OS
+      exists. If the install-time port is an LACP member or carries tagged
+      VLANs, this will not work -- use 'iso'.
+  when: os_install_answer_source == 'http'
+  changed_when: false
+
+# Before anything is built, and long before anything is power cycled: can the
+# requested filesystem layout actually be satisfied on this target? The
+# installer only discovers that once it is running on the machine, where the
+# answer is an error screen nobody is watching.
+- name: Check the disk topology is satisfiable
+  ansible.builtin.include_tasks: validate_disk_topology.yml
+
+- name: Build and publish the per-host installation media
+  ansible.builtin.include_tasks: prepare_iso.yml
+
+- name: Attach the installation media to the BMC
+  ansible.builtin.include_tasks: mount_media.yml
+
+- name: Point the next boot at the attached media
+  ansible.builtin.include_tasks: set_boot_override.yml
+
+- name: Stop here unless the destructive step was explicitly requested
+  ansible.builtin.debug:
+    msg: >-
+      DRY RUN complete for {{ inventory_hostname }}. The ISO is built, published,
+      attached, and the next boot is pointed at it -- but the host has NOT been
+      power cycled and its disks are untouched. Re-run with
+      -e os_install_dry_run=false to install, or -e os_install_cleanup_only=true
+      to detach the media and clear the override.
+  when: os_install_dry_run | bool
+  changed_when: false
+
+- name: Install
+  when: not (os_install_dry_run | bool)
+  block:
+    - name: Power cycle into the installer
+      ansible.builtin.include_tasks: start_install.yml
+
+    - name: Wait for the installation to complete
+      ansible.builtin.include_tasks: wait_install.yml
+
+  always:
+    # Runs even if the wait timed out or the install failed -- the boot override
+    # must not survive the run in either case.
+    #
+    # The image itself is treated differently: cleanup_media detaches only when
+    # the node confirmed as installed or was never power cycled, because pulling
+    # the media out from under a still-running installer would turn a slow
+    # install into a failed one. See that file for the full reasoning.
+    - name: Clear the boot override, and detach the media when safe
+      ansible.builtin.include_tasks: cleanup_media.yml

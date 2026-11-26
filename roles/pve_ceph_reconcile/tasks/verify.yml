@@ -1,0 +1,90 @@
+---
+# Verification facts: health, CRUSH rule presence, pools present, CephFS present,
+# and device-class membership. Field names should be confirmed against a live
+# cluster; they follow the documented `ceph ... -f json` shapes.
+- name: Read Ceph status for verification.
+  ansible.builtin.command:
+    cmd: ceph -s -f json
+  delegate_to: "{{ pve_ceph_first_node }}"
+  register: pve_ceph_reconcile_status
+  changed_when: false
+
+- name: Read CRUSH rules for verification.
+  ansible.builtin.command:
+    cmd: ceph osd crush rule ls
+  delegate_to: "{{ pve_ceph_first_node }}"
+  register: pve_ceph_reconcile_rules_verify
+  changed_when: false
+
+- name: Read pools for verification.
+  ansible.builtin.command:
+    cmd: ceph osd pool ls
+  delegate_to: "{{ pve_ceph_first_node }}"
+  register: pve_ceph_reconcile_pools_verify
+  changed_when: false
+
+- name: Read CephFS filesystems for verification.
+  ansible.builtin.command:
+    cmd: ceph fs ls -f json
+  delegate_to: "{{ pve_ceph_first_node }}"
+  register: pve_ceph_reconcile_fs_verify
+  changed_when: false
+
+- name: Read device-class membership for verification.
+  ansible.builtin.command:
+    cmd: ceph osd crush class ls-osd {{ pve_ceph_device_class }} -f json
+  delegate_to: "{{ pve_ceph_first_node }}"
+  register: pve_ceph_reconcile_class_verify
+  changed_when: false
+  failed_when: false
+
+- name: Record reconcile verification facts.
+  ansible.builtin.set_fact:
+    pve_ceph_reconcile_verification: >-
+      {{ [
+        {
+          'name': 'Ceph health',
+          'command': 'ceph -s -f json (.health.status)',
+          'expected': 'HEALTH_OK',
+          'actual': (_st.health.status | default('unknown')),
+          'result': ('pass' if (_st.health.status | default('')) == 'HEALTH_OK' else 'fail')
+        },
+        {
+          'name': 'Class-scoped CRUSH rule present',
+          'command': 'ceph osd crush rule ls',
+          'expected': pve_ceph_crush_rule,
+          'actual': (_rules | join(', ')),
+          'result': ('pass' if (_rules | select('equalto', pve_ceph_crush_rule) | list | length) > 0 else 'fail')
+        },
+        {
+          'name': 'Production pools present',
+          'command': 'ceph osd pool ls',
+          'expected': (_want_pools | join(', ')),
+          'actual': (_pools | join(', ')),
+          'result': ('pass' if ((_want_pools | difference(_pools)) | length) == 0 else 'fail')
+        },
+        {
+          'name': 'CephFS present',
+          'command': 'ceph fs ls -f json',
+          'expected': pve_ceph_fs_name,
+          'actual': (_fs | join(', ')),
+          'result': ('pass' if (_fs | select('equalto', pve_ceph_fs_name) | list | length) > 0 else 'fail')
+        },
+        {
+          'name': 'OSDs on target device class',
+          'command': 'ceph osd crush class ls-osd ' ~ pve_ceph_device_class,
+          'expected': 'all ' ~ (_num | string) ~ ' OSDs on ' ~ pve_ceph_device_class,
+          'actual': (_classed | length | string) ~ ' of ' ~ (_num | string),
+          'result': ('pass' if (_num > 0 and (_classed | length) == _num) else 'fail')
+        }
+      ] }}
+  vars:
+    _st: "{{ pve_ceph_reconcile_status.stdout | default('{}', true) | from_json }}"
+    _num: "{{ _st.osdmap.num_osds | default(0) | int }}"
+    _rules: "{{ pve_ceph_reconcile_rules_verify.stdout_lines | default([]) }}"
+    _pools: "{{ pve_ceph_reconcile_pools_verify.stdout_lines | default([]) }}"
+    _want_pools: "{{ pve_ceph_pools | map(attribute='name') | list }}"
+    _fs: "{{ pve_ceph_reconcile_fs_verify.stdout | default('[]', true) | from_json | map(attribute='name') | list }}"
+    _classed: "{{ pve_ceph_reconcile_class_verify.stdout | default('[]', true) | from_json }}"
+  delegate_to: "{{ pve_ceph_first_node }}"
+  changed_when: false

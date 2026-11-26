@@ -1,0 +1,61 @@
+---
+# C5/C6 - production RBD pools, bound to the class-scoped rule. The pool CREATE is
+# a proxmox_ceph_pool module call (idempotent by state=present), so the old
+# check-before-create read is gone. Compression has NO module parameter, so it
+# stays a CLI task and runs AFTER the module creates the pool -- the module makes
+# the pool, then the CLI sets compression only when it differs, so re-runs do not
+# churn the pool.
+- name: Create the production RBD pools and register them as PVE storage.
+  community.proxmox.proxmox_ceph_pool:
+    name: "{{ item.name }}"
+    node: "{{ pve_ceph_first_node }}"
+    size: "{{ pve_ceph_pool_size }}"
+    min_size: "{{ pve_ceph_pool_min_size }}"
+    crush_rule: "{{ pve_ceph_crush_rule }}"
+    pg_autoscale_mode: "{{ pve_ceph_pool_pg_autoscale_mode }}"
+    add_storages: true
+    state: present
+  loop: "{{ pve_ceph_pools }}"
+  loop_control:
+    label: "{{ item.name }}"
+  delegate_to: localhost
+  register: pve_ceph_reconcile_pool_create
+
+- name: Ensure the RBD application tag on the production pools (idempotent).
+  # proxmox_ceph_pool has no `application` parameter and does not set the tag, so
+  # guarantee it here. Read-before-write keeps it a no-op once rbd is present.
+  ansible.builtin.shell:
+    cmd: |
+      set -u
+      if ceph osd pool application get {{ item.name }} 2>/dev/null | grep -q '"rbd"'; then
+        echo "APP_CHANGED=0"
+      else
+        ceph osd pool application enable {{ item.name }} rbd
+        echo "APP_CHANGED=1"
+      fi
+  delegate_to: "{{ pve_ceph_first_node }}"
+  loop: "{{ pve_ceph_pools }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: pve_ceph_reconcile_pool_app
+  changed_when: "'APP_CHANGED=1' in (pve_ceph_reconcile_pool_app.stdout | default(''))"
+
+- name: Configure compression on the pools that request it (idempotent).
+  ansible.builtin.shell:
+    cmd: |
+      set -u
+      cur=$(ceph osd pool get {{ item.name }} compression_algorithm 2>/dev/null | awk '{print $2}')
+      changed=0
+      if [ "$cur" != "{{ item.compression_algorithm }}" ]; then
+        ceph osd pool set {{ item.name }} compression_algorithm {{ item.compression_algorithm }}
+        ceph osd pool set {{ item.name }} compression_mode {{ item.compression_mode }}
+        changed=1
+      fi
+      echo "COMPRESS_CHANGED=$changed"
+  delegate_to: "{{ pve_ceph_first_node }}"
+  loop: "{{ pve_ceph_pools }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: item.compression_algorithm | length > 0
+  register: pve_ceph_reconcile_pool_compress
+  changed_when: "'COMPRESS_CHANGED=1' in (pve_ceph_reconcile_pool_compress.stdout | default(''))"

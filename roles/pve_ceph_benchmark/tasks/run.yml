@@ -1,0 +1,35 @@
+---
+# G - render the measurement script onto the first node and run it. The script
+# prefills each image (so fio reads are valid), then runs rados bench + fio for
+# the configured number of rounds. It creates and deletes NO pools.
+#
+# This is a long run (tens of minutes). For a production run over an unstable
+# link, wrap the invocation in screen on the node (project practice:
+# run-long-tasks-in-screen-on-dc-nodes); here it runs async so a transient
+# control-connection drop does not abandon the job.
+- name: Render the benchmark measurement script onto the first node.
+  ansible.builtin.template:
+    src: ceph_benchmark.sh.j2
+    dest: /root/pve_ceph_benchmark.sh
+    owner: root
+    group: root
+    mode: "0755"
+  delegate_to: "{{ pve_ceph_first_node }}"
+  changed_when: false
+
+- name: Run the benchmark measurement script.
+  ansible.builtin.command:
+    cmd: bash /root/pve_ceph_benchmark.sh
+  delegate_to: "{{ pve_ceph_first_node }}"
+  register: pve_ceph_benchmark_run
+  async: 21600
+  poll: 30
+  changed_when: "'BENCHMARK_DONE_MARKER' in (pve_ceph_benchmark_run.stdout | default(''))"
+  failed_when: pve_ceph_benchmark_run.rc != 0
+
+- name: Record the benchmark result bundle location on the first node.
+  ansible.builtin.set_fact:
+    pve_ceph_benchmark_out_dir: >-
+      {{ (pve_ceph_benchmark_run.stdout | default('') | regex_search('BENCHMARK_DONE_MARKER (\S+)', '\1') | first) | default('unknown', true) }}
+  run_once: true
+  changed_when: false

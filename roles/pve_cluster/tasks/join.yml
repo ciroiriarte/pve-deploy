@@ -1,0 +1,46 @@
+---
+# Join an existing cluster.
+#
+# The address given to `pvecm add` is the FOUNDER'S CORORSYNC address, not its
+# management address: the joining node has to reach the cluster on the ring it
+# will itself use. --link0 is this node's own corosync address.
+#
+# Authentication is by root password over SSH to the founder. That password was
+# rotated by phase 10, so it is the vaulted hash's plaintext -- which Ansible
+# does not have. The join therefore uses the root SSH key trust that phase 10
+# installed on every node instead, via an explicit known-hosts primed entry.
+
+- name: Prime the founder's host key so the join is not blocked on a prompt
+  ansible.builtin.known_hosts:
+    name: "{{ hostvars[pve_cluster_founder].networks[pve_cluster_link0_network].ip }}"
+    key: >-
+      {{ hostvars[pve_cluster_founder].networks[pve_cluster_link0_network].ip }}
+      {{ lookup('pipe', 'ssh-keyscan -t ed25519 -T 5 '
+         ~ hostvars[pve_cluster_founder].networks[pve_cluster_link0_network].ip
+         ~ ' 2>/dev/null | awk "/ed25519/{print \$2, \$3}"') }}
+    state: present
+  changed_when: false
+  failed_when: false
+
+- name: Join the cluster
+  ansible.builtin.command:
+    argv: >-
+      {{ ['pvecm', 'add',
+          hostvars[pve_cluster_founder].networks[pve_cluster_link0_network].ip,
+          '--link0', pve_cluster_link0_addr
+                     ~ (',priority=' ~ pve_cluster_link0_priority
+                        if pve_cluster_link1_addr | length > 0 else ''),
+          '--use_ssh', '1']
+         + (['--link1', pve_cluster_link1_addr ~ ',priority=' ~ pve_cluster_link1_priority]
+            if pve_cluster_link1_addr | length > 0 else []) }}
+  register: pve_cluster_join
+  changed_when: pve_cluster_join.rc == 0
+
+- name: Wait for this node to appear quorate
+  ansible.builtin.command:
+    cmd: pvecm status
+  register: pve_cluster_join_quorum
+  until: pve_cluster_join_quorum.rc == 0 and 'Quorate:' in pve_cluster_join_quorum.stdout
+  retries: "{{ pve_cluster_quorum_retries }}"
+  delay: "{{ pve_cluster_quorum_delay }}"
+  changed_when: false

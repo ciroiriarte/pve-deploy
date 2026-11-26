@@ -1,0 +1,62 @@
+---
+# Evidence schema version. Bump only when downstream consumers must adapt.
+bmc_inventory_schema_version: "1.0"
+
+# Deployment tier stamped into report metadata. Names the tier, not a path.
+environment_name: "production"
+
+# Directory name under environments/ holding this site's evidence.
+pve_site_name: "default"
+
+# BMC username. Password must be supplied by Ansible Vault as bmc_password.
+bmc_username: "USERID"
+
+# BMCs commonly ship with self-signed XCC certificates. Set true only after
+# installing a trusted CA chain and, optionally, bmc_redfish_ca_path.
+bmc_redfish_validate_certs: false
+bmc_redfish_ca_path: ""
+
+# Timeout for each Redfish GET/info request.
+bmc_redfish_timeout: 60
+
+# URI scheme for Redfish endpoints.
+bmc_redfish_scheme: "https"
+
+# Shared timestamp for per-host evidence and consolidated outputs.
+bmc_inventory_stamp: "{{ lookup('pipe', 'date +%Y-%m-%dT%H%M') }}"
+
+# Repository root, resolved from the playbook location rather than the caller's
+# working directory, so the tools are found no matter where ansible-playbook
+# was invoked from.
+pve_deploy_root: "{{ (playbook_dir ~ '/..') | realpath }}"
+
+# Site data root: where per-deployment records are written. Defaults to this
+# checkout; point it at a site repository to keep records out of the tool repo.
+pve_site_root: "{{ pve_deploy_root }}"
+
+# Local output locations. These are control-node artifacts, not BMC writes.
+bmc_inventory_environment_dir: "{{ pve_site_root }}/environments/{{ pve_site_name }}"
+bmc_inventory_evidence_dir: "{{ bmc_inventory_environment_dir }}/evidence"
+bmc_inventory_report_dir: "{{ pve_site_root }}/reports"
+bmc_inventory_summary_path: "{{ bmc_inventory_evidence_dir }}/bmc-hardware-summary-{{ bmc_inventory_stamp }}.md"
+bmc_inventory_report_input_path: "{{ bmc_inventory_evidence_dir }}/bmc-hardware-report-{{ bmc_inventory_stamp }}.json"
+
+# Report metadata.
+# No timestamp in the slug: report.py appends the YYYY-MM-DDTHHMM stamp itself
+# for non-change reports, so embedding one here yields a filename carrying two
+# different timestamps.
+bmc_inventory_report_slug: "bmc-hardware-audit"
+bmc_inventory_report_title: "BMC Hardware Audit"
+bmc_inventory_report_operator: "{{ lookup('env', 'USER') | default('unknown', true) }}"
+bmc_inventory_report_tool: "pve-deploy 01-hardware.yml"
+
+# Toggle raw Redfish payload inclusion. Keep enabled for first deployment audits
+# because Lenovo XCC field placement can vary across firmware releases.
+bmc_inventory_include_raw_redfish: true
+
+# Raw GET paths used only for defensive discovery beyond redfish_info coverage.
+# These are standard Redfish collection paths; member expansion below is still
+# marked in tasks as needing live Lenovo XCC verification.
+bmc_inventory_service_root_path: "/redfish/v1"
+bmc_inventory_systems_path: "/redfish/v1/Systems"
+bmc_inventory_managers_path: "/redfish/v1/Managers"

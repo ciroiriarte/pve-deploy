@@ -1,0 +1,25 @@
+---
+# BMC credentials for the out-of-band (Tier A) plays.
+#
+# Template only. A site inventory keeps its real copy at
+# <site>/inventories/<site>/group_vars/bmc/vault.yml, encrypted:
+#
+#     cp inventories/vault.yml.example \
+#        $SITE/inventories/<site>/group_vars/bmc/vault.yml
+#     ansible-vault encrypt $SITE/inventories/<site>/group_vars/bmc/vault.yml
+#     ansible-vault edit    $SITE/inventories/<site>/group_vars/bmc/vault.yml
+#
+# vault.yml is git-ignored. This example is not, and must never contain a real
+# credential.
+#
+# It belongs in the group_vars/bmc/ DIRECTORY alongside generated.yml.
+# tools/sheet_sync.py owns generated.yml and rewrites it on every sync; it never
+# touches anything else in that directory, so hand-maintained secrets are safe.
+
+# Lenovo XCC local account. USERID is the factory default administrative user.
+bmc_username: USERID
+bmc_password: "CHANGE-ME-DO-NOT-COMMIT"
+
+# BMCs ship with self-signed certificates, so certificate validation is off by
+# default. Set to true once a trusted certificate is installed on the XCCs.
+bmc_validate_certs: false

@@ -1,0 +1,177 @@
+---
+# Default variables for bmc_config role
+
+# Audit mode flag: MUST default to true. ZERO writes to the BMC.
+# Normally set by playbooks/01-hardware.yml from its hardware_apply gate rather
+# than by hand. Consumers must read it through `| bool`: a string value is
+# truthy in Jinja whatever it contains, including "False".
+bmc_config_audit_only: true
+
+# BMC connection defaults.
+# bmc_password is deliberately NOT defaulted: an empty default would satisfy an
+# "is defined" assertion and turn a missing vault into a confusing auth failure
+# against every BMC. Supply it from group_vars/bmc/vault.yml.
+bmc_username: "USERID"
+bmc_validate_certs: false
+bmc_timeout: 30
+
+# Deployment tier stamped into report metadata. Names the tier, not a path.
+environment_name: "production"
+
+# Directory name under environments/ holding this site's evidence.
+pve_site_name: "default"
+
+pve_deploy_root: "{{ (playbook_dir ~ '/..') | realpath }}"
+pve_site_root: "{{ pve_deploy_root }}"
+evidence_dir: "{{ pve_site_root }}/environments/{{ pve_site_name }}/evidence"
+reports_dir: "{{ pve_site_root }}/reports"
+
+# Audit result state.
+#
+# Defined here, not only in the task files, because the rescue path renders the
+# same templates without having run the audit. Initialising these solely on the
+# success path makes the error handler itself fail on an undefined variable,
+# which masks the original error.
+bmc_config_outcome: "failed"
+bmc_config_drift_items: []
+bmc_config_match_count: 0
+bmc_config_drift_count: 0
+bmc_config_absent_count: 0
+bmc_config_unsupported_count: 0
+bmc_config_evidence_source: "none"
+bmc_network_protocol: {}
+bmc_ethernet_interfaces: []
+bmc_accounts: []
+bmc_account_service: {}
+
+# ---------------------------------------------------------------------------
+# Desired BMC state
+# ---------------------------------------------------------------------------
+#
+# Expressed as intent, not as Redfish paths. The mapping from these keys to
+# Redfish resources lives in the audit tasks, so a second vendor can implement
+# the same intent without this file changing. See the multi-vendor abstraction
+# issue for where this eventually moves.
+#
+# Every entry is optional: a key left undefined is not audited. That is
+# deliberate — a half-specified baseline should narrow what is checked, never
+# silently pass things it never looked at.
+
+bmc_baseline:
+  # Time synchronisation. Drift here corrupts every timestamp the BMC produces,
+  # including the event log used to reconstruct incidents.
+  ntp:
+    enabled: true
+    servers: []
+
+  # Name resolution used by the BMC itself for syslog/SMTP/LDAP targets.
+  #
+  # mode decides what is even meaningful to audit:
+  #   dhcp   - resolvers are supplied by DHCP. StaticNameServers is NOT compared,
+  #            because whatever sits there is inert while DHCP owns the lease.
+  #            What IS checked is that the interface really is taking DNS from
+  #            DHCP rather than silently ignoring it.
+  #   static - addressing is manual, so resolvers must be pinned and `servers`
+  #            has to match.
+  #   null   - not audited at all.
+  #
+  # Comparing StaticNameServers unconditionally would report drift on every
+  # DHCP-configured BMC purely for holding stale static values it never uses.
+  dns:
+    mode: dhcp
+    servers: []
+
+  # Management protocol posture. Values are Redfish ProtocolEnabled booleans.
+  #
+  # ipmi_over_lan is MANDATORY and is called out separately for that reason.
+  #
+  # It is the out-of-band recovery path. Serial-over-LAN rides on it, and SoL is
+  # what reaches a machine that has no working network -- during a bare-metal
+  # install, after a bad network change, or when a bond fails to negotiate. A
+  # node with neither a network nor IPMI is reachable only by walking to it.
+  #
+  # This default was originally false, on the general security argument that
+  # IPMI predates Redfish and authenticates weakly. That argument is real but it
+  # loses: it optimises for a protocol's reputation over the ability to recover a
+  # host, and the phases in this repository depend on SoL by design. Where the
+  # exposure matters, bound it at the firewall rather than by removing the
+  # capability from the hardware.
+  # Everything the BMC exposes is stated here. Leaving a supported protocol out
+  # of the baseline is not neutrality -- it means nobody decided, and whatever
+  # the factory shipped silently becomes the policy.
+  protocols:
+    ssh: true
+    https: true
+    ipmi_over_lan: true
+    virtual_media: true
+
+    # Remote KVM. Enabled: it shares port 3900 with virtual media, and the
+    # deployment jumphost policy already permits that port (XCC-Console).
+    kvmip: true
+
+    # The BMC's own DHCP client. True because that is the addressing model in
+    # use -- the BMCs take their address and resolvers from DHCP.
+    dhcp: true
+    dhcpv6: true
+
+    # --- the two below are hardening positions, not observations ---
+
+    # Plaintext management on port 80. HTTPS is available on 443, so this is
+    # redundant as well as unencrypted. Set false deliberately; the fleet
+    # currently has it ENABLED, so expect this to report drift until it is
+    # either applied or the position is consciously reversed here.
+    http: false
+
+    # Multicast discovery on 1900. Not used by anything in this deployment and
+    # routinely disabled in hardened environments. Also currently enabled on the
+    # fleet, so also expect drift.
+    ssdp: false
+
+    # Exposed by this firmware but not implemented: the property appears with a
+    # port and a null ProtocolEnabled. Declared so that a future firmware which
+    # DOES implement it is measured rather than ignored; classified unsupported
+    # rather than counted as a finding while it stays null.
+    snmp: false
+
+  # Account policy. Not the accounts themselves — those are handled separately
+  # because creating and deleting BMC users is destructive in a way that
+  # toggling a lockout threshold is not.
+  #
+  # As with protocols: every policy property the BMC exposes is stated, so the
+  # factory default never becomes the policy by omission.
+  account_policy:
+    min_password_length: 10
+    max_password_length: 255
+    lockout_threshold: 5
+
+    # How long a locked account stays locked, and how long failed attempts are
+    # remembered. Both in seconds. Left at the firmware's 3600 rather than
+    # invented: an hour is a defensible lockout for a management controller, and
+    # shortening it weakens the throttle the threshold exists to provide.
+    lockout_duration: 3600
+    lockout_counter_reset_after: 3600
+    lockout_counter_reset_enabled: true
+
+    # Local accounts must keep working. This is the credential path that still
+    # functions when LDAP or the network behind it does not, which is the
+    # situation a BMC exists for.
+    local_account_auth: "Enabled"
+
+    # The account service itself. Disabled would mean no authentication service
+    # at all.
+    service_enabled: true
+
+# Accounts expected to exist, by username. Auditing only: this role reports
+# unexpected or missing accounts, and does not create, delete or re-password
+# them. Credential lifecycle needs its own opt-in beyond the phase gate.
+bmc_expected_accounts:
+  - "{{ bmc_username }}"
+
+# Report metadata. No timestamp in the slug: report.py appends the
+# YYYY-MM-DDTHHMM stamp itself for non-change reports, so embedding one here
+# yields a filename carrying two different timestamps.
+bmc_config_report_slug: "bmc-config-audit-{{ parent_host | default(inventory_hostname) }}"
+bmc_config_report_title: "BMC Configuration Audit"
+bmc_config_stamp: "{{ lookup('pipe', 'date +%Y-%m-%dT%H%M') }}"
+bmc_config_evidence_path: >-
+  {{ evidence_dir }}/{{ parent_host | default(inventory_hostname) }}-bmcconfig-{{ bmc_config_stamp }}.json

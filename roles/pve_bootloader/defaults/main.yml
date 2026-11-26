@@ -1,0 +1,11 @@
+---
+pve_deploy_root: "{{ (playbook_dir ~ '/..') | realpath }}"
+
+# Site data root: where per-deployment records are written. Defaults to this
+# checkout; point it at a site repository to keep records out of the tool repo.
+pve_site_root: "{{ pve_deploy_root }}"
+reports_dir: "{{ pve_site_root }}/reports"
+
+pve_environment: "production"
+pve_bootloader_migrate: true
+pve_esp_partition: "auto"

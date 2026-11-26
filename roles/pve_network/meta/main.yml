@@ -1,0 +1,11 @@
+---
+galaxy_info:
+  author: "PVE Automation Team"
+  description: "Renders and safely applies network interface configuration on PVE nodes"
+  license: "MIT"
+  min_ansible_version: "2.15.0"
+  platforms:
+    - name: Debian
+      versions:
+        - trixie
+dependencies: []

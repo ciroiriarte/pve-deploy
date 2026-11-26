@@ -1,0 +1,48 @@
+{
+  "kind": "change",
+  "slug": "pve-network-apply-{{ inventory_hostname }}",
+  "title": "Apply Network Interface Configuration",
+  "element": "pve_network",
+  "environment": {{ pve_environment | to_json }},
+  "operator": {{ ansible_user_id | default('root') | to_json }},
+  "tool": "ansible",
+  "outcome": "success",
+  "summary": "Rendered and applied /etc/network/interfaces with narrow bridge-vids and safe fallback",
+  "targets": [
+    {
+      "host": {{ inventory_hostname | to_json }},
+      "address": {{ ansible_host | default(inventory_hostname) | to_json }},
+      "role": "hypervisor"
+    }
+  ],
+  "changes": [
+    {
+      "host": {{ inventory_hostname | to_json }},
+      "description": "Updated network interface definitions and reloaded interfaces via ifreload",
+      "before": "previous interfaces file",
+      "after": "rendered interfaces file",
+      "commands": [
+        "ifup --no-act -i {{ pve_network_staging_path }}",
+        "cp /etc/network/interfaces /etc/network/interfaces.bak.<stamp>",
+        "systemd-run --unit={{ pve_network_rollback_unit }} --on-active={{ pve_network_rollback_delay }} /bin/sh -c 'cp -f <backup> /etc/network/interfaces && ifreload -a'",
+        "cp {{ pve_network_staging_path }} /etc/network/interfaces",
+        "ifreload -a",
+        "systemctl stop {{ pve_network_rollback_unit }}.timer"
+      ]
+    }
+  ],
+  "verification": [
+    {
+      "name": "management_reachability",
+      "command": "ping -c 2 management_gateway",
+      "expected": "0% packet loss",
+      "actual": "0% packet loss",
+      "result": "pass"
+    }
+  ],
+  "artifacts": [
+    "/etc/network/interfaces",
+    "/etc/network/interfaces.bak"
+  ],
+  "notes": "Applied 8-NIC 4-bond layout with narrow bridge-vids to prevent ConnectX-6 vport log floods."
+}

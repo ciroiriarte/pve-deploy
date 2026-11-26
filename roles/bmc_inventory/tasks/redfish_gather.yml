@@ -1,0 +1,532 @@
+---
+- name: Check Redfish service availability.
+  community.general.redfish_info:
+    category:
+      - Service
+    command:
+      - CheckAvailability
+    baseuri: "{{ ansible_host }}"
+    username: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    timeout: "{{ bmc_redfish_timeout }}"
+    validate_certs: "{{ bmc_redfish_validate_certs }}"
+    ca_path: "{{ bmc_redfish_ca_path | default(omit) if bmc_redfish_ca_path | length > 0 else omit }}"
+  register: bmc_rf_service
+  failed_when: false
+  changed_when: false
+  no_log: true
+  tags:
+    - audit
+    - bmc
+    - readonly
+
+- name: Gather system identity inventory.
+  community.general.redfish_info:
+    category:
+      - Systems
+    command:
+      - GetSystemInventory
+    baseuri: "{{ ansible_host }}"
+    username: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    timeout: "{{ bmc_redfish_timeout }}"
+    validate_certs: "{{ bmc_redfish_validate_certs }}"
+    ca_path: "{{ bmc_redfish_ca_path | default(omit) if bmc_redfish_ca_path | length > 0 else omit }}"
+  register: bmc_rf_system
+  failed_when: false
+  changed_when: false
+  no_log: true
+  tags:
+    - audit
+    - bmc
+    - readonly
+
+- name: Gather processor inventory.
+  community.general.redfish_info:
+    category:
+      - Systems
+    command:
+      - GetCpuInventory
+    baseuri: "{{ ansible_host }}"
+    username: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    timeout: "{{ bmc_redfish_timeout }}"
+    validate_certs: "{{ bmc_redfish_validate_certs }}"
+    ca_path: "{{ bmc_redfish_ca_path | default(omit) if bmc_redfish_ca_path | length > 0 else omit }}"
+  register: bmc_rf_cpu
+  failed_when: false
+  changed_when: false
+  no_log: true
+  tags:
+    - audit
+    - bmc
+    - readonly
+
+- name: Gather memory inventory.
+  community.general.redfish_info:
+    category:
+      - Systems
+    command:
+      - GetMemoryInventory
+    baseuri: "{{ ansible_host }}"
+    username: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    timeout: "{{ bmc_redfish_timeout }}"
+    validate_certs: "{{ bmc_redfish_validate_certs }}"
+    ca_path: "{{ bmc_redfish_ca_path | default(omit) if bmc_redfish_ca_path | length > 0 else omit }}"
+  register: bmc_rf_memory
+  failed_when: false
+  changed_when: false
+  no_log: true
+  tags:
+    - audit
+    - bmc
+    - readonly
+
+- name: Gather host NIC inventory.
+  community.general.redfish_info:
+    category:
+      - Systems
+    command:
+      - GetNicInventory
+    baseuri: "{{ ansible_host }}"
+    username: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    timeout: "{{ bmc_redfish_timeout }}"
+    validate_certs: "{{ bmc_redfish_validate_certs }}"
+    ca_path: "{{ bmc_redfish_ca_path | default(omit) if bmc_redfish_ca_path | length > 0 else omit }}"
+  register: bmc_rf_nic
+  failed_when: false
+  changed_when: false
+  no_log: true
+  tags:
+    - audit
+    - bmc
+    - readonly
+
+- name: Gather storage controller inventory.
+  community.general.redfish_info:
+    category:
+      - Systems
+    command:
+      - GetStorageControllerInventory
+    baseuri: "{{ ansible_host }}"
+    username: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    timeout: "{{ bmc_redfish_timeout }}"
+    validate_certs: "{{ bmc_redfish_validate_certs }}"
+    ca_path: "{{ bmc_redfish_ca_path | default(omit) if bmc_redfish_ca_path | length > 0 else omit }}"
+  register: bmc_rf_storage_controller
+  failed_when: false
+  changed_when: false
+  no_log: true
+  tags:
+    - audit
+    - bmc
+    - readonly
+
+- name: Gather physical disk inventory.
+  community.general.redfish_info:
+    category:
+      - Systems
+    command:
+      - GetDiskInventory
+    baseuri: "{{ ansible_host }}"
+    username: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    timeout: "{{ bmc_redfish_timeout }}"
+    validate_certs: "{{ bmc_redfish_validate_certs }}"
+    ca_path: "{{ bmc_redfish_ca_path | default(omit) if bmc_redfish_ca_path | length > 0 else omit }}"
+  register: bmc_rf_disk
+  failed_when: false
+  changed_when: false
+  no_log: true
+  tags:
+    - audit
+    - bmc
+    - readonly
+
+- name: Gather configured volume inventory.
+  community.general.redfish_info:
+    category:
+      - Systems
+    command:
+      - GetVolumeInventory
+    baseuri: "{{ ansible_host }}"
+    username: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    timeout: "{{ bmc_redfish_timeout }}"
+    validate_certs: "{{ bmc_redfish_validate_certs }}"
+    ca_path: "{{ bmc_redfish_ca_path | default(omit) if bmc_redfish_ca_path | length > 0 else omit }}"
+  register: bmc_rf_volume
+  failed_when: false
+  changed_when: false
+  no_log: true
+  tags:
+    - audit
+    - bmc
+    - readonly
+
+- name: Gather BIOS attributes.
+  community.general.redfish_info:
+    category:
+      - Systems
+    command:
+      - GetBiosAttributes
+    baseuri: "{{ ansible_host }}"
+    username: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    timeout: "{{ bmc_redfish_timeout }}"
+    validate_certs: "{{ bmc_redfish_validate_certs }}"
+    ca_path: "{{ bmc_redfish_ca_path | default(omit) if bmc_redfish_ca_path | length > 0 else omit }}"
+  register: bmc_rf_bios
+  failed_when: false
+  changed_when: false
+  no_log: true
+  tags:
+    - audit
+    - bmc
+    - readonly
+
+- name: Gather system health and power rollup.
+  community.general.redfish_info:
+    category:
+      - Systems
+    command:
+      - GetHealthReport
+    baseuri: "{{ ansible_host }}"
+    username: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    timeout: "{{ bmc_redfish_timeout }}"
+    validate_certs: "{{ bmc_redfish_validate_certs }}"
+    ca_path: "{{ bmc_redfish_ca_path | default(omit) if bmc_redfish_ca_path | length > 0 else omit }}"
+  register: bmc_rf_system_health
+  failed_when: false
+  changed_when: false
+  no_log: true
+  tags:
+    - audit
+    - bmc
+    - readonly
+
+- name: Gather chassis inventory and health rollup.
+  community.general.redfish_info:
+    category:
+      - Chassis
+    command:
+      - GetChassisInventory
+      - GetHealthReport
+    baseuri: "{{ ansible_host }}"
+    username: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    timeout: "{{ bmc_redfish_timeout }}"
+    validate_certs: "{{ bmc_redfish_validate_certs }}"
+    ca_path: "{{ bmc_redfish_ca_path | default(omit) if bmc_redfish_ca_path | length > 0 else omit }}"
+  register: bmc_rf_chassis
+  failed_when: false
+  changed_when: false
+  no_log: true
+  tags:
+    - audit
+    - bmc
+    - readonly
+
+- name: Gather BMC manager identity.
+  community.general.redfish_info:
+    category:
+      - Manager
+    command:
+      - GetManagerInventory
+    baseuri: "{{ ansible_host }}"
+    username: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    timeout: "{{ bmc_redfish_timeout }}"
+    validate_certs: "{{ bmc_redfish_validate_certs }}"
+    ca_path: "{{ bmc_redfish_ca_path | default(omit) if bmc_redfish_ca_path | length > 0 else omit }}"
+  register: bmc_rf_manager
+  failed_when: false
+  changed_when: false
+  no_log: true
+  tags:
+    - audit
+    - bmc
+    - readonly
+
+- name: Gather BMC manager NIC inventory.
+  community.general.redfish_info:
+    category:
+      - Manager
+    command:
+      - GetManagerNicInventory
+    baseuri: "{{ ansible_host }}"
+    username: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    timeout: "{{ bmc_redfish_timeout }}"
+    validate_certs: "{{ bmc_redfish_validate_certs }}"
+    ca_path: "{{ bmc_redfish_ca_path | default(omit) if bmc_redfish_ca_path | length > 0 else omit }}"
+  register: bmc_rf_manager_nic
+  failed_when: false
+  changed_when: false
+  no_log: true
+  tags:
+    - audit
+    - bmc
+    - readonly
+
+- name: Gather firmware inventory.
+  community.general.redfish_info:
+    category:
+      - Update
+    command:
+      - GetFirmwareInventory
+    baseuri: "{{ ansible_host }}"
+    username: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    timeout: "{{ bmc_redfish_timeout }}"
+    validate_certs: "{{ bmc_redfish_validate_certs }}"
+    ca_path: "{{ bmc_redfish_ca_path | default(omit) if bmc_redfish_ca_path | length > 0 else omit }}"
+  register: bmc_rf_firmware
+  failed_when: false
+  changed_when: false
+  no_log: true
+  tags:
+    - audit
+    - bmc
+    - readonly
+
+- name: Discover raw Redfish system collection.
+  ansible.builtin.uri:
+    url: "{{ bmc_redfish_scheme }}://{{ ansible_host }}{{ bmc_inventory_systems_path }}"
+    method: GET
+    url_username: "{{ bmc_username }}"
+    url_password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_redfish_validate_certs }}"
+    ca_path: "{{ bmc_redfish_ca_path | default(omit) if bmc_redfish_ca_path | length > 0 else omit }}"
+    timeout: "{{ bmc_redfish_timeout }}"
+    headers:
+      Accept: "application/json"
+    return_content: true
+  register: bmc_raw_systems
+  failed_when: false
+  changed_when: false
+  no_log: true
+  tags:
+    - audit
+    - bmc
+    - readonly
+
+- name: Select first raw Redfish system member URI.
+  ansible.builtin.set_fact:
+    bmc_raw_system_uri: "{{ (bmc_raw_systems.json.Members | default([]) | first)['@odata.id'] | default('') }}"
+  changed_when: false
+  tags:
+    - audit
+    - bmc
+    - readonly
+
+# Needs verification against live Lenovo XCC: SR655 V3/SR665 V3/SR630 V4 may expose
+# useful slot/adapter hints only in the ComputerSystem member payload.
+- name: Gather raw Redfish system member details.
+  ansible.builtin.uri:
+    url: "{{ bmc_redfish_scheme }}://{{ ansible_host }}{{ bmc_raw_system_uri }}"
+    method: GET
+    url_username: "{{ bmc_username }}"
+    url_password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_redfish_validate_certs }}"
+    ca_path: "{{ bmc_redfish_ca_path | default(omit) if bmc_redfish_ca_path | length > 0 else omit }}"
+    timeout: "{{ bmc_redfish_timeout }}"
+    headers:
+      Accept: "application/json"
+    return_content: true
+  when: bmc_raw_system_uri | length > 0
+  register: bmc_raw_system
+  failed_when: false
+  changed_when: false
+  no_log: true
+  tags:
+    - audit
+    - bmc
+    - readonly
+
+# Needs verification against live Lenovo XCC: adapter/slot correlation for ConnectX-6
+# may be richer under EthernetInterfaces than community.general.GetNicInventory.
+- name: Discover raw Redfish host Ethernet interface collection.
+  ansible.builtin.uri:
+    url: "{{ bmc_redfish_scheme }}://{{ ansible_host }}{{ bmc_raw_system_uri }}/EthernetInterfaces"
+    method: GET
+    url_username: "{{ bmc_username }}"
+    url_password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_redfish_validate_certs }}"
+    ca_path: "{{ bmc_redfish_ca_path | default(omit) if bmc_redfish_ca_path | length > 0 else omit }}"
+    timeout: "{{ bmc_redfish_timeout }}"
+    headers:
+      Accept: "application/json"
+    return_content: true
+  when: bmc_raw_system_uri | length > 0
+  register: bmc_raw_host_ethernet_collection
+  failed_when: false
+  changed_when: false
+  no_log: true
+  tags:
+    - audit
+    - bmc
+    - readonly
+
+- name: Gather raw Redfish host Ethernet interface members.
+  ansible.builtin.uri:
+    url: "{{ bmc_redfish_scheme }}://{{ ansible_host }}{{ item['@odata.id'] }}"
+    method: GET
+    url_username: "{{ bmc_username }}"
+    url_password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_redfish_validate_certs }}"
+    ca_path: "{{ bmc_redfish_ca_path | default(omit) if bmc_redfish_ca_path | length > 0 else omit }}"
+    timeout: "{{ bmc_redfish_timeout }}"
+    headers:
+      Accept: "application/json"
+    return_content: true
+  loop: "{{ bmc_raw_host_ethernet_collection.json.Members | default([]) }}"
+  loop_control:
+    label: "{{ item['@odata.id'] | default('unknown') }}"
+  register: bmc_raw_host_ethernet
+  failed_when: false
+  changed_when: false
+  no_log: true
+  tags:
+    - audit
+    - bmc
+    - readonly
+
+# Needs verification against live Lenovo XCC: storage collection shape is standard
+# Redfish, but Lenovo may nest physical-drive state in OEM fields.
+- name: Discover raw Redfish storage collection.
+  ansible.builtin.uri:
+    url: "{{ bmc_redfish_scheme }}://{{ ansible_host }}{{ bmc_raw_system_uri }}/Storage"
+    method: GET
+    url_username: "{{ bmc_username }}"
+    url_password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_redfish_validate_certs }}"
+    ca_path: "{{ bmc_redfish_ca_path | default(omit) if bmc_redfish_ca_path | length > 0 else omit }}"
+    timeout: "{{ bmc_redfish_timeout }}"
+    headers:
+      Accept: "application/json"
+    return_content: true
+  when: bmc_raw_system_uri | length > 0
+  register: bmc_raw_storage_collection
+  failed_when: false
+  changed_when: false
+  no_log: true
+  tags:
+    - audit
+    - bmc
+    - readonly
+
+- name: Gather raw Redfish storage controller members.
+  ansible.builtin.uri:
+    url: "{{ bmc_redfish_scheme }}://{{ ansible_host }}{{ item['@odata.id'] }}"
+    method: GET
+    url_username: "{{ bmc_username }}"
+    url_password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_redfish_validate_certs }}"
+    ca_path: "{{ bmc_redfish_ca_path | default(omit) if bmc_redfish_ca_path | length > 0 else omit }}"
+    timeout: "{{ bmc_redfish_timeout }}"
+    headers:
+      Accept: "application/json"
+    return_content: true
+  loop: "{{ bmc_raw_storage_collection.json.Members | default([]) }}"
+  loop_control:
+    label: "{{ item['@odata.id'] | default('unknown') }}"
+  register: bmc_raw_storage
+  failed_when: false
+  changed_when: false
+  no_log: true
+  tags:
+    - audit
+    - bmc
+    - readonly
+
+- name: Discover raw Redfish manager collection.
+  ansible.builtin.uri:
+    url: "{{ bmc_redfish_scheme }}://{{ ansible_host }}{{ bmc_inventory_managers_path }}"
+    method: GET
+    url_username: "{{ bmc_username }}"
+    url_password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_redfish_validate_certs }}"
+    ca_path: "{{ bmc_redfish_ca_path | default(omit) if bmc_redfish_ca_path | length > 0 else omit }}"
+    timeout: "{{ bmc_redfish_timeout }}"
+    headers:
+      Accept: "application/json"
+    return_content: true
+  register: bmc_raw_managers
+  failed_when: false
+  changed_when: false
+  no_log: true
+  tags:
+    - audit
+    - bmc
+    - readonly
+
+- name: Select first raw Redfish manager member URI.
+  ansible.builtin.set_fact:
+    bmc_raw_manager_uri: "{{ (bmc_raw_managers.json.Members | default([]) | first)['@odata.id'] | default('') }}"
+  changed_when: false
+  tags:
+    - audit
+    - bmc
+    - readonly
+
+# Needs verification against live Lenovo XCC: Manager EthernetInterfaces is the
+# expected place for the BMC's own MAC/IP, but field names can vary by firmware.
+- name: Discover raw Redfish manager Ethernet interface collection.
+  ansible.builtin.uri:
+    url: "{{ bmc_redfish_scheme }}://{{ ansible_host }}{{ bmc_raw_manager_uri }}/EthernetInterfaces"
+    method: GET
+    url_username: "{{ bmc_username }}"
+    url_password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_redfish_validate_certs }}"
+    ca_path: "{{ bmc_redfish_ca_path | default(omit) if bmc_redfish_ca_path | length > 0 else omit }}"
+    timeout: "{{ bmc_redfish_timeout }}"
+    headers:
+      Accept: "application/json"
+    return_content: true
+  when: bmc_raw_manager_uri | length > 0
+  register: bmc_raw_manager_ethernet_collection
+  failed_when: false
+  changed_when: false
+  no_log: true
+  tags:
+    - audit
+    - bmc
+    - readonly
+
+- name: Gather raw Redfish manager Ethernet interface members.
+  ansible.builtin.uri:
+    url: "{{ bmc_redfish_scheme }}://{{ ansible_host }}{{ item['@odata.id'] }}"
+    method: GET
+    url_username: "{{ bmc_username }}"
+    url_password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_redfish_validate_certs }}"
+    ca_path: "{{ bmc_redfish_ca_path | default(omit) if bmc_redfish_ca_path | length > 0 else omit }}"
+    timeout: "{{ bmc_redfish_timeout }}"
+    headers:
+      Accept: "application/json"
+    return_content: true
+  loop: "{{ bmc_raw_manager_ethernet_collection.json.Members | default([]) }}"
+  loop_control:
+    label: "{{ item['@odata.id'] | default('unknown') }}"
+  register: bmc_raw_manager_ethernet
+  failed_when: false
+  changed_when: false
+  no_log: true
+  tags:
+    - audit
+    - bmc
+    - readonly

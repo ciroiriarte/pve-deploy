@@ -1,0 +1,41 @@
+{
+  "kind": "assessment",
+  "slug": "bmc-config-audit-{{ parent_host | default(inventory_hostname) }}",
+  "title": "BMC Configuration Audit for {{ parent_host | default(inventory_hostname) }}",
+  "element": "bmc",
+  "environment": "{{ environment_name }}",
+  "operator": "{{ ansible_user_id | default('ansible') }}",
+  "tool": "pve-deploy 01-hardware.yml",
+  "outcome": "{{ bmc_config_outcome }}",
+  "summary": {{ ("BMC configuration audit on " ~ (parent_host | default(inventory_hostname)) ~ ": " ~ (bmc_config_drift_count | int) ~ " drifted, " ~ (bmc_config_absent_count | int) ~ " absent, " ~ (bmc_config_match_count | int) ~ " matching.") | to_json }},
+  "targets": [
+    {
+      "host": "{{ parent_host | default(inventory_hostname) }}",
+      "address": "{{ ansible_host }}",
+      "role": "bmc"
+    }
+  ],
+  "verification": [
+{% for item in bmc_config_drift_items %}
+    {
+      "name": {{ ("BMC setting " ~ item.key) | to_json }},
+      "command": "Redfish GET /redfish/v1/Managers/1/NetworkProtocol, /EthernetInterfaces, /redfish/v1/AccountService",
+      "expected": {{ item.desired | string | to_json }},
+      "actual": {{ item.current | string | to_json }},
+      "result": "{% if item.status == 'match' %}pass{% elif item.status == 'absent' %}warn{% elif item.severity == 'critical' %}fail{% else %}warn{% endif %}"
+    }{% if not loop.last %},{% endif %}
+
+{% endfor %}
+  ],
+  "artifacts": [
+    {
+      "path": "{{ evidence_dir }}/{{ parent_host | default(inventory_hostname) }}-bmcconfig-{{ stamp }}.json",
+      "description": "BMC service configuration evidence JSON"
+    }
+  ],
+  "notes": [
+    "Read-only audit. This role never creates, deletes or re-passwords BMC accounts; account state is reported only.",
+    "Remote syslog, SMTP and SNMP trap destinations are Lenovo OEM rather than standard Redfish and are deliberately not collected here.",
+    "An 'absent' result means the BMC does not expose that property, which is not the same as compliance."
+  ]
+}

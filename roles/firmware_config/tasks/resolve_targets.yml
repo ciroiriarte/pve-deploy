@@ -1,0 +1,129 @@
+---
+# Resolves the target version for every component, from either the pinned
+# baseline or the catalog's newest entry.
+#
+# ON VERSION ORDERING
+#
+# Lenovo version strings do not share a format: "68P-6.20", "42G-5.81",
+# "26.46.3048", "52.32.0-5990", "E3MQ005", "14.52". There is no comparison
+# function that orders all of those correctly, and the failure is silent and
+# wrong in the dangerous direction -- lexically "68P-6.9" sorts above
+# "68P-6.20", so a naive "is newer" test would happily downgrade a BMC.
+#
+# So this role never infers which of two versions is newer. Ordering comes from
+# exactly one place: the catalog lists each component's versions newest-first,
+# and `latest` takes the first entry. The diff itself only ever asks "does
+# current differ from target", which is a string equality test and always safe.
+
+- name: Initialize target resolution state
+  ansible.builtin.set_fact:
+    firmware_catalog: {}
+    firmware_targets: {}
+  changed_when: false
+
+- name: Look for a firmware catalog on the control node
+  ansible.builtin.stat:
+    path: "{{ firmware_catalog_file }}"
+  delegate_to: localhost
+  register: firmware_catalog_stat
+  changed_when: false
+
+- name: Load the firmware catalog when present
+  ansible.builtin.set_fact:
+    firmware_catalog: >-
+      {{ (lookup('file', firmware_catalog_file) | from_json) }}
+  delegate_to: localhost
+  when: firmware_catalog_stat.stat.exists
+  changed_when: false
+
+# `latest` has no meaning without a catalog to be latest *in*. Failing here is
+# better than silently falling back to the baseline, which would converge the
+# fleet somewhere the operator did not ask for.
+- name: Require a catalog when the target mode is latest
+  ansible.builtin.fail:
+    msg: >-
+      firmware_target_mode=latest needs a catalog listing available versions,
+      but {{ firmware_catalog_file }} does not exist. Either refresh the catalog
+      or pin firmware_target_mode=baseline with an explicit firmware_baseline.
+  when:
+    - firmware_target_mode == 'latest'
+    - not firmware_catalog_stat.stat.exists
+
+- name: Require a populated baseline when the target mode is baseline
+  ansible.builtin.fail:
+    msg: >-
+      firmware_target_mode=baseline but firmware_baseline is empty, so no
+      component has a target version and the run would report every component
+      as having nothing to do. Populate firmware_baseline for this machine type
+      (see environments/{{ pve_site_name }}/firmware-baseline.yml) or switch to
+      firmware_target_mode=latest.
+  when:
+    - firmware_target_mode == 'baseline'
+    - firmware_baseline | length == 0
+
+- name: Reject an unknown target mode rather than defaulting to one
+  ansible.builtin.fail:
+    msg: >-
+      firmware_target_mode={{ firmware_target_mode }} is not recognised.
+      Valid values are 'baseline' (converge to firmware_baseline) or 'latest'
+      (converge to the newest catalog entry).
+  when: firmware_target_mode not in ['baseline', 'latest']
+
+# Catalog entries are matched by component id. The catalog's machine_type is
+# checked against the host so a catalog assembled for a different model cannot
+# be applied here by accident. On the reference site that is not hypothetical: the four PVE
+# nodes are SR655 V3 (SKU 7D9ECTO1WW) while the backup node is SR665 V3 (SKU
+# 7D9ACTO1WW) -- one digit apart in the name, different hardware, and exactly
+# the mix-up that ends with a chassis on a bench.
+- name: Refuse a catalog assembled for a different machine type
+  vars:
+    catalog_mt: "{{ firmware_catalog.machine_type | default('') }}"
+    host_mt: "{{ firmware_machine_type | default('') }}"
+  ansible.builtin.fail:
+    msg: >-
+      Catalog {{ firmware_catalog_file }} declares machine_type
+      '{{ catalog_mt }}' but {{ parent_host | default(inventory_hostname) }}
+      reports '{{ host_mt }}'. Refusing to resolve firmware targets from a
+      catalog built for different hardware.
+  when:
+    - firmware_catalog | length > 0
+    - firmware_catalog.machine_type is defined
+    - firmware_machine_type is defined
+    - firmware_machine_type | length > 0
+    - firmware_catalog.machine_type != firmware_machine_type
+
+- name: Resolve the target version for each component
+  ansible.builtin.set_fact:
+    firmware_targets: >-
+      {%- set targets = {} -%}
+      {%- set components = firmware_catalog.components | default({}) -%}
+      {%- for item in firmware_inventory_items -%}
+      {%-   set entry = {} -%}
+      {%-   if firmware_target_mode == 'baseline' -%}
+      {%-     if firmware_baseline[item.id] is defined -%}
+      {%-       set versions = components[item.id] | default([]) -%}
+      {%-       set payload = [] -%}
+      {%-       for v in versions -%}
+      {%-         if v.version == firmware_baseline[item.id] and v.file is defined -%}
+      {%-           set _ = payload.append(v.file) -%}
+      {%-         endif -%}
+      {%-       endfor -%}
+      {%-       set entry = {'version': firmware_baseline[item.id],
+                             'file': (payload | first) if payload | length > 0 else '',
+                             'source': 'baseline'} -%}
+      {%-     endif -%}
+      {%-   else -%}
+      {%-     set versions = components[item.id] | default([]) -%}
+      {%-     if versions | length > 0 -%}
+      {%-       set newest = versions | first -%}
+      {%-       set entry = {'version': newest.version | default(''),
+                             'file': newest.file | default(''),
+                             'source': 'catalog (newest of ' ~ (versions | length) ~ ')'} -%}
+      {%-     endif -%}
+      {%-   endif -%}
+      {%-   if entry -%}
+      {%-     set _ = targets.update({item.id: entry}) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ targets }}
+  changed_when: false

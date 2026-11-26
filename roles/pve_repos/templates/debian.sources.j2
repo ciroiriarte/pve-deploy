@@ -1,0 +1,21 @@
+# Managed by Ansible role pve_repos - Debian base repositories
+#
+# Plain http, not https, per the Proxmox Package Repositories reference. APT
+# verifies every package against the Debian archive keyring below, so the
+# transport adds no integrity guarantee -- and http is what keeps a caching
+# proxy (apt-cacher-ng and friends) able to serve these repositories, which is
+# the standing remedy for the Fastly CDN churn that deb.debian.org exhibits
+# against an FQDN-matching firewall policy.
+Types: deb
+URIs: http://deb.debian.org/debian/
+Suites: {{ pve_apt_suite }} {{ pve_apt_suite }}-updates
+Components: {{ pve_debian_components }}
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+Enabled: yes
+
+Types: deb
+URIs: http://security.debian.org/debian-security/
+Suites: {{ pve_apt_suite }}-security
+Components: {{ pve_debian_components }}
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+Enabled: yes

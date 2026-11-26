@@ -1,0 +1,44 @@
+---
+- name: Execute BMC Configuration Audit Block
+  tags:
+    - audit
+    - bmc
+    - readonly
+    - bmc_config
+  block:
+    - name: Gather current BMC service configuration
+      ansible.builtin.include_tasks: gather_evidence.yml
+
+    - name: Compare BMC configuration against baseline
+      ansible.builtin.include_tasks: audit_bmc.yml
+
+    - name: Generate BMC configuration evidence and assessment reports
+      ansible.builtin.include_tasks: generate_reports.yml
+
+  rescue:
+    - name: Record BMC configuration audit failure state
+      ansible.builtin.set_fact:
+        bmc_config_outcome: "failed"
+        bmc_config_failure_reason: >-
+          {{ ansible_failed_result.msg | default('BMC Redfish request failed') }}
+      changed_when: false
+
+    - name: Generate failure evidence and report
+      ansible.builtin.include_tasks: generate_reports.yml
+
+# Outside the block above, which carries the `readonly` tag, so that
+# `--tags readonly` cannot select a mutating task. Same reasoning as
+# bios_config and raid_config.
+#
+# `| bool` is not redundant: bmc_config_audit_only arrives from
+# 01-hardware.yml as a rendered template and can also be set as a quoted
+# string, and every non-empty string is truthy in Jinja — including "False".
+# Without the filter an operator who asked for a convergence gets a silently
+# skipped apply and a green run.
+- name: Apply BMC configuration changes
+  ansible.builtin.include_tasks: apply_bmc.yml
+  when: not (bmc_config_audit_only | bool)
+  tags:
+    - bmc
+    - bmc_config
+    - apply

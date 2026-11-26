@@ -1,0 +1,84 @@
+---
+# Detaches whatever the RemoteMap service currently holds.
+#
+# UMount removes the registration as well as the mount, so the DELETE sweep that
+# follows normally finds nothing and returns 404. That 404 is the expected
+# outcome, not a failure -- it means UMount did its job.
+
+- name: Set the RemoteMap endpoints
+  ansible.builtin.set_fact:
+    xcc_remotemap: "https://{{ ansible_host }}/redfish/v1/Managers/1/Oem/Lenovo/RemoteMap"
+  changed_when: false
+
+- name: Unmount the image
+  ansible.builtin.uri:
+    url: "{{ xcc_remotemap }}/Actions/LenovoRemoteMapService.UMount"
+    method: POST
+    body_format: json
+    body: {}
+    user: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_validate_certs }}"
+    timeout: "{{ bmc_timeout }}"
+    status_code: [200, 202, 204]
+  no_log: true
+  changed_when: true
+  # Cleanup runs from an `always` block, so it can be reached after the failure
+  # it is cleaning up after. It must not replace that failure with its own.
+  failed_when: false
+
+- name: Read what remains registered
+  ansible.builtin.uri:
+    url: "{{ xcc_remotemap }}/MountImages"
+    method: GET
+    user: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_validate_certs }}"
+    timeout: "{{ bmc_timeout }}"
+  register: xcc_remaining
+  no_log: true
+  failed_when: false
+  changed_when: false
+
+- name: Remove any registration UMount left behind
+  ansible.builtin.uri:
+    url: "https://{{ ansible_host }}{{ item['@odata.id'] }}"
+    method: DELETE
+    user: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_validate_certs }}"
+    timeout: "{{ bmc_timeout }}"
+    status_code: [200, 202, 204, 404]
+  loop: "{{ (xcc_remaining.json | default({})).Members | default([]) }}"
+  loop_control:
+    label: "{{ item['@odata.id'] }}"
+  no_log: true
+  failed_when: false
+  changed_when: true
+
+- name: Confirm nothing is still attached
+  ansible.builtin.uri:
+    url: "https://{{ ansible_host }}/redfish/v1/Managers/1/VirtualMedia?$expand=."
+    method: GET
+    user: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_validate_certs }}"
+    timeout: "{{ bmc_timeout }}"
+  register: xcc_vmedia_after
+  no_log: true
+  failed_when: false
+  changed_when: false
+
+- name: Report the detach result
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }}: registrations remaining
+      {{ (xcc_remaining.json | default({}))['Members@odata.count'] | default('unknown') }},
+      slots still inserted
+      {{ ((xcc_vmedia_after.json | default({})).Members | default([]))
+         | selectattr('Inserted', 'defined') | selectattr('Inserted') | list | length }}
+  changed_when: false

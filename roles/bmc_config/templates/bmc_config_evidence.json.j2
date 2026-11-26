@@ -1,0 +1,21 @@
+{
+  "host": "{{ parent_host | default(inventory_hostname) }}",
+  "bmc_address": "{{ ansible_host }}",
+  "timestamp": "{{ stamp }}",
+  "evidence_source": "{{ bmc_config_evidence_source }}",
+  "audit_summary": {
+    "outcome": "{{ bmc_config_outcome }}",
+    "matches": {{ bmc_config_match_count | int }},
+    "drift": {{ bmc_config_drift_count | int }},
+    "absent": {{ bmc_config_absent_count | int }},
+    "unsupported": {{ bmc_config_unsupported_count | int }}
+{% if bmc_config_failure_reason is defined %},
+    "failure_reason": {{ bmc_config_failure_reason | to_json }}
+{% endif %}
+  },
+  "drift_items": {{ bmc_config_drift_items | to_json }},
+  "network_protocol": {{ bmc_network_protocol | to_json }},
+  "ethernet_interfaces": {{ bmc_ethernet_interfaces | to_json }},
+  "account_service": {{ bmc_account_service | to_json }},
+  "accounts": {{ bmc_accounts | to_json }}
+}

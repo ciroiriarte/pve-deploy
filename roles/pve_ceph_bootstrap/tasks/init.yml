@@ -1,0 +1,33 @@
+---
+# B2 - initialize Ceph, pinning the public and cluster networks, then wait for
+# the generated /etc/pve/ceph.conf to replicate to every node.
+- name: Check whether Ceph is already initialized.
+  ansible.builtin.stat:
+    path: /etc/pve/ceph.conf
+  delegate_to: "{{ pve_ceph_first_node }}"
+  register: pve_ceph_bootstrap_conf_stat
+
+- name: Initialize Ceph with the public and cluster networks.
+  ansible.builtin.command:
+    cmd: >-
+      pveceph init --network {{ pve_ceph_public_network }}
+      --cluster-network {{ pve_ceph_cluster_network }}
+  delegate_to: "{{ pve_ceph_first_node }}"
+  when: not pve_ceph_bootstrap_conf_stat.stat.exists
+  register: pve_ceph_bootstrap_init
+  changed_when: pve_ceph_bootstrap_init.rc == 0
+
+# GOTCHA: /etc/pve is the replicated pmxcfs filesystem; ceph.conf is written on
+# the founding node and propagates to the rest. Creating a mon on a node before
+# ceph.conf has landed there races the replication. Wait for it everywhere first.
+- name: Wait for ceph.conf to propagate to every node.
+  ansible.builtin.stat:
+    path: /etc/pve/ceph.conf
+  loop: "{{ pve_ceph_nodes }}"
+  loop_control:
+    label: "{{ item }}"
+  delegate_to: "{{ item }}"
+  register: pve_ceph_bootstrap_conf_propagated
+  until: pve_ceph_bootstrap_conf_propagated.stat.exists
+  retries: "{{ pve_ceph_conffile_retries }}"
+  delay: "{{ pve_ceph_conffile_delay }}"

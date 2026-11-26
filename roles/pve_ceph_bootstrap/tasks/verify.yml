@@ -1,0 +1,53 @@
+---
+# Emit verification facts from a single `ceph -s -f json`. The JSON field names
+# below (health.status, quorum, mgrmap.*, osdmap.*) should be confirmed against a
+# live cluster; they follow the documented `ceph status` JSON shape.
+- name: Read Ceph status for verification.
+  ansible.builtin.command:
+    cmd: ceph -s -f json
+  delegate_to: "{{ pve_ceph_first_node }}"
+  register: pve_ceph_bootstrap_status
+  changed_when: false
+
+- name: Record bootstrap verification facts.
+  ansible.builtin.set_fact:
+    pve_ceph_bootstrap_verification: >-
+      {{ [
+        {
+          'name': 'Ceph health',
+          'command': 'ceph -s -f json (.health.status)',
+          'expected': 'HEALTH_OK',
+          'actual': (_st.health.status | default('unknown')),
+          'result': ('pass' if (_st.health.status | default('')) == 'HEALTH_OK' else 'fail')
+        },
+        {
+          'name': 'Monitor quorum size',
+          'command': 'ceph -s -f json (.quorum | length)',
+          'expected': (pve_ceph_mon_nodes | length) | string,
+          'actual': (_st.quorum | default([]) | length) | string,
+          'result': ('pass' if (_st.quorum | default([]) | length) == (pve_ceph_mon_nodes | length) else 'fail')
+        },
+        {
+          'name': 'Managers present (active + standbys)',
+          'command': 'ceph -s -f json (.mgrmap.available + .mgrmap.num_standbys)',
+          'expected': '>= 1 active',
+          'actual': ((1 if (_st.mgrmap.available | default(false)) else 0) + (_st.mgrmap.num_standbys | default(0) | int)) | string,
+          'result': ('pass'
+            if ((1 if (_st.mgrmap.available | default(false)) else 0) + (_st.mgrmap.num_standbys | default(0) | int)) >= 1
+            else 'fail')
+        },
+        {
+          'name': 'OSDs up and in',
+          'command': 'ceph -s -f json (.osdmap num_up_osds / num_in_osds / num_osds)',
+          'expected': 'all OSDs up and in',
+          'actual': (_up | string) ~ ' up / ' ~ (_in | string) ~ ' in of ' ~ (_num | string),
+          'result': ('pass' if (_num > 0 and _up == _num and _in == _num) else 'fail')
+        }
+      ] }}
+  vars:
+    _st: "{{ pve_ceph_bootstrap_status.stdout | default('{}', true) | from_json }}"
+    _up: "{{ _st.osdmap.num_up_osds | default(0) | int }}"
+    _in: "{{ _st.osdmap.num_in_osds | default(0) | int }}"
+    _num: "{{ _st.osdmap.num_osds | default(0) | int }}"
+  delegate_to: "{{ pve_ceph_first_node }}"
+  changed_when: false

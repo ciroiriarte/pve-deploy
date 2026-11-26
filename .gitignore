@@ -1,0 +1,67 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environments
+.venv
+venv/
+ENV/
+env/
+
+# Ansible execution cache & retry files
+.ansible_cache/
+*.retry
+*.retry-file
+
+# Security, credentials, and API tokens (NEVER COMMIT)
+*.key
+*.pem
+*.crt
+*token*
+credentials/
+vault_pass*
+.env
+
+# Generated deployment artifacts and change reports
+artifacts/
+evidence/
+change-report-*.md
+
+# Editor and IDE configurations
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# AI Assistant local state
+.omc/
+.omx/
+
+# Ansible Vault payloads. The *.example templates are safe and intentionally tracked.
+vault.yml
+**/vault.yml

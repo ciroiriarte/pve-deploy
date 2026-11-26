@@ -1,0 +1,72 @@
+# Managed by Ansible role pve_network
+# Source of truth: Google Sheet Cabling (OS Device + Aggregation) and Logical Networking Table.
+# Host: {{ inventory_hostname }}
+
+auto lo
+iface lo inet loopback
+
+{% set physical_ports = cabling | default([]) | selectattr('os_device', 'defined') | selectattr('os_device') | list %}
+{% set bond_names = physical_ports | map(attribute='bond') | reject('equalto', '') | unique | sort | list %}
+### Physical NICs -- bond members ###
+{% for port in physical_ports | sort(attribute='os_device') %}
+auto {{ port.os_device }}
+iface {{ port.os_device }} inet manual
+    mtu {{ pve_network_carrier_mtu }}
+
+{% endfor %}
+
+### Bonds -- LACP 802.3ad ###
+{% for bond_name in bond_names %}
+{% set members = physical_ports | selectattr('bond', 'equalto', bond_name) | map(attribute='os_device') | list %}
+auto {{ bond_name }}
+iface {{ bond_name }} inet manual
+    bond-slaves {{ members | join(' ') }}
+{% if bond_name == pve_network_vm_bridge_parent and pve_network_pin_sdn_bond_mac | default(true) and pve_network_sdn_bond_mac | default('') | length == 17 and pve_network_sdn_bond_mac != '00:00:00:00:00:00' %}
+    # Pin the SDN bond MAC to its first slave's permanent HW address so an ifreload
+    # cannot flip it between slaves and break ConnectX-6 RX steering (rx_steer_missed
+    # -> VLAN underlay 100% RX loss). Derived at runtime from
+    # ethtool -P (see pve_network tasks), so a NIC swap re-derives it.
+    hwaddress {{ pve_network_sdn_bond_mac }}
+{% endif %}
+    bond-mode {{ pve_network_bond_mode }}
+    bond-miimon {{ pve_network_bond_miimon }}
+    bond-lacp-rate {{ pve_network_bond_lacp_rate }}
+    bond-xmit-hash-policy {{ pve_network_bond_xmit_hash_policy }}
+    mtu {{ pve_network_carrier_mtu }}
+
+{% endfor %}
+
+{% set vm_bridge = pve_network_vm_bridge %}
+{% set vm_bridge_parent = pve_network_vm_bridge_parent %}
+### VM/SDN bridge ###
+auto {{ vm_bridge }}
+iface {{ vm_bridge }} inet manual
+    bridge-ports {{ vm_bridge_parent }}
+    bridge-stp off
+    bridge-fd 0
+    bridge-vlan-aware yes
+    bridge-vids {{ pve_network_vm_bridge_vids | join(' ') }}
+    mtu {{ pve_network_carrier_mtu }}
+
+### Host VLAN interfaces ###
+{% for net_key, net in networks.items() | sort %}
+{% set parent = vm_bridge if net.bond == vm_bridge_parent else net.bond %}
+{% set catalog = network_catalog.get(net_key, {}) %}
+{% if net.bond != 'BMC' and net.vlan_id is defined and net.vlan_id and net.ip is defined and net.ip %}
+auto {{ parent }}.{{ net.vlan_id }}
+iface {{ parent }}.{{ net.vlan_id }} inet static
+    address {{ net.ip }}/{{ net.cidr.split('/')[1] }}
+{% if catalog.gateway is defined and catalog.gateway %}
+    gateway {{ catalog.gateway }}
+{% endif %}
+    mtu {{ catalog.mtu | default(pve_network_default_vlan_mtu) }}
+
+{% endif %}
+{% endfor %}
+
+### SDN-managed interfaces (EVPN/VXLAN overlay generated under /etc/pve/sdn) ###
+# Required for PVE SDN: without this line the SDN-generated bridge/vxlan/VRF
+# stanzas in /etc/network/interfaces.d/ are never parsed, so `pvesh set /cluster/sdn`
+# brings up FRR/BGP but not the dataplane. Placed last so the underlay (vmbr1.<underlay>)
+# is defined before the overlay that sources its VTEP IP from it.
+source /etc/network/interfaces.d/*

@@ -1,0 +1,41 @@
+{
+  "kind": "assessment",
+  "slug": "firmware-audit-{{ parent_host | default(inventory_hostname) }}",
+  "title": "Firmware Baseline Audit for {{ parent_host | default(inventory_hostname) }}",
+  "element": "bmc",
+  "environment": "{{ environment_name }}",
+  "operator": "{{ ansible_user_id | default('ansible') }}",
+  "tool": "pve-deploy 00-firmware.yml",
+  "outcome": "{{ firmware_config_outcome }}",
+  "summary": {{ ("Firmware audit on " ~ (parent_host | default(inventory_hostname)) ~ " (mode=" ~ firmware_target_mode ~ "): " ~ (firmware_update_count | int) ~ " need updating, " ~ (firmware_up_to_date_count | int) ~ " at target, " ~ (firmware_unknown_count | int) ~ " not actionable.") | to_json }},
+  "targets": [
+    {
+      "host": "{{ parent_host | default(inventory_hostname) }}",
+      "address": "{{ ansible_host }}",
+      "role": "bmc"
+    }
+  ],
+  "verification": [
+{% for p in firmware_plan %}
+    {
+      "name": {{ (p.class ~ ": " ~ p.id) | to_json }},
+      "command": "Redfish GET /redfish/v1/UpdateService/FirmwareInventory",
+      "expected": {{ (p.target_version if p.target_version else "(no target defined)") | to_json }},
+      "actual": {{ p.current_version | to_json }},
+      "result": "{% if p.state == 'up_to_date' %}pass{% elif p.state == 'update_required' %}warn{% elif p.state == 'no_target' %}warn{% else %}warn{% endif %}"
+    }{% if not loop.last %},{% endif %}
+
+{% endfor %}
+  ],
+  "artifacts": [
+    {
+      "path": "{{ evidence_dir }}/{{ parent_host | default(inventory_hostname) }}-firmware-{{ stamp }}.json",
+      "description": "Firmware inventory and update plan"
+    }
+  ],
+  "notes": [
+    "Read-only audit. Versions are compared for equality only; this role never infers which of two Lenovo version strings is newer.",
+    "Ordering for target_mode=latest comes from the catalog, which lists each component newest-first.",
+    "Update order is BMC, UEFI, bootstrap, adapter, drive, PSU: the BMC performs every other update and so is flashed first."
+  ]
+}

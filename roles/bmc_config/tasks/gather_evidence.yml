@@ -1,0 +1,198 @@
+---
+# Reads BMC service configuration straight from Redfish.
+#
+# Unlike bios_config and raid_config there is no bmc_inventory companion file to
+# read first: bmc_inventory captures hardware, not the BMC's own service
+# configuration. Every fact here comes from a live query.
+#
+# All four resources below are standard DMTF Redfish, not Lenovo OEM, so this
+# gather is the part most likely to work unchanged against iDRAC and iLO. The
+# OEM-only surfaces — remote syslog, SMTP alert destinations, Lenovo-specific
+# security policy — are deliberately NOT collected here; they belong behind the
+# vendor driver seam rather than being hardcoded into a shared role.
+
+- name: Initialize BMC configuration evidence variables
+  ansible.builtin.set_fact:
+    bmc_network_protocol: {}
+    bmc_ethernet_interfaces: []
+    bmc_accounts: []
+    bmc_account_service: {}
+    bmc_config_evidence_source: "none"
+  changed_when: false
+
+- name: Fetch BMC network protocol configuration
+  ansible.builtin.uri:
+    url: "https://{{ ansible_host }}/redfish/v1/Managers/1/NetworkProtocol"
+    method: GET
+    user: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_validate_certs }}"
+    timeout: "{{ bmc_timeout }}"
+    status_code: [200, 404]
+  register: bmc_np_response
+  # no_log hides the credentials in the module args, but it also hides the
+  # failure message. Tolerate the failure here and surface a sanitized message
+  # in the next task instead.
+  no_log: true
+  failed_when: false
+  changed_when: false
+
+- name: Surface a sanitized Redfish error when the protocol query failed
+  ansible.builtin.fail:
+    msg: >-
+      Redfish NetworkProtocol query failed on
+      {{ parent_host | default(inventory_hostname) }}:
+      {{ bmc_np_response.msg | default('no message returned') }}
+  when:
+    - bmc_np_response.status is not defined or bmc_np_response.status not in [200, 404]
+
+- name: Record BMC network protocol configuration
+  ansible.builtin.set_fact:
+    bmc_network_protocol: "{{ bmc_np_response.json | default({}) }}"
+    bmc_config_evidence_source: "redfish_direct"
+  when: bmc_np_response.status | default(0) == 200
+  changed_when: false
+
+- name: Fetch BMC ethernet interface collection
+  ansible.builtin.uri:
+    url: "https://{{ ansible_host }}/redfish/v1/Managers/1/EthernetInterfaces"
+    method: GET
+    user: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_validate_certs }}"
+    timeout: "{{ bmc_timeout }}"
+    status_code: [200, 404]
+  register: bmc_eth_collection
+  no_log: true
+  failed_when: false
+  changed_when: false
+
+# Expanded one member at a time rather than with $expand. Lenovo XCC support for
+# $expand varies by firmware, and a query parameter the BMC silently ignores
+# returns a collection of bare @odata.id links with every field absent — which
+# reads downstream as "DNS is unconfigured" rather than "not collected".
+- name: Fetch each BMC ethernet interface member
+  ansible.builtin.uri:
+    url: "https://{{ ansible_host }}{{ item['@odata.id'] }}"
+    method: GET
+    user: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_validate_certs }}"
+    timeout: "{{ bmc_timeout }}"
+    status_code: [200, 404]
+  register: bmc_eth_members
+  no_log: true
+  failed_when: false
+  changed_when: false
+  loop: "{{ (bmc_eth_collection.json | default({})).Members | default([]) }}"
+  loop_control:
+    label: "{{ item['@odata.id'] | default('unknown') }}"
+
+- name: Record BMC ethernet interfaces
+  ansible.builtin.set_fact:
+    bmc_ethernet_interfaces: >-
+      {{ bmc_eth_members.results | default([])
+         | selectattr('status', 'defined')
+         | selectattr('status', 'equalto', 200)
+         | map(attribute='json') | list }}
+  changed_when: false
+
+- name: Fetch BMC account service policy
+  ansible.builtin.uri:
+    url: "https://{{ ansible_host }}/redfish/v1/AccountService"
+    method: GET
+    user: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_validate_certs }}"
+    timeout: "{{ bmc_timeout }}"
+    status_code: [200, 404]
+  register: bmc_acctsvc_response
+  no_log: true
+  failed_when: false
+  changed_when: false
+
+- name: Record BMC account service policy
+  ansible.builtin.set_fact:
+    bmc_account_service: "{{ bmc_acctsvc_response.json | default({}) }}"
+  when: bmc_acctsvc_response.status | default(0) == 200
+  changed_when: false
+
+- name: Fetch BMC account collection
+  ansible.builtin.uri:
+    url: "https://{{ ansible_host }}/redfish/v1/AccountService/Accounts"
+    method: GET
+    user: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_validate_certs }}"
+    timeout: "{{ bmc_timeout }}"
+    status_code: [200, 404]
+  register: bmc_account_collection
+  no_log: true
+  failed_when: false
+  changed_when: false
+
+- name: Fetch each BMC account member
+  ansible.builtin.uri:
+    url: "https://{{ ansible_host }}{{ item['@odata.id'] }}"
+    method: GET
+    user: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_validate_certs }}"
+    timeout: "{{ bmc_timeout }}"
+    status_code: [200, 404]
+  register: bmc_account_members
+  no_log: true
+  failed_when: false
+  changed_when: false
+  loop: "{{ (bmc_account_collection.json | default({})).Members | default([]) }}"
+  loop_control:
+    label: "{{ item['@odata.id'] | default('unknown') }}"
+
+# Only identity and state are retained. Password hashes are not returned by
+# Redfish, but role and enablement are enough to audit posture without writing
+# account details into an evidence file that lands in a git repository.
+#
+# Built with plain Jinja rather than a filter chain: keep_keys lives in
+# ansible.utils, which is not in requirements.yml, and json_query needs jmespath
+# which requirements.yml explicitly refuses to add. Both would fail at
+# template-render time, late in a long play.
+- name: Record BMC accounts
+  ansible.builtin.set_fact:
+    bmc_accounts: >-
+      {%- set out = [] -%}
+      {%- for result in bmc_account_members.results | default([]) -%}
+      {%-   if result.status | default(0) == 200 and result.json is defined -%}
+      {%-     set _ = out.append({
+                'Id': result.json.Id | default(''),
+                'UserName': result.json.UserName | default(''),
+                'RoleId': result.json.RoleId | default(''),
+                'Enabled': result.json.Enabled | default(false),
+                'Locked': result.json.Locked | default(false)
+              }) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ out }}
+  changed_when: false
+
+# An empty collection is a collection failure, not a compliance result. The
+# BIOS audit reported a vacuous pass on exactly this shape — a host that
+# returned nothing was recorded as successfully audited.
+- name: Fail when the BMC returned no service configuration at all
+  ansible.builtin.fail:
+    msg: >-
+      No BMC service configuration was collected from
+      {{ parent_host | default(inventory_hostname) }}. NetworkProtocol,
+      EthernetInterfaces and AccountService all returned nothing. This is a
+      collection failure, not evidence that the BMC is unconfigured — check
+      Redfish reachability and credentials before interpreting any result for
+      this host.
+  when:
+    - bmc_network_protocol | length == 0
+    - bmc_ethernet_interfaces | length == 0
+    - bmc_account_service | length == 0

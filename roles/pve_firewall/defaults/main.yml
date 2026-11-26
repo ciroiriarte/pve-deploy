@@ -1,0 +1,272 @@
+---
+# Default is rule convergence only. Datacenter enable is an explicit opt-in because
+# an incomplete ruleset can cut off SSH/API access and break corosync quorum.
+pve_firewall_enable: false
+
+# PVE 9 can use the nftables-based proxmox-firewall, but legacy iptables is the
+# predictable default for mixed/upgrade environments.
+pve_firewall_implementation: "iptables"
+
+# Transient Phase 13 validation mesh allowance. Turn off after validation is accepted.
+pve_firewall_allow_validation: false
+pve_firewall_validation_port: 5201
+pve_firewall_validation_protocols:
+  - tcp
+  - udp
+
+# Control-host pc CLI. pc is expected to have authentication configured outside
+# this role, for example through its normal profile/env mechanism.
+pve_firewall_pc_bin: "pc"
+pve_firewall_pc_no_log: true
+pve_firewall_api_retries: 3
+pve_firewall_api_delay: 2
+
+# Grace period between enabling the datacenter firewall and probing reachability.
+# Probing immediately can observe pre-enforcement state and pass spuriously.
+pve_firewall_settle_seconds: 10
+pve_firewall_probe_timeout: 30
+
+# Repository/report locations.
+# environment_name is report metadata (the deployment tier), not a path.
+environment_name: "production"
+pve_deploy_root: "{{ (playbook_dir ~ '/..') | realpath }}"
+
+# Site data root: where per-deployment records are written. Defaults to this
+# checkout; point it at a site repository to keep records out of the tool repo.
+pve_site_root: "{{ pve_deploy_root }}"
+reports_dir: "{{ pve_site_root }}/reports"
+
+# Logical segment lookup. Values are keys in network_catalog from generated.yml.
+pve_firewall_segments:
+  management:
+    catalog_key: "pve_management"
+    ipset: "pve_management"
+    alias: "PVE_MANAGEMENT"
+  corosync:
+    catalog_key: "pve_corosync"
+    ipset: "pve_corosync"
+    alias: "PVE_COROSYNC"
+  live_migration:
+    catalog_key: "pve_live_migration"
+    ipset: "pve_live_migration"
+    alias: "PVE_LIVE_MIGRATION"
+  underlay:
+    catalog_key: "pve_underlay"
+    ipset: "pve_underlay"
+    alias: "PVE_UNDERLAY"
+  ceph_public:
+    catalog_key: "pve_ceph_access"
+    ipset: "pve_ceph_public"
+    alias: "PVE_CEPH_PUBLIC"
+  ceph_cluster:
+    catalog_key: "pve_ceph_replica"
+    ipset: "pve_ceph_cluster"
+    alias: "PVE_CEPH_CLUSTER"
+  backup:
+    catalog_key: "backup_traffic"
+    ipset: "pve_backup"
+    alias: "PVE_BACKUP"
+
+# Optional explicit infrastructure endpoints. If empty, DNS/NTP/PBS rules are
+# omitted rather than guessed.
+pve_firewall_dns_servers: []
+pve_firewall_ntp_servers: []
+pve_firewall_pbs_addresses: []
+# EVPN is off unless the selected environment layout needs it.
+pve_firewall_sdn_evpn_enabled: false
+
+# Monitoring pollers (e.g. LibreNMS) allowed to SNMP-poll the nodes. Each entry
+# is a source the poller queries from (IP/CIDR or an existing IPSet ref like
+# "+name"). Empty => no SNMP rules are added. snmpd on the node still enforces
+# community + host ACL; this is the firewall layer in front of it.
+pve_firewall_nms_pollers: []
+pve_firewall_snmp_protocols:
+  - udp
+  - tcp
+
+# Global datacenter policy after enable.
+pve_firewall_datacenter_options:
+  enable: 0
+  policy_in: "DROP"
+  policy_out: "ACCEPT"
+  policy_forward: "DROP"
+
+# Node policy is prepared before datacenter enable.
+pve_firewall_node_options:
+  enable: 1
+  policy_in: "DROP"
+  policy_out: "ACCEPT"
+
+# Ports and ranges are variables so environments can override without task edits.
+pve_firewall_ports:
+  ssh: "22"
+  pve_api: "8006"
+  spice_proxy: "3128"
+  novnc: "5900:5999"
+  pbs: "8007"
+  corosync: "5405:5412"
+  live_migration: "60000:60050"
+  ceph_mon: "3300,6789"
+  ceph_services: "6800:7568"
+  vxlan: "4789"
+  bgp: "179"
+  bfd: "3784,3785,4784"
+  ntp: "123"
+  dns: "53"
+  web_repos: "80,443"
+  snmp: "161"
+
+# Datacenter-level rules. The role matches existing rules by comment.
+pve_firewall_cluster_rules_base:
+  - comment: "pve-deploy allow SSH from management segment"
+    type: "in"
+    action: "ACCEPT"
+    proto: "tcp"
+    dport: "{{ pve_firewall_ports.ssh }}"
+    source: "+{{ pve_firewall_segments.management.ipset }}"
+    enable: 1
+  - comment: "pve-deploy allow PVE web UI and API from management segment"
+    type: "in"
+    action: "ACCEPT"
+    proto: "tcp"
+    dport: "{{ pve_firewall_ports.pve_api }}"
+    source: "+{{ pve_firewall_segments.management.ipset }}"
+    enable: 1
+  - comment: "pve-deploy allow SPICE proxy from management segment"
+    type: "in"
+    action: "ACCEPT"
+    proto: "tcp"
+    dport: "{{ pve_firewall_ports.spice_proxy }}"
+    source: "+{{ pve_firewall_segments.management.ipset }}"
+    enable: 1
+  - comment: "pve-deploy allow noVNC console websockets from management segment"
+    type: "in"
+    action: "ACCEPT"
+    proto: "tcp"
+    dport: "{{ pve_firewall_ports.novnc }}"
+    source: "+{{ pve_firewall_segments.management.ipset }}"
+    enable: 1
+  - comment: "pve-deploy allow corosync on corosync segment"
+    type: "in"
+    action: "ACCEPT"
+    proto: "udp"
+    dport: "{{ pve_firewall_ports.corosync }}"
+    source: "+{{ pve_firewall_segments.corosync.ipset }}"
+    enable: 1
+  - comment: "pve-deploy allow live migration on migration segment"
+    type: "in"
+    action: "ACCEPT"
+    proto: "tcp"
+    dport: "{{ pve_firewall_ports.live_migration }}"
+    source: "+{{ pve_firewall_segments.live_migration.ipset }}"
+    enable: 1
+  - comment: "pve-deploy allow Ceph monitors from Ceph public segment"
+    type: "in"
+    action: "ACCEPT"
+    proto: "tcp"
+    dport: "{{ pve_firewall_ports.ceph_mon }}"
+    source: "+{{ pve_firewall_segments.ceph_public.ipset }}"
+    enable: 1
+  - comment: "pve-deploy allow Ceph services from Ceph public segment"
+    type: "in"
+    action: "ACCEPT"
+    proto: "tcp"
+    dport: "{{ pve_firewall_ports.ceph_services }}"
+    source: "+{{ pve_firewall_segments.ceph_public.ipset }}"
+    enable: 1
+  - comment: "pve-deploy allow Ceph services from Ceph cluster segment"
+    type: "in"
+    action: "ACCEPT"
+    proto: "tcp"
+    dport: "{{ pve_firewall_ports.ceph_services }}"
+    source: "+{{ pve_firewall_segments.ceph_cluster.ipset }}"
+    enable: 1
+  # ICMP (ping) between cluster nodes on every internal segment. policy_in is
+  # DROP, so without these, node-to-node ping fails on all segments once the
+  # firewall is enabled -- breaking diagnostics, monitoring, PMTUD, and the
+  # phase-04/13 net validation (which probes with ICMP). Scoped to the trusted
+  # inter-node segment IPSets; no dport => all ICMP types.
+  - comment: "pve-deploy allow ICMP between nodes on management segment"
+    type: "in"
+    action: "ACCEPT"
+    proto: "icmp"
+    source: "+{{ pve_firewall_segments.management.ipset }}"
+    enable: 1
+  - comment: "pve-deploy allow ICMP between nodes on corosync segment"
+    type: "in"
+    action: "ACCEPT"
+    proto: "icmp"
+    source: "+{{ pve_firewall_segments.corosync.ipset }}"
+    enable: 1
+  - comment: "pve-deploy allow ICMP between nodes on migration segment"
+    type: "in"
+    action: "ACCEPT"
+    proto: "icmp"
+    source: "+{{ pve_firewall_segments.live_migration.ipset }}"
+    enable: 1
+  - comment: "pve-deploy allow ICMP between nodes on underlay segment"
+    type: "in"
+    action: "ACCEPT"
+    proto: "icmp"
+    source: "+{{ pve_firewall_segments.underlay.ipset }}"
+    enable: 1
+  - comment: "pve-deploy allow ICMP between nodes on Ceph public segment"
+    type: "in"
+    action: "ACCEPT"
+    proto: "icmp"
+    source: "+{{ pve_firewall_segments.ceph_public.ipset }}"
+    enable: 1
+  - comment: "pve-deploy allow ICMP between nodes on Ceph cluster segment"
+    type: "in"
+    action: "ACCEPT"
+    proto: "icmp"
+    source: "+{{ pve_firewall_segments.ceph_cluster.ipset }}"
+    enable: 1
+
+pve_firewall_cluster_rules_evpn:
+  - comment: "pve-deploy allow EVPN VXLAN from underlay segment"
+    type: "in"
+    action: "ACCEPT"
+    proto: "udp"
+    dport: "{{ pve_firewall_ports.vxlan }}"
+    source: "+{{ pve_firewall_segments.underlay.ipset }}"
+    enable: 1
+  - comment: "pve-deploy allow EVPN BGP from underlay segment"
+    type: "in"
+    action: "ACCEPT"
+    proto: "tcp"
+    dport: "{{ pve_firewall_ports.bgp }}"
+    source: "+{{ pve_firewall_segments.underlay.ipset }}"
+    enable: 1
+  - comment: "pve-deploy allow EVPN BFD from underlay segment"
+    type: "in"
+    action: "ACCEPT"
+    proto: "udp"
+    dport: "{{ pve_firewall_ports.bfd }}"
+    source: "+{{ pve_firewall_segments.underlay.ipset }}"
+    enable: 1
+
+# N/S per-VRF eBGP peers from the external router's transit /29s (not the underlay ipset).
+# Set per-site to the FG tenant-VDOM transit subnets; rules are built in rules_cluster.yml.
+# Empty -> no N/S BGP rules added.
+pve_firewall_ns_transit_bgp_sources: []
+
+pve_firewall_cluster_rules_validation:
+  - comment: "pve-deploy temporary Phase 13 iperf3 validation tcp"
+    type: "in"
+    action: "ACCEPT"
+    proto: "tcp"
+    dport: "{{ pve_firewall_validation_port }}"
+    source: "+{{ pve_firewall_segments.management.ipset }}"
+    enable: 1
+  - comment: "pve-deploy temporary Phase 13 iperf3 validation udp"
+    type: "in"
+    action: "ACCEPT"
+    proto: "udp"
+    dport: "{{ pve_firewall_validation_port }}"
+    source: "+{{ pve_firewall_segments.management.ipset }}"
+    enable: 1
+
+# Per-node rules duplicate the critical management/cluster allowances so node
+# rules are present before datacenter enable and remain meaningful pre-cluster.
+pve_firewall_node_rules_base: "{{ pve_firewall_cluster_rules_base }}"

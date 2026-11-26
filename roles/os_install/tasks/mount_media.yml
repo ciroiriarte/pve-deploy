@@ -1,0 +1,42 @@
+---
+# Attaches the prepared image to the machine as virtual media.
+#
+# Dispatch rather than inline, because this is the one genuinely vendor-specific
+# step in the role. Everything else is DMTF-standard Redfish or the Proxmox
+# installer; only the attach mechanism differs per BMC family, and on Lenovo it
+# differs enough that the standard action is simply absent.
+
+- name: Assert the media backend is one this role implements
+  ansible.builtin.assert:
+    that:
+      - os_install_media_backend in ['lenovo_xcc']
+    fail_msg: >-
+      os_install_media_backend={{ os_install_media_backend }} is not implemented.
+      Available: lenovo_xcc. Adding a vendor means adding
+      roles/os_install/tasks/media/<backend>_mount.yml and its _umount
+      counterpart -- nothing outside tasks/media/ needs to change.
+    quiet: true
+  changed_when: false
+
+- name: Compose the image URL the BMC will fetch
+  ansible.builtin.set_fact:
+    os_install_media_url: "{{ os_install_publish_to }}{{ os_install_output_iso }}"
+  changed_when: false
+
+# Resolvable and routable FROM THE BMC, which is a different network position
+# than the control node. A URL that works from the operator's laptop says
+# nothing about whether the BMC can reach it.
+- name: Assert the image URL is set
+  ansible.builtin.assert:
+    that:
+      - os_install_publish_to | length > 0
+      - os_install_media_url is search('^https?://')
+    fail_msg: >-
+      os_install_publish_to must be the base URL under which
+      {{ os_install_iso_dir }} is served, with a trailing slash, reachable from
+      the BMC at {{ ansible_host }}.
+    quiet: true
+  changed_when: false
+
+- name: Attach the image using the configured backend
+  ansible.builtin.include_tasks: "media/{{ os_install_media_backend }}_mount.yml"

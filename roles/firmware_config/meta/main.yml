@@ -1,0 +1,20 @@
+---
+galaxy_info:
+  role_name: firmware_config
+  author: pve-deploy team
+  description: Audit and converge server firmware to a pinned baseline or the newest catalog version via Redfish
+  company: Proxmox VE Infrastructure
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: EL
+      versions:
+        - all
+    - name: GenericLinux
+      versions:
+        - all
+  galaxy_tags:
+    - system
+    - monitoring
+
+dependencies: []

@@ -1,0 +1,279 @@
+{
+ "storage": {
+  "controllers": [
+   {
+    "CacheSummary": {
+     "PersistentCacheSizeMiB": 4096,
+     "Status": {
+      "Health": "Warning",
+      "State": "Enabled"
+     },
+     "TotalCacheSizeMiB": 4096
+    },
+    "FirmwareVersion": "52.32.0-5990",
+    "Identifiers": [
+     {
+      "DurableName": "00000000-0000-4000-8000-000000000001",
+      "DurableNameFormat": "UUID"
+     }
+    ],
+    "Location": {
+     "Info": "Slot 2",
+     "PartLocation": {
+      "LocationOrdinalValue": 2,
+      "LocationType": "Slot",
+      "ServiceLabel": "PCI 2"
+     }
+    },
+    "Manufacturer": "Lenovo",
+    "Model": "SAS3908",
+    "Name": "ThinkSystem RAID 940-8i 4GB Flash PCIe Gen4 12Gb Adapter",
+    "PartNumber": "SR17B74710",
+    "SerialNumber": "SN-CTRL-0001",
+    "Status": {
+     "Health": "OK",
+     "State": "Enabled"
+    }
+   },
+   {
+    "CacheSummary": {
+     "PersistentCacheSizeMiB": 0,
+     "Status": {
+      "State": "Disabled"
+     },
+     "TotalCacheSizeMiB": 0
+    },
+    "FirmwareVersion": "52.32.0-6386",
+    "Identifiers": [
+     {
+      "DurableName": "00000000-0000-4000-8000-000000000002",
+      "DurableNameFormat": "UUID"
+     }
+    ],
+    "Location": {
+     "Info": "Slot 16",
+     "PartLocation": {
+      "LocationOrdinalValue": 16,
+      "LocationType": "Slot",
+      "ServiceLabel": "PCI 16"
+     }
+    },
+    "Manufacturer": "Lenovo",
+    "Model": "SAS3808N",
+    "Name": "ThinkSystem M.2 RAID B540i-2i SATA/NVMe Enablement Kit",
+    "PartNumber": "SR17B71469",
+    "SerialNumber": "SN-CTRL-0002",
+    "Status": {
+     "Health": "OK",
+     "State": "Disabled"
+    }
+   }
+  ],
+  "physical_drives": [
+   {
+    "subsystem": "RAID_Slot2",
+    "slot": {
+     "Info": "Slot 0",
+     "PartLocation": {
+      "LocationOrdinalValue": 0,
+      "ServiceLabel": "Drive 0",
+      "LocationType": "Bay"
+     },
+     "InfoFormat": "Slot Number",
+     "InfoFormat@Redfish.Deprecated": "The property is deprecated. Please use PartLocation instead.",
+     "Info@Redfish.Deprecated": "The property is deprecated. Please use PartLocation instead."
+    },
+    "model": "MTFDKCC6T4TGQ-1BK1DABYY",
+    "serial": "SN-NVME-0001",
+    "capacity_bytes": 6401252745216,
+    "media_type": "SSD",
+    "protocol": "NVMe",
+    "usage": {
+     "State": "Enabled",
+     "Health": "OK"
+    },
+    "failure_predicted": false,
+    "is_unconfigured": false,
+    "raw": {
+     "Id": "Disk.0"
+    }
+   },
+   {
+    "subsystem": "RAID_Slot2",
+    "slot": {
+     "InfoFormat": "Slot Number",
+     "InfoFormat@Redfish.Deprecated": "The property is deprecated. Please use PartLocation instead.",
+     "Info@Redfish.Deprecated": "The property is deprecated. Please use PartLocation instead.",
+     "Info": "Slot 1",
+     "PartLocation": {
+      "LocationType": "Bay",
+      "LocationOrdinalValue": 1,
+      "ServiceLabel": "Drive 1"
+     }
+    },
+    "model": "MTFDKCC6T4TGQ-1BK1DABYY",
+    "serial": "SN-NVME-0002",
+    "capacity_bytes": 6401252745216,
+    "media_type": "SSD",
+    "protocol": "NVMe",
+    "usage": {
+     "State": "Enabled",
+     "Health": "OK"
+    },
+    "failure_predicted": false,
+    "is_unconfigured": false,
+    "raw": {
+     "Id": "Disk.1"
+    }
+   },
+   {
+    "subsystem": "RAID_Slot2",
+    "slot": {
+     "PartLocation": {
+      "LocationOrdinalValue": 2,
+      "ServiceLabel": "Drive 2",
+      "LocationType": "Bay"
+     },
+     "InfoFormat": "Slot Number",
+     "InfoFormat@Redfish.Deprecated": "The property is deprecated. Please use PartLocation instead.",
+     "Info@Redfish.Deprecated": "The property is deprecated. Please use PartLocation instead.",
+     "Info": "Slot 2"
+    },
+    "model": "MTFDKCC6T4TGQ-1BK1DABYY",
+    "serial": "SN-NVME-0003",
+    "capacity_bytes": 6401252745216,
+    "media_type": "SSD",
+    "protocol": "NVMe",
+    "usage": {
+     "State": "Enabled",
+     "Health": "OK"
+    },
+    "failure_predicted": false,
+    "is_unconfigured": false,
+    "raw": {
+     "Id": "Disk.2"
+    }
+   },
+   {
+    "subsystem": "RAID_Slot2",
+    "slot": {
+     "PartLocation": {
+      "LocationOrdinalValue": 3,
+      "ServiceLabel": "Drive 3",
+      "LocationType": "Bay"
+     },
+     "InfoFormat": "Slot Number",
+     "InfoFormat@Redfish.Deprecated": "The property is deprecated. Please use PartLocation instead.",
+     "Info@Redfish.Deprecated": "The property is deprecated. Please use PartLocation instead.",
+     "Info": "Slot 3"
+    },
+    "model": "MTFDKCC6T4TGQ-1BK1DABYY",
+    "serial": "SN-NVME-0004",
+    "capacity_bytes": 6401252745216,
+    "media_type": "SSD",
+    "protocol": "NVMe",
+    "usage": {
+     "State": "Enabled",
+     "Health": "OK"
+    },
+    "failure_predicted": false,
+    "is_unconfigured": false,
+    "raw": {
+     "Id": "Disk.3"
+    }
+   },
+   {
+    "subsystem": "RAID_Slot16",
+    "slot": {
+     "InfoFormat": "Slot Number",
+     "InfoFormat@Redfish.Deprecated": "The property is deprecated. Please use PartLocation instead.",
+     "Info@Redfish.Deprecated": "The property is deprecated. Please use PartLocation instead.",
+     "Info": "Slot 0",
+     "PartLocation": {
+      "LocationType": "Bay",
+      "LocationOrdinalValue": 0,
+      "ServiceLabel": "M.2 Drive 0"
+     }
+    },
+    "model": "Micron_7450_MTFDKBA480TFR",
+    "serial": "SN-M2-0001",
+    "capacity_bytes": 480103981056,
+    "media_type": "SSD",
+    "protocol": "NVMe",
+    "usage": {
+     "State": "Enabled",
+     "Health": "OK"
+    },
+    "failure_predicted": false,
+    "is_unconfigured": false,
+    "raw": {
+     "Id": "Disk.M.2_Bay_0"
+    }
+   },
+   {
+    "subsystem": "RAID_Slot16",
+    "slot": {
+     "InfoFormat@Redfish.Deprecated": "The property is deprecated. Please use PartLocation instead.",
+     "Info@Redfish.Deprecated": "The property is deprecated. Please use PartLocation instead.",
+     "Info": "Slot 1",
+     "PartLocation": {
+      "LocationOrdinalValue": 1,
+      "ServiceLabel": "M.2 Drive 1",
+      "LocationType": "Bay"
+     },
+     "InfoFormat": "Slot Number"
+    },
+    "model": "Micron_7450_MTFDKBA480TFR",
+    "serial": "SN-M2-0002",
+    "capacity_bytes": 480103981056,
+    "media_type": "SSD",
+    "protocol": "NVMe",
+    "usage": {
+     "State": "Enabled",
+     "Health": "OK"
+    },
+    "failure_predicted": false,
+    "is_unconfigured": false,
+    "raw": {
+     "Id": "Disk.M.2_Bay_1"
+    }
+   }
+  ],
+  "volumes": [
+   {
+    "Controller": "ThinkSystem RAID 940-8i 4GB Flash PCIe Gen4 12Gb Adapter",
+    "Volumes": []
+   },
+   {
+    "Controller": "ThinkSystem M.2 RAID B540i-2i SATA/NVMe Enablement Kit",
+    "Volumes": [
+     {
+      "AccessCapabilities": [
+       "Read",
+       "Write"
+      ],
+      "BlockSizeBytes": 512,
+      "CapacityBytes": 479559942144,
+      "Encrypted": false,
+      "EncryptionTypes": [],
+      "Id": "0",
+      "Linked_drives": [
+       {
+        "Id": "Disk.M.2_Bay_0"
+       },
+       {
+        "Id": "Disk.M.2_Bay_1"
+       }
+      ],
+      "Name": "",
+      "RAIDType": "RAID1",
+      "Status": {
+       "Health": "OK",
+       "State": "Enabled"
+      }
+     }
+    ]
+   }
+  ]
+ }
+}

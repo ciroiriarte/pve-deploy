@@ -1,0 +1,54 @@
+{
+  "kind": "change",
+  "slug": "ceph-phasegh-benchmark-{{ pve_cluster_name | default('clu') }}",
+  "title": "Ceph Phase G/H pool-tier benchmark and teardown on {{ pve_cluster_name | default('the PVE cluster') }}",
+  "element": "ceph",
+  "environment": "{{ environment_name }}",
+  "operator": "{{ ansible_user_id | default('ansible') }}",
+  "tool": "pve-deploy 16-ceph.yml (ceph_benchmark)",
+  "outcome": "{{ pve_ceph_benchmark_outcome | default('failed') }}",
+  "summary": "Benchmarked {{ pve_ceph_benchmark_pools | length }} temporary pool-tier variants (replica3 / EC2+1 x none/zstd-aggressive) with rados bench + fio librbd over {{ pve_ceph_benchmark_rounds }} rounds, then tore down all tst- pools. Production pools untouched.",
+  "targets": [
+{% for host in (groups['pve'] | default([pve_ceph_first_node])) %}
+    {
+      "host": "{{ host }}",
+      "address": "{{ hostvars[host].ansible_host | default(host) }}",
+      "role": "ceph-osd"
+    }{% if not loop.last %},{% endif %}
+{% endfor %}
+  ],
+  "changes": [
+    {
+      "host": "{{ pve_ceph_first_node }}",
+      "description": "Created temporary tst- pools + EC profile, ran rados bench and prefilled-image fio librbd, then guarded-teardown of only tst- pools.",
+      "before": "Production Ceph cluster with its 5 production pools.",
+      "after": "Same production pools; all temporary tst- pools and the {{ pve_ceph_benchmark_ec_profile }} EC profile removed. Results in {{ pve_ceph_benchmark_out_dir | default('the on-node result bundle') }}.",
+      "commands": [
+        "ceph osd erasure-code-profile set {{ pve_ceph_benchmark_ec_profile }} plugin=jerasure k={{ pve_ceph_benchmark_ec_k }} m={{ pve_ceph_benchmark_ec_m }} crush-failure-domain=host crush-device-class={{ pve_ceph_device_class }} --force",
+        "ceph osd pool create tst-... (replicated size3/min2 or erasure {{ pve_ceph_benchmark_ec_profile }} + allow_ec_overwrites) --autoscale-mode=off",
+        "fio --ioengine=rbd ... (prefill, then rados bench + fio measurement rounds)",
+        "ceph config set mon mon_allow_pool_delete true   # required for teardown, restored after",
+        "ceph osd pool delete tst-... tst-... --yes-i-really-really-mean-it   # tst- prefix guarded",
+        "ceph osd erasure-code-profile rm {{ pve_ceph_benchmark_ec_profile }}"
+      ]
+    }
+  ],
+  "verification": [
+{% for item in pve_ceph_benchmark_verification | default([]) %}
+    {
+      "name": {{ item.name | to_json }},
+      "command": {{ item.command | to_json }},
+      "expected": {{ item.expected | to_json }},
+      "actual": {{ item.actual | to_json }},
+      "result": {{ item.result | to_json }}
+    }{% if not loop.last %},{% endif %}
+{% endfor %}
+  ],
+  "notes": [
+    "Temporary by design: every tst- pool and the EC profile are removed by the guarded teardown; teardown targets only names starting with the tst- prefix and asserts none survive.",
+    "EC caveat: the EC tier is k=2 m=1, so min_size = k+1 = 3 -- one shard loss blocks I/O. EC is a capacity-tier candidate only.",
+    "fio read validity: images are fully prefilled before any read measurement, because reads on a sparse image return zero-fill without an OSD round-trip.",
+    "mon_allow_pool_delete is read, set true for the teardown window, then restored to its prior value.",
+    "This is a hyperconverged, shared-OSD benchmark: treat the numbers as relative comparisons between tiers, not absolute maxima."
+  ]
+}

@@ -1,0 +1,154 @@
+---
+- name: Enable datacenter firewall only after rule verification.
+  tags:
+    - firewall
+    - phase15
+    - enable
+  run_once: true
+  block:
+    - name: Read datacenter firewall options before enable.
+      ansible.builtin.command:
+        argv:
+          - "{{ pve_firewall_pc_bin }}"
+          - "api"
+          - "GET"
+          - "/cluster/firewall/options"
+      delegate_to: localhost
+      register: pve_firewall_dc_options_before
+      changed_when: false
+      failed_when: pve_firewall_dc_options_before.rc != 0
+      no_log: "{{ pve_firewall_pc_no_log }}"
+
+    - name: Enable datacenter firewall with the configured default policy.
+      # /cluster/firewall/options has no `implementation` parameter on PVE 8.4/9.2
+      # (verified 2026-08-13 against a production cluster: valid keys are enable,
+      # policy_in/out/forward, ebtables, log_ratelimit, digest, delete). Passing
+      # `--data implementation=...` made `pc api PUT` reject the whole call, failing
+      # the enable and tripping the rescue/rollback. iptables is the stack in use;
+      # there is nothing to select, so the parameter is dropped.
+      ansible.builtin.command:
+        cmd: >-
+          {{ pve_firewall_pc_bin }} api PUT /cluster/firewall/options --yes
+          --data enable=1
+          --data {{ ('policy_in=' ~ pve_firewall_datacenter_options.policy_in) | quote }}
+          --data {{ ('policy_out=' ~ pve_firewall_datacenter_options.policy_out) | quote }}
+          --data {{ ('policy_forward=' ~ pve_firewall_datacenter_options.policy_forward) | quote }}
+      delegate_to: localhost
+      when: not ansible_check_mode
+      register: pve_firewall_dc_enable
+      changed_when: true
+      failed_when: pve_firewall_dc_enable.rc != 0
+      no_log: "{{ pve_firewall_pc_no_log }}"
+
+    # Rule application is not instantaneous. Probing immediately can observe the
+    # pre-enforcement state and report reachable for ports the new ruleset is
+    # about to close, turning this verification into a false all-clear.
+    - name: Allow the new ruleset to take effect before probing.
+      ansible.builtin.wait_for:
+        timeout: "{{ pve_firewall_settle_seconds }}"
+      delegate_to: localhost
+      changed_when: false
+
+    - name: Wait for SSH to remain reachable on every PVE node.
+      ansible.builtin.wait_for:
+        host: "{{ hostvars[item].ansible_host | default(item) }}"
+        port: "{{ pve_firewall_ports.ssh }}"
+        timeout: "{{ pve_firewall_probe_timeout }}"
+        connect_timeout: 3
+        state: started
+      delegate_to: localhost
+      loop: "{{ groups['pve'] }}"
+      register: pve_firewall_ssh_probe
+      changed_when: false
+
+    - name: Wait for PVE API to remain reachable on every PVE node.
+      ansible.builtin.wait_for:
+        host: "{{ hostvars[item].ansible_host | default(item) }}"
+        port: "{{ pve_firewall_ports.pve_api }}"
+        timeout: "{{ pve_firewall_probe_timeout }}"
+        connect_timeout: 3
+        state: started
+      delegate_to: localhost
+      loop: "{{ groups['pve'] }}"
+      register: pve_firewall_api_probe
+      changed_when: false
+
+    - name: Verify corosync quorum after enabling firewall.
+      ansible.builtin.command:
+        argv:
+          - "pvecm"
+          - "status"
+      register: pve_firewall_quorum_status
+      changed_when: false
+      # Matched with a regex rather than an exact substring: "Quorate:" is
+      # column-aligned in pvecm output and that padding is not contractual, so a
+      # fixed run of spaces would silently stop matching. A quorum check that
+      # misreports is worse than none here, because this is what gates the
+      # firewall rollback.
+      failed_when: >-
+        pve_firewall_quorum_status.rc != 0 or
+        (pve_firewall_quorum_status.stdout | regex_search('Quorate:\s*Yes', ignorecase=True)) is none
+      delegate_to: "{{ groups['pve'][0] }}"
+
+    # Results are derived from the probe and quorum output rather than asserted.
+    # A literal 'pass' only restates that no earlier task failed, which is the
+    # pattern aef7339 removed from the audit roles for hiding real state.
+    - name: Record firewall enable verification.
+      ansible.builtin.set_fact:
+        pve_firewall_verification: >-
+          {{
+            pve_firewall_verification + [
+              {
+                'name': 'SSH reachable on every PVE node after datacenter firewall enable',
+                'command': 'wait_for tcp/' ~ pve_firewall_ports.ssh ~ ' from control host',
+                'expected': (groups['pve'] | length) ~ ' host(s) reachable',
+                'actual': (pve_firewall_ssh_reached | join(', ')) | default('none', true),
+                'result': ('pass' if pve_firewall_ssh_reached | length == groups['pve'] | length else 'fail')
+              },
+              {
+                'name': 'PVE API reachable on every PVE node after datacenter firewall enable',
+                'command': 'wait_for tcp/' ~ pve_firewall_ports.pve_api ~ ' from control host',
+                'expected': (groups['pve'] | length) ~ ' host(s) reachable',
+                'actual': (pve_firewall_api_reached | join(', ')) | default('none', true),
+                'result': ('pass' if pve_firewall_api_reached | length == groups['pve'] | length else 'fail')
+              },
+              {
+                'name': 'Corosync quorum retained after datacenter firewall enable',
+                'command': 'pvecm status',
+                'expected': 'Quorate: Yes',
+                'actual': pve_firewall_quorum_status.stdout | regex_search('Quorate:\s*\S+', ignorecase=True)
+                          | default('no Quorate line in pvecm output', true),
+                'result': ('pass'
+                           if (pve_firewall_quorum_status.stdout | regex_search('Quorate:\s*Yes', ignorecase=True)) is not none
+                           else 'fail')
+              }
+            ]
+          }}
+      vars:
+        pve_firewall_ssh_reached: >-
+          {{ pve_firewall_ssh_probe.results | default([]) | rejectattr('failed', 'defined')
+             | map(attribute='item') | list }}
+        pve_firewall_api_reached: >-
+          {{ pve_firewall_api_probe.results | default([]) | rejectattr('failed', 'defined')
+             | map(attribute='item') | list }}
+      changed_when: false
+
+  rescue:
+    - name: Disable datacenter firewall immediately after failed enable verification.
+      ansible.builtin.command:
+        cmd: >-
+          {{ pve_firewall_pc_bin }} api PUT /cluster/firewall/options --yes
+          --data enable=0
+      delegate_to: localhost
+      when: not ansible_check_mode
+      register: pve_firewall_dc_rollback
+      changed_when: true
+      failed_when: pve_firewall_dc_rollback.rc != 0
+      no_log: "{{ pve_firewall_pc_no_log }}"
+
+    - name: Fail with explicit rollback message.
+      ansible.builtin.fail:
+        msg: >-
+          Datacenter firewall enable verification failed. The role attempted to
+          disable the firewall again immediately. Check SSH, PVE API, and
+          corosync quorum from console before retrying.

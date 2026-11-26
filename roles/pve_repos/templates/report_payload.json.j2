@@ -1,0 +1,47 @@
+{
+  "kind": "change",
+  "slug": "pve-repos-config-{{ inventory_hostname }}",
+  "title": "Configure PVE 9 deb822 APT Repositories",
+  "element": "pve_repos",
+  "environment": {{ pve_environment | to_json }},
+  "operator": {{ ansible_user_id | default('root') | to_json }},
+  "tool": "ansible",
+  "outcome": "success",
+  "summary": "Configured reliable APT repository access for PVE 9 and applied pending package upgrades when pve_repos_apply_full_upgrade=true: Debian sources, official Proxmox PVE/Ceph sources, OBS sources, and APT IPv4 acquire preference while VLAN2001 has no routed IPv6",
+  "targets": [
+    {
+      "host": {{ inventory_hostname | to_json }},
+      "address": {{ ansible_host | default(inventory_hostname) | to_json }},
+      "role": "hypervisor"
+    }
+  ],
+  "changes": [
+    {
+      "host": {{ inventory_hostname | to_json }},
+      "description": "Updated APT repository configuration to deb822 format using official Proxmox repository paths/protocols and applied pending package upgrades when enabled",
+      "before": "legacy/default sources; Debian base/security may use HTTPS and carry the contrib component",
+      "after": "deb822 sources: Debian base/security over official HTTP with components {{ pve_debian_components }}, Proxmox no-subscription over official HTTP, Ceph no-subscription over official HTTP, OBS over HTTPS, and APT IPv4 acquire preference",
+      "commands": [
+        "apt-get update",
+        "apt-get dist-upgrade"
+      ]
+    }
+  ],
+  "verification": [
+    {
+      "name": "apt_update_check",
+      "command": "apt-get update",
+      "expected": "0",
+      "actual": "0",
+      "result": "pass"
+    }
+  ],
+  "artifacts": [
+    "/etc/apt/sources.list.d/debian.sources",
+    "{{ '/etc/apt/sources.list.d/pve-enterprise.sources' if (pve_subscription_key | default('', true) | length > 0) else '/etc/apt/sources.list.d/proxmox.sources' }}",
+    "/etc/apt/sources.list.d/ceph.sources",
+    "/etc/apt/sources.list.d/obs.sources",
+    "/etc/apt/apt.conf.d/99pve-deploy-ipv4-acquire"
+  ],
+  "notes": "PVE 9 requires deb822 sources format. The Debian base/security repositories and the Proxmox PVE and Ceph no-subscription repositories all intentionally use plain HTTP per the Proxmox Package Repositories reference -- APT verifies packages against the archive keyrings, so the transport adds no integrity guarantee, and HTTP keeps a caching proxy usable; enterprise repositories use HTTPS only when a subscription key is configured. APT is pinned to IPv4 only because VLAN2001 currently has no global IPv6 address/default route; this does not disable IPv6 system-wide and should be removed when routed IPv6 is deployed. Phase 10 applies pending package upgrades after repository convergence when pve_repos_apply_full_upgrade=true."
+}

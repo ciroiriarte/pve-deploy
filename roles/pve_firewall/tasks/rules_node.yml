@@ -1,0 +1,194 @@
+---
+- name: Reset NMS poller SNMP monitoring rule accumulator (node).
+  ansible.builtin.set_fact:
+    pve_firewall_monitoring_rules_node: []
+  changed_when: false
+  tags:
+    - firewall
+    - phase15
+
+- name: Build NMS poller SNMP monitoring rules (node).
+  ansible.builtin.set_fact:
+    pve_firewall_monitoring_rules_node: "{{ pve_firewall_monitoring_rules_node + [rule] }}"
+  vars:
+    rule:
+      comment: "pve-deploy allow SNMP {{ item.1 }} from NMS poller {{ item.0 }}"
+      type: "in"
+      action: "ACCEPT"
+      proto: "{{ item.1 }}"
+      dport: "{{ pve_firewall_ports.snmp }}"
+      source: "{{ item.0 }}"
+      enable: 1
+  loop: "{{ pve_firewall_nms_pollers | product(pve_firewall_snmp_protocols) | list }}"
+  when: pve_firewall_nms_pollers | length > 0
+  changed_when: false
+  tags:
+    - firewall
+    - phase15
+
+- name: Add NMS poller ICMP monitoring rules (node).
+  ansible.builtin.set_fact:
+    pve_firewall_monitoring_rules_node: "{{ pve_firewall_monitoring_rules_node + [rule] }}"
+  vars:
+    rule:
+      comment: "pve-deploy allow ICMP from NMS poller {{ item }}"
+      type: "in"
+      action: "ACCEPT"
+      proto: "icmp"
+      source: "{{ item }}"
+      enable: 1
+  loop: "{{ pve_firewall_nms_pollers }}"
+  when: pve_firewall_nms_pollers | length > 0
+  changed_when: false
+  tags:
+    - firewall
+    - phase15
+
+- name: Build desired node firewall rule list.
+  ansible.builtin.set_fact:
+    pve_firewall_node_rules_desired: >-
+      {{
+        pve_firewall_node_rules_base
+        + (pve_firewall_cluster_rules_evpn if pve_firewall_sdn_evpn_enabled | bool else [])
+        + (pve_firewall_cluster_rules_validation if pve_firewall_allow_validation | bool else [])
+        + (pve_firewall_monitoring_rules_node | default([]))
+      }}
+  changed_when: false
+  tags:
+    - firewall
+    - phase15
+
+- name: Read current node firewall options.
+  ansible.builtin.command:
+    argv:
+      - "{{ pve_firewall_pc_bin }}"
+      - "api"
+      - "GET"
+      - "/nodes/{{ inventory_hostname }}/firewall/options"
+  delegate_to: localhost
+  register: pve_firewall_node_options_get
+  changed_when: false
+  failed_when: pve_firewall_node_options_get.rc != 0
+  no_log: "{{ pve_firewall_pc_no_log }}"
+  tags:
+    - firewall
+    - phase15
+
+- name: Converge node firewall options before datacenter enable.
+  # Node-level firewall options support enable here; policy defaults are
+  # datacenter-scope options on PVE 9.
+  ansible.builtin.command:
+    cmd: >-
+      {{ pve_firewall_pc_bin }} api PUT /nodes/{{ inventory_hostname }}/firewall/options --yes
+      --data {{ ('enable=' ~ (pve_firewall_node_options.enable | string)) | quote }}
+  delegate_to: localhost
+  when:
+    - not ansible_check_mode
+    - >-
+      ((pve_firewall_node_options_get.stdout | default('{"data": {}}') | from_json).data
+       | default({})).enable | default(0) | int
+      != pve_firewall_node_options.enable | int
+  register: pve_firewall_node_options_put
+  changed_when: true
+  failed_when: pve_firewall_node_options_put.rc != 0
+  no_log: "{{ pve_firewall_pc_no_log }}"
+  tags:
+    - firewall
+    - phase15
+
+- name: Read current node firewall rules.
+  ansible.builtin.command:
+    argv:
+      - "{{ pve_firewall_pc_bin }}"
+      - "api"
+      - "GET"
+      - "/nodes/{{ inventory_hostname }}/firewall/rules"
+  delegate_to: localhost
+  register: pve_firewall_node_rules_get
+  changed_when: false
+  failed_when: pve_firewall_node_rules_get.rc != 0
+  no_log: "{{ pve_firewall_pc_no_log }}"
+  tags:
+    - firewall
+    - phase15
+
+- name: Normalize current node firewall rules.
+  ansible.builtin.set_fact:
+    pve_firewall_node_rules_current: "{{ ((pve_firewall_node_rules_get.stdout | default('{\"data\": []}') | from_json).data | default([])) }}"
+  changed_when: false
+  tags:
+    - firewall
+    - phase15
+
+- name: Create missing node firewall rules before datacenter enable.
+  # Use pc api with repeatable --data flags; this avoids pvesh and matches
+  # pve-cli v0.13's documented mutating API syntax.
+  ansible.builtin.command:
+    cmd: >-
+      {{ pve_firewall_pc_bin }} api POST /nodes/{{ inventory_hostname }}/firewall/rules --yes
+      --data {{ ('type=' ~ item.type) | quote }}
+      --data {{ ('action=' ~ item.action) | quote }}
+      --data {{ ('proto=' ~ item.proto) | quote }}
+      {{ ('--data ' ~ (('dport=' ~ item.dport) | quote)) if (item.dport | default('') | string | length > 0) else '' }}
+      --data {{ ('source=' ~ item.source) | quote }}
+      --data {{ ('enable=' ~ (item.enable | string)) | quote }}
+      --data {{ ('comment=' ~ item.comment) | quote }}
+  delegate_to: localhost
+  loop: "{{ pve_firewall_node_rules_desired }}"
+  when:
+    - not ansible_check_mode
+    - item.comment not in (pve_firewall_node_rules_current | map(attribute='comment') | list)
+  register: pve_firewall_node_rule_create
+  changed_when: true
+  failed_when: pve_firewall_node_rule_create.rc != 0
+  no_log: "{{ pve_firewall_pc_no_log }}"
+  tags:
+    - firewall
+    - phase15
+
+- name: Read node firewall rules after convergence.
+  ansible.builtin.command:
+    argv:
+      - "{{ pve_firewall_pc_bin }}"
+      - "api"
+      - "GET"
+      - "/nodes/{{ inventory_hostname }}/firewall/rules"
+  delegate_to: localhost
+  register: pve_firewall_node_rules_verify
+  changed_when: false
+  failed_when: pve_firewall_node_rules_verify.rc != 0
+  no_log: "{{ pve_firewall_pc_no_log }}"
+  tags:
+    - firewall
+    - phase15
+
+- name: Verify required node firewall rules are present.
+  ansible.builtin.assert:
+    that:
+      - "item.comment in (((pve_firewall_node_rules_verify.stdout | from_json).data | default([])) | map(attribute='comment') | list)"
+    fail_msg: "Missing required node firewall rule on {{ inventory_hostname }}: {{ item.comment }}"
+    quiet: true
+  loop: "{{ pve_firewall_node_rules_desired }}"
+  changed_when: false
+  tags:
+    - firewall
+    - phase15
+
+- name: Record node firewall rule verification.
+  ansible.builtin.set_fact:
+    pve_firewall_verification: >-
+      {{
+        pve_firewall_verification + [
+          {
+            'name': 'Node firewall rules present on ' ~ inventory_hostname,
+            'command': pve_firewall_pc_bin ~ ' api GET /nodes/' ~ inventory_hostname ~ '/firewall/rules',
+            'expected': (pve_firewall_node_rules_desired | map(attribute='comment') | list | to_json),
+            'actual': (((pve_firewall_node_rules_verify.stdout | from_json).data | default([])) | map(attribute='comment') | list | to_json),
+            'result': 'pass'
+          }
+        ]
+      }}
+  changed_when: false
+  tags:
+    - firewall
+    - phase15

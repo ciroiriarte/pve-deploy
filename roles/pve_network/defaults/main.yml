@@ -1,0 +1,64 @@
+---
+pve_deploy_root: "{{ (playbook_dir ~ '/..') | realpath }}"
+
+# Site data root: where per-deployment records are written. Defaults to this
+# checkout; point it at a site repository to keep records out of the tool repo.
+pve_site_root: "{{ pve_deploy_root }}"
+reports_dir: "{{ pve_site_root }}/reports"
+
+pve_environment: "production"
+pve_network_apply: false
+
+# Staging path for the rendered candidate config.
+#
+# Deliberately NOT /etc/network/interfaces.new: that path belongs to PVE, which
+# uses it for pending network edits made through the web UI and commits it to
+# /etc/network/interfaces on boot via pvenetcommit.service. Writing there makes
+# the UI show permanently pending changes and lets a reboot silently apply and
+# delete the file behind this role's back.
+pve_network_staging_path: "/etc/network/interfaces.pve-deploy"
+
+# Seconds before the on-node safety timer restores the previous config.
+#
+# The timer is armed on the node itself before the new config is applied and
+# disarmed only once reachability is confirmed. If the apply cuts the
+# management path, the controller cannot reach the node to roll back, so the
+# node must be able to recover itself. Must comfortably exceed the time between
+# ifreload and the reachability probe below.
+pve_network_rollback_delay: 120
+pve_network_rollback_unit: "pve-deploy-netrollback"
+
+# systemd defaults AccuracySec to 1min and coalesces timers to save wakeups, so
+# an --on-active=120 rollback can fire well past 120s. Measured on a PVE 9 node:
+# a 5s timer fired at 12s with the default, and at 6s with this set. That slack
+# is extra outage on a node that is already unreachable.
+pve_network_rollback_accuracy: "1s"
+
+# Reachability probe after apply, before the safety timer is disarmed.
+pve_network_verify_retries: 10
+pve_network_verify_delay: 3
+
+# Carrier MTU leaves headroom above 9000-byte segment payloads for VLAN and overlay overhead.
+pve_network_carrier_mtu: 9216
+pve_network_default_vlan_mtu: 1500
+
+# LACP policy must match the FortiSwitch trunks.
+pve_network_bond_mode: "802.3ad"
+pve_network_bond_miimon: 100
+pve_network_bond_lacp_rate: "slow"
+pve_network_bond_xmit_hash_policy: "layer3+4"
+
+# VM/SDN uplink bridge. Keep VLAN list narrow for ConnectX-6 hardware VLAN filter limits.
+pve_network_vm_bridge: "vmbr1"
+pve_network_vm_bridge_parent: "bond1"
+pve_network_vm_bridge_vids:
+  - "230-232"
+  - "240"
+  - "701"
+  - "2005"
+  - "3921-3922"   # N/S per-VRF eBGP transit to the FG tenant VDOMs (Stage 2)
+
+# Pin the SDN uplink bond (vm_bridge_parent) MAC to its first slave's permanent
+# address so ifreload cannot flip it and break ConnectX-6 RX steering.
+# The MAC is read live via ethtool -P. Set false on NICs not affected by this.
+pve_network_pin_sdn_bond_mac: true

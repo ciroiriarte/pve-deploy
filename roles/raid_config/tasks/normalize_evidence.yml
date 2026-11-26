@@ -1,0 +1,114 @@
+---
+# Collapses the two storage evidence shapes into one canonical schema.
+#
+# Storage reaches this role from two sources with incompatible field names:
+#
+#   bmc_inventory file : snake_case, pre-normalized  (model, capacity_bytes,
+#                        media_type, subsystem, usage.Health, raw.Id)
+#   direct Redfish     : PascalCase, as the BMC returns it  (Model,
+#                        CapacityBytes, MediaType, Status.Health, Id)
+#
+# audit_storage.yml and evaluate_drive.yml read only the PascalCase shape, so
+# with the file source -- the one actually used in practice -- every field fell
+# through to its default. Drives were reported as "Unknown Model / Unknown
+# Serial / Unknown capacity", which left nothing for boot detection to match on
+# and made the candidate list useless as data.
+#
+# Normalising here rather than teaching each consumer both shapes keeps the
+# vendor/source seam in one place, which is also where a second vendor's driver
+# will need to plug in.
+
+- name: Normalize physical drives to the canonical shape
+  ansible.builtin.set_fact:
+    physical_drives: >-
+      {%- set out = [] -%}
+      {%- for d in physical_drives | default([]) -%}
+      {%-   set raw = d.raw | default({}) -%}
+      {%-   set slot = d.slot | default({}) -%}
+      {%-   set part = slot.PartLocation | default({}) -%}
+      {%-   set usage = d.usage | default(d.Status | default({})) -%}
+      {%-   set _ = out.append({
+              'id': d.id | default(raw.Id | default(d.Id | default(''))),
+              'model': d.model | default(d.Model | default(raw.Model | default('Unknown Model'))),
+              'serial': d.serial | default(d.SerialNumber | default(raw.SerialNumber | default('Unknown Serial'))),
+              'capacity_bytes': d.capacity_bytes | default(d.CapacityBytes | default(raw.CapacityBytes | default(0))),
+              'media_type': d.media_type | default(d.MediaType | default(raw.MediaType | default('Unknown'))),
+              'protocol': d.protocol | default(d.Protocol | default(raw.Protocol | default('Unknown'))),
+              'subsystem': d.subsystem | default(''),
+              'location': part.ServiceLabel | default(slot.Info | default(d.Name | default(raw.Name | default('Unknown')))),
+              'health': usage.Health | default('Unknown'),
+              'state': usage.State | default('Unknown'),
+              'is_unconfigured': d.is_unconfigured | default(false),
+              'failure_predicted': d.failure_predicted | default(d.FailurePredicted | default(false))
+            }) -%}
+      {%- endfor -%}
+      {{ out }}
+  changed_when: false
+
+# Volume members are the load-bearing field. Linked_drives[].Id on the volume
+# matches raw.Id on the physical drive exactly (both spell it
+# "Disk.M.2_Bay_0"), which is a factual join rather than a name heuristic.
+- name: Normalize virtual disks to the canonical shape
+  ansible.builtin.set_fact:
+    virtual_disks: >-
+      {%- set out = [] -%}
+      {%- for v in virtual_disks | default([]) -%}
+      {%-   set members = [] -%}
+      {%-   for m in v.Linked_drives | default([]) -%}
+      {%-     if m.Id is defined -%}{%- set _ = members.append(m.Id) -%}{%- endif -%}
+      {%-   endfor -%}
+      {%-   for m in (v.Links | default({})).Drives | default([]) -%}
+      {%-     if m['@odata.id'] is defined -%}
+      {%-       set _ = members.append(m['@odata.id'].split('/') | last) -%}
+      {%-     endif -%}
+      {%-   endfor -%}
+      {%-   set status = v.Status | default({}) -%}
+      {%-   set _ = out.append({
+              'name': v.Name | default(''),
+              'raid_type': v.RAIDType | default(v.VolumeType | default('Unknown')),
+              'capacity_bytes': v.CapacityBytes | default(0),
+              'member_ids': members,
+              'controller': v.controller | default(''),
+              'health': status.Health | default('Unknown'),
+              'state': status.State | default('Unknown')
+            }) -%}
+      {%- endfor -%}
+      {{ out }}
+  changed_when: false
+
+- name: Normalize storage controllers to the canonical shape
+  ansible.builtin.set_fact:
+    storage_controllers: >-
+      {%- set out = [] -%}
+      {%- for c in storage_controllers | default([]) -%}
+      {%-   set loc = c.Location | default({}) -%}
+      {%-   set status = c.Status | default({}) -%}
+      {%-   set cache = c.CacheSummary | default({}) -%}
+      {%-   set _ = out.append({
+              'name': c.Name | default(c.Model | default('Unknown Controller')),
+              'model': c.Model | default('Unknown'),
+              'location': loc.Info | default(''),
+              'mode': c.Mode | default(''),
+              'health': status.Health | default('Unknown'),
+              'state': status.State | default('Unknown'),
+              'cache_health': (cache.Status | default({})).Health | default('')
+            }) -%}
+      {%- endfor -%}
+      {{ out }}
+  changed_when: false
+
+# The normalizer is the boundary; past this point a missing identity is a real
+# collection problem rather than a field-name mismatch, and must not be
+# smoothed over into an "Unknown" that boot detection then cannot act on.
+- name: Fail when drives were collected but carry no usable identity
+  ansible.builtin.fail:
+    msg: >-
+      {{ physical_drives | length }} drive(s) were collected from
+      {{ parent_host | default(inventory_hostname) }} but none carries an id or
+      serial. Storage evidence cannot be attributed to physical hardware, so
+      boot-device identification and OSD candidacy would both be guesswork.
+      Check the evidence schema against roles/raid_config/tasks/normalize_evidence.yml.
+  when:
+    - physical_drives | length > 0
+    - physical_drives | selectattr('id') | list | length == 0
+    - physical_drives | rejectattr('serial', 'equalto', 'Unknown Serial') | list | length == 0

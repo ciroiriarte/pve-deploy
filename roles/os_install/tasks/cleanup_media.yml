@@ -1,0 +1,78 @@
+---
+# Undoes the reversible half: clears the boot override, and detaches the image
+# when detaching it is safe.
+#
+# WHY DETACHING IS CONDITIONAL
+#
+# Pulling the media out from under a running installer breaks the install. So
+# this step does not detach unconditionally -- it detaches when the node is
+# known to be up (the installer is finished with the image), or when the machine
+# was never power cycled at all (nothing is reading it).
+#
+# What it does NOT do is detach after a timeout. A timeout means "the node did
+# not answer", which includes "the installer is still running and needed longer
+# than we allowed". Detaching there would convert a slow install into a failed
+# one, and would do it at the exact moment nobody is watching.
+#
+# Leaving media attached is cheap: the boot override is `Once` and was consumed
+# by the boot into the installer, so an attached image is inert -- it is a slot
+# holding a URL, not a machine that keeps reinstalling itself.
+
+# os_install_committed is set immediately BEFORE the reset is issued, so it is
+# true for every path where the machine might be running the installer --
+# including the one where the reset succeeded and a later task failed. Keying
+# on anything set after the reset produced exactly that hole once: the machine
+# was power cycled, the next task failed, the flag was never set, and this
+# decided it was safe to detach media from a host that was mid-POST.
+#
+# `not defined` is treated as committed=false only because the flag is
+# initialised in defaults; an undefined value here would mean the role never
+# reached start_install at all.
+- name: Decide whether it is safe to detach
+  ansible.builtin.set_fact:
+    os_install_safe_to_detach: >-
+      {{ (os_install_cleanup_only | default(false) | bool)
+         or (os_install_outcome | default('') == 'installed')
+         or (not (os_install_committed | default(false) | bool)) }}
+  changed_when: false
+
+# Cleared even though `Once` already consumed it. This is the belt to the
+# override's braces: if the power cycle never happened, or if a site overrode
+# os_install_boot_override to Continuous, an uncleared override is a machine
+# that boots the installer again. The PATCH costs one request.
+- name: Clear the boot override
+  ansible.builtin.uri:
+    url: "https://{{ ansible_host }}/redfish/v1/Systems/1"
+    method: PATCH
+    body_format: json
+    body:
+      Boot:
+        BootSourceOverrideEnabled: "Disabled"
+        BootSourceOverrideTarget: "None"
+    user: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_validate_certs }}"
+    timeout: "{{ bmc_timeout }}"
+    status_code: [200, 202, 204, 412]
+  no_log: true
+  # This file runs from an `always` block, so it is reached after the failure it
+  # is cleaning up after. It must not mask that failure with its own.
+  failed_when: false
+  changed_when: true
+
+- name: Detach the installation media
+  ansible.builtin.include_tasks: "media/{{ os_install_media_backend }}_umount.yml"
+  when: os_install_safe_to_detach | bool
+
+- name: Explain why the media was left attached
+  ansible.builtin.debug:
+    msg:
+      - "{{ inventory_hostname }}: media LEFT ATTACHED on purpose."
+      - "The node did not confirm as installed, so the installer may still be running."
+      - "Detaching now would break an install that is merely slow."
+      - "The boot override has been cleared, so an attached image cannot cause a reinstall."
+      - "Once you have established what happened -- over SoL -- detach with:"
+      - "  ansible-playbook playbooks/02-install.yml --limit {{ inventory_hostname }} -e os_install_cleanup_only=true"
+  when: not (os_install_safe_to_detach | bool)
+  changed_when: false

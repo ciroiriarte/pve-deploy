@@ -1,0 +1,105 @@
+---
+# Executes the firmware plan built by audit_firmware.yml.
+#
+# Reached only when the caller has cleared the apply gate. The plan is already
+# computed and ordered by the time execution arrives here -- do not re-derive
+# it, or apply and the report it was reviewed from could diverge.
+
+- name: Select the components this run will flash
+  ansible.builtin.set_fact:
+    firmware_apply_queue: >-
+      {{ firmware_plan | selectattr('state', 'equalto', 'update_required') | list }}
+  changed_when: false
+
+- name: Report that the fleet already matches the target
+  ansible.builtin.debug:
+    msg: >-
+      Nothing to flash on {{ parent_host | default(inventory_hostname) }}:
+      {{ firmware_up_to_date_count }} component(s) already at the target version.
+  when: firmware_apply_queue | length == 0
+
+- name: Flash the queued components
+  when: firmware_apply_queue | length > 0
+  block:
+    - name: Verify every queued payload exists before touching the BMC
+      # Checked as a set, up front. Discovering a missing payload halfway through
+      # leaves the host part-flashed across a BMC/UEFI boundary, which is the
+      # worst place to stop.
+      ansible.builtin.stat:
+        path: "{{ firmware_payload_dir }}/{{ item.payload_file }}"
+      delegate_to: localhost
+      loop: "{{ firmware_apply_queue }}"
+      loop_control:
+        label: "{{ item.payload_file }}"
+      register: firmware_payload_stats
+      changed_when: false
+
+    - name: Refuse to start when any payload is missing
+      ansible.builtin.fail:
+        msg: >-
+          {{ firmware_payload_stats.results | rejectattr('stat.exists') | map(attribute='item.payload_file') | join(', ') }}
+          not found in {{ firmware_payload_dir }}. Refusing to begin a partial
+          firmware sequence.
+      when: firmware_payload_stats.results | rejectattr('stat.exists') | list | length > 0
+
+    - name: Announce the flash sequence
+      ansible.builtin.debug:
+        msg: >-
+          Flashing {{ firmware_apply_queue | length }} component(s) on
+          {{ parent_host | default(inventory_hostname) }} in class order:
+          {{ firmware_apply_queue | map(attribute='id') | join(' -> ') }}.
+          The host will reboot as part of this sequence.
+
+    # One component at a time, in the plan's order. Ansible's loop is sequential,
+    # which is what the ordering requires: the BMC is flashed before anything it
+    # will subsequently be asked to flash.
+    - name: Push firmware payloads to the BMC
+      ansible.builtin.include_tasks: push_payload.yml
+      loop: "{{ firmware_apply_queue }}"
+      loop_control:
+        loop_var: fw_item
+        label: "{{ fw_item.id }} -> {{ fw_item.target_version }}"
+
+    # Re-read rather than trusting the task results. A Redfish update task
+    # reporting Completed means the BMC accepted and applied the payload, not
+    # that the component now reports the version we wanted -- those differ when
+    # a payload is rejected late, or when the component needs a power cycle the
+    # update task did not perform.
+    - name: Re-read the firmware inventory to verify the applied versions
+      ansible.builtin.include_tasks: gather_inventory.yml
+
+    - name: Compare the post-flash versions against the plan
+      ansible.builtin.set_fact:
+        firmware_verify_failures: >-
+          {%- set failed = [] -%}
+          {%- for want in firmware_apply_queue -%}
+          {%-   set found = [] -%}
+          {%-   for got in firmware_inventory_items -%}
+          {%-     if got.id == want.id -%}{%- set _ = found.append(got.version) -%}{%- endif -%}
+          {%-   endfor -%}
+          {%-   set actual = (found | first) if found | length > 0 else '(component absent after update)' -%}
+          {%-   if actual != want.target_version -%}
+          {%-     set _ = failed.append({'id': want.id, 'wanted': want.target_version, 'actual': actual}) -%}
+          {%-   endif -%}
+          {%- endfor -%}
+          {{ failed }}
+      changed_when: false
+
+    - name: Fail when a component did not reach its target version
+      ansible.builtin.fail:
+        msg: >-
+          Firmware verification failed on
+          {{ parent_host | default(inventory_hostname) }}:
+          {% for f in firmware_verify_failures %}
+          {{ f.id }} wanted {{ f.wanted }} but reports {{ f.actual }};
+          {% endfor %}
+          The update was submitted and accepted, so the host may be in a
+          part-converged state. Do NOT proceed to the next node.
+      when: firmware_verify_failures | length > 0
+
+    - name: Report the verified flash result
+      ansible.builtin.debug:
+        msg: >-
+          {{ firmware_apply_queue | length }} component(s) verified at their
+          target versions on {{ parent_host | default(inventory_hostname) }}.
+      when: firmware_verify_failures | length == 0

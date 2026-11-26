@@ -1,0 +1,90 @@
+---
+- name: Initialize BIOS audit drift results
+  ansible.builtin.set_fact:
+    bios_drift_items: []
+    bios_audit_critical_count: 0
+    bios_audit_warning_count: 0
+    bios_audit_match_count: 0
+    bios_audit_absent_count: 0
+    bios_audit_outcome: "success"
+  changed_when: false
+
+- name: Evaluate baseline BIOS attributes against current hardware state
+  ansible.builtin.include_tasks: evaluate_key.yml
+  loop: "{{ bios_baseline | dict2items }}"
+  loop_control:
+    loop_var: baseline_item
+
+# Per-port NIC SR-IOV (ConnectX-6 VirtualizationMode).
+#
+# Scoped to VirtualizationMode only. The pattern used to also match 'SRIOV',
+# which pulled in the global DevicesandIOPorts_SRIOV attribute — an
+# Enabled/Disabled flag already covered by bios_baseline — and compared its
+# value against the string 'SR-IOV'. That comparison can never succeed, so a
+# correctly configured chassis reported permanent false drift on it.
+- name: Evaluate per-NIC SR-IOV attribute pattern match
+  ansible.builtin.set_fact:
+    sriov_nic_attributes: "{{ bios_attributes | dict2items | selectattr('key', 'search', 'VirtualizationMode') | list }}"
+  changed_when: false
+
+- name: Process per-NIC SR-IOV attribute matches
+  ansible.builtin.set_fact:
+    bios_drift_items: >-
+      {{ bios_drift_items + [{
+           'key': item.key,
+           'desired': bios_nic_sriov_value,
+           'current': item.value,
+           'pending': bios_pending_attributes[item.key] | default('none'),
+           'status': (item.value == bios_nic_sriov_value) | ternary('match', 'drift'),
+           'severity': 'warning',
+           'pending_staged': (bios_pending_attributes[item.key] is defined
+                              and bios_pending_attributes[item.key] != item.value),
+           'note': 'Per-NIC SR-IOV mode'
+         }] }}
+  loop: "{{ sriov_nic_attributes }}"
+  when: sriov_nic_attributes | length > 0
+  changed_when: false
+
+# A baseline key absent from the hardware is a finding, not silence.
+#
+# The outcome used to derive from drift counts alone, so a baseline whose keys
+# ALL failed to match — the exact state of this fleet, 0 matches and 10 absent
+# on every node — reported "success". An audit that cannot see the settings it
+# is auditing must never claim the hardware is compliant.
+# An empty attribute set is a collection failure, not a compliance result.
+# db-01 returned 0 attributes in the 2026-07-26 audit and was still
+# reported as a successful run with "10 absent", which reads as though the
+# hardware were inspected and found lacking.
+- name: Fail when the BMC returned no BIOS attributes at all
+  ansible.builtin.fail:
+    msg: >-
+      No BIOS attributes were collected from {{ inventory_hostname }}. This is a
+      collection failure — the BMC returned nothing to compare against — not
+      evidence that the baseline is absent from the hardware. Check Redfish
+      reachability and the XCC BIOS attribute registry before interpreting any
+      result for this host.
+  when:
+    - bios_baseline | length > 0
+    - bios_attributes | length == 0
+
+- name: Fail when no baseline attribute matched any hardware attribute
+  ansible.builtin.fail:
+    msg: >-
+      BIOS baseline matched ZERO of {{ bios_baseline | length }} attributes on
+      {{ inventory_hostname }}, out of {{ bios_attributes | length }} attributes
+      read from the BMC. That means the baseline keys do not exist on this
+      firmware, NOT that the hardware is compliant. Check the namespace and the
+      '_' separator against a live attribute dump. Refusing to report a vacuous
+      pass.
+  when:
+    - bios_baseline | length > 0
+    - bios_attributes | length > 0
+    - bios_audit_match_count | int == 0
+
+- name: Determine overall BIOS audit outcome
+  ansible.builtin.set_fact:
+    bios_audit_outcome: >-
+      {{ (bios_audit_critical_count | int > 0
+          or bios_audit_warning_count | int > 0
+          or bios_audit_absent_count | int > 0) | ternary('partial', 'success') }}
+  changed_when: false

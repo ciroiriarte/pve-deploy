@@ -1,0 +1,70 @@
+---
+- name: Initialize storage audit facts
+  ansible.builtin.set_fact:
+    ceph_osd_candidates: []
+    ceph_raid0_findings: []
+    boot_device_identifiers: []
+    boot_device_confident: false
+    boot_disk_redundancy: "unknown"
+    raid_audit_outcome: "success"
+  changed_when: false
+
+- name: Identify boot storage device conservatively
+  ansible.builtin.include_tasks: identify_boot_device.yml
+
+- name: Audit controller operational modes against Ceph requirements
+  # Reads the canonical shape from normalize_evidence.yml. This used to read
+  # item.Mode / item.Name, which the bmc_inventory file source does not provide.
+  vars:
+    raid_ceph_finding: >-
+      CRITICAL: Ceph BlueStore requires raw HBA/JBOD disk access. A hardware RAID
+      controller in RAID mode presenting single-drive RAID-0 volumes is not an
+      acceptable configuration for OSDs.
+  ansible.builtin.set_fact:
+    ceph_raid0_findings: >-
+      {{ ceph_raid0_findings + [{
+           'controller': item.name | default('Unknown Controller'),
+           'mode': item.mode,
+           'finding': raid_ceph_finding
+         }] }}
+  loop: "{{ storage_controllers }}"
+  loop_control:
+    label: "{{ item.name | default('unknown') }}"
+  when:
+    - item.mode is defined
+    - item.mode | length > 0
+    - item.mode | lower == 'raid'
+  changed_when: false
+
+# Cache health is reported rather than left silent. A RAID controller with a
+# degraded cache (typically a failed supercapacitor or flash-backup unit) is a
+# real hardware fault. It may be tolerable while the controller holds no
+# volumes, but that is a judgement for an operator, not something to omit.
+- name: Record controllers reporting degraded cache health
+  ansible.builtin.set_fact:
+    storage_controller_warnings: >-
+      {{ storage_controller_warnings | default([]) + [{
+           'controller': item.name,
+           'cache_health': item.cache_health,
+           'finding': 'Controller cache reports ' ~ item.cache_health ~
+                      ' (commonly a failed supercapacitor or flash-backup unit)'
+         }] }}
+  loop: "{{ storage_controllers }}"
+  loop_control:
+    label: "{{ item.name | default('unknown') }}"
+  when:
+    - item.cache_health is defined
+    - item.cache_health | length > 0
+    - item.cache_health not in ['OK', 'Unknown']
+  changed_when: false
+
+- name: Evaluate physical drives for Ceph OSD suitability
+  ansible.builtin.include_tasks: evaluate_drive.yml
+  loop: "{{ physical_drives }}"
+  loop_control:
+    loop_var: drive_item
+
+- name: Evaluate overall storage audit outcome
+  ansible.builtin.set_fact:
+    raid_audit_outcome: "{{ (not boot_device_confident or ceph_raid0_findings | length > 0) | ternary('partial', 'success') }}"
+  changed_when: false

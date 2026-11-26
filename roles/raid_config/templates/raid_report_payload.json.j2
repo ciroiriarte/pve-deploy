@@ -1,0 +1,51 @@
+{
+  "kind": "assessment",
+  "slug": "storage-audit-{{ parent_host }}",
+  "title": "Storage Topology & Ceph Candidate Assessment for {{ parent_host }}",
+  "element": "bmc",
+  "environment": "{{ environment_name }}",
+  "operator": "{{ ansible_user_id | default('ansible') }}",
+  "tool": "pve-deploy 01-hardware.yml",
+  "outcome": "{{ raid_audit_outcome }}",
+  "summary": "Storage topology audit on {{ parent_host }}: {{ ceph_osd_candidates | length }} candidates identified (Boot Redundancy: {{ boot_disk_redundancy }}).",
+  "targets": [
+    {
+      "host": "{{ parent_host }}",
+      "address": "{{ ansible_host }}",
+      "role": "bmc"
+    }
+  ],
+  "verification": [
+    {
+      "name": "Boot Storage Identification",
+      "command": "Redfish System Storage / Volume Inspection",
+      "expected": "Confident Boot Device Identification",
+      "actual": "Confidence: {{ boot_device_confident }} (Mode: {{ boot_disk_redundancy }})",
+      "result": "{% if boot_device_confident %}pass{% else %}warn{% endif %}"
+    },
+    {
+      "name": "Ceph Controller Mode Compliance",
+      "command": "Redfish StorageController Operational Mode",
+      "expected": "HBA / JBOD / IT-Mode",
+      "actual": "{% if ceph_raid0_findings | length > 0 %}RAID Mode with single-drive RAID-0{% else %}HBA/JBOD Mode{% endif %}",
+      "result": "{% if ceph_raid0_findings | length == 0 %}pass{% else %}fail{% endif %}"
+    }
+  ],
+  "artifacts": [
+    {
+      "path": "{{ evidence_dir }}/{{ parent_host }}-storage-{{ stamp }}.json",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "description": "Storage controllers and physical drive inventory evidence"
+    },
+    {
+      "path": "{{ reports_dir }}/{{ parent_host }}-raid-summary.md",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "description": "Human-readable Markdown storage and Ceph candidate report"
+    }
+  ],
+  "notes": [
+    "Audit mode executed with ZERO writes.",
+    "Ceph BlueStore requires direct HBA/JBOD disk access; RAID-0 candidate presentation is reported as an explicit finding.",
+    "Uncertain boot device identification causes candidates to be marked unverified for host safety."
+  ]
+}

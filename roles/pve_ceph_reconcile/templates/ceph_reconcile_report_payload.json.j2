@@ -1,0 +1,60 @@
+{
+  "kind": "change",
+  "slug": "ceph-phasecd-reconcile-{{ pve_cluster_name | default('clu') }}",
+  "title": "Ceph Phase C/D reconcile (device class, pools, CephFS) on {{ pve_cluster_name | default('the PVE cluster') }}",
+  "element": "ceph",
+  "environment": "{{ environment_name }}",
+  "operator": "{{ ansible_user_id | default('ansible') }}",
+  "tool": "pve-deploy 16-ceph.yml (ceph_reconcile)",
+  "outcome": "{{ pve_ceph_reconcile_outcome | default('failed') }}",
+  "summary": "Reconciled Ceph into its intended shape: OSDs reclassed to {{ pve_ceph_device_class }}, class-scoped CRUSH rule {{ pve_ceph_crush_rule }} (host domain), autotuning knobs, RBD pools {{ pve_ceph_pools | map(attribute='name') | join(' + ') }} (size {{ pve_ceph_pool_size }}/min_size {{ pve_ceph_pool_min_size }}), and CephFS {{ pve_ceph_fs_name }}.",
+  "targets": [
+{% for host in (groups['pve'] | default([pve_ceph_first_node])) %}
+    {
+      "host": "{{ host }}",
+      "address": "{{ hostvars[host].ansible_host | default(host) }}",
+      "role": "{{ 'ceph-mon/mgr/mds/osd' if host in pve_ceph_mon_nodes else 'ceph-osd' }}"
+    }{% if not loop.last %},{% endif %}
+{% endfor %}
+  ],
+  "changes": [
+    {
+      "host": "{{ pve_ceph_first_node }}",
+      "description": "Idempotent Ceph reconcile: device-class reclass to nvme + class-scoped rule, autotuning, production RBD pools (one uncompressed, one zstd/aggressive), MDS + CephFS bound to the class rule and exposed as PVE storage.",
+      "before": "Bootstrapped Ceph: OSDs auto-classed ssd, only the .mgr pool, no CephFS.",
+      "after": "OSDs on {{ pve_ceph_device_class }}; rule {{ pve_ceph_crush_rule }}; pools {{ pve_ceph_pools | map(attribute='name') | join(', ') }} + {{ pve_ceph_fs_name }}_data/_metadata; CephFS {{ pve_ceph_fs_name }} content {{ pve_ceph_fs_content }}.",
+      "commands": [
+        "ceph osd crush rm-device-class osd.N && ceph osd crush set-device-class {{ pve_ceph_device_class }} osd.N   # per OSD not yet classed",
+        "ceph osd crush rule create-replicated {{ pve_ceph_crush_rule }} default {{ pve_ceph_crush_failure_domain }} {{ pve_ceph_device_class }}",
+        "ceph config set osd osd_memory_target_autotune {{ pve_ceph_osd_memory_target_autotune | string | lower }}",
+        "ceph config set osd osd_memory_target {{ pve_ceph_osd_memory_target }}",
+        "ceph balancer mode {{ pve_ceph_balancer_mode }} && ceph balancer on",
+        "ceph config set global osd_pool_default_pg_autoscale_mode {{ pve_ceph_pg_autoscale_default }}",
+        "pveceph pool create <name> --size {{ pve_ceph_pool_size }} --min_size {{ pve_ceph_pool_min_size }} --application rbd --crush_rule {{ pve_ceph_crush_rule }} --pg_autoscale_mode on --add_storages 1",
+        "ceph osd pool set nvme-compressed compression_algorithm zstd && ceph osd pool set nvme-compressed compression_mode aggressive",
+        "pveceph mds create   # first three nodes",
+        "pveceph fs create --name {{ pve_ceph_fs_name }} --add-storage 1",
+        "ceph osd pool set {{ pve_ceph_fs_name }}_data crush_rule {{ pve_ceph_crush_rule }} && ceph osd pool set {{ pve_ceph_fs_name }}_metadata crush_rule {{ pve_ceph_crush_rule }}",
+        "pvesm set {{ pve_ceph_fs_name }} --content {{ pve_ceph_fs_content }}"
+      ]
+    }
+  ],
+  "verification": [
+{% for item in pve_ceph_reconcile_verification | default([]) %}
+    {
+      "name": {{ item.name | to_json }},
+      "command": {{ item.command | to_json }},
+      "expected": {{ item.expected | to_json }},
+      "actual": {{ item.actual | to_json }},
+      "result": {{ item.result | to_json }}
+    }{% if not loop.last %},{% endif %}
+{% endfor %}
+  ],
+  "notes": [
+    "Every task guards with a read-before-write check (ceph osd pool ls / crush rule ls / fs ls / config get), so the role is safe to re-run.",
+    "The .mgr pool intentionally stays on the class-less default rule; only production data pools are bound to the class-scoped rule.",
+    "Autotuning config scopes (osd for the memory knobs, global for pg autoscale) follow the hand-run Phase C/D script; the prose change report mentioned mgr/mon scopes, but the script is authoritative.",
+    "EC pools are NOT created here; erasure-coded tiers are evaluated only by pve_ceph_benchmark.",
+    "Verification JSON field names should be confirmed against a live cluster."
+  ]
+}

@@ -1,0 +1,40 @@
+# Managed by Ansible role pve_repos - Ciro Iriarte OBS tools repositories
+#
+# downloadcontent.opensuse.org, NOT download.opensuse.org.
+#
+# The usual host runs MirrorBrain and redirects each request to a nearby mirror.
+# That is normally a feature and here it is a hard failure: it redirected these
+# nodes to opensuse.mirror.liquidtelecom.com, which publishes AAAA records only
+# and has no IPv4 address at all. PVE management has no routed IPv6, so the
+# fetch cannot complete -- and Acquire::ForceIPv4 does not help, because there
+# is no IPv4 address to force it onto.
+#
+# The failure is also misleading: download.opensuse.org itself resolves and
+# answers over IPv4, so the host looks reachable while every package fetch from
+# it fails with "Unable to connect" naming a mirror nobody configured.
+#
+# downloadcontent.opensuse.org is the canonical origin and serves content
+# directly, without mirror redirection. Verified from a node: HTTP 200 for
+# pve-cli_0.13.0-1_amd64.deb where the redirecting host failed.
+#
+# The trade is real -- every node fetches from Nuremberg instead of a nearby
+# mirror -- and is accepted because these are three small packages, and because
+# a mirror set that can hand out IPv6-only hosts is not usable here at all.
+{% set obs_host = obs_repo_host | default('downloadcontent.opensuse.org') %}
+Types: deb
+URIs: https://{{ obs_host }}/repositories/home:/ciriarte:/pve-cli/Debian_13/
+Suites: /
+Signed-By: /etc/apt/keyrings/obs-home-ciriarte-pve-cli.asc
+Enabled: yes
+
+Types: deb
+URIs: https://{{ obs_host }}/repositories/home:/ciriarte:/pve-tools/Debian_13/
+Suites: /
+Signed-By: /etc/apt/keyrings/obs-home-ciriarte-pve-tools.asc
+Enabled: yes
+
+Types: deb
+URIs: https://{{ obs_host }}/repositories/home:/ciriarte:/network-tools/Debian_13/
+Suites: /
+Signed-By: /etc/apt/keyrings/obs-home-ciriarte-network-tools.asc
+Enabled: yes

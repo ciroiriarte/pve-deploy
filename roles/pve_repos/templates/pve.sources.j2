@@ -1,0 +1,7 @@
+# Managed by Ansible role pve_repos
+Types: deb
+URIs: {{ 'https://enterprise.proxmox.com/debian/pve' if (pve_subscription_key | default('', true) | length > 0) else 'http://download.proxmox.com/debian/pve' }}
+Suites: {{ pve_apt_suite }}
+Components: {{ 'pve-enterprise' if (pve_subscription_key | default('', true) | length > 0) else 'pve-no-subscription' }}
+Signed-By: {{ pve_keyring_path }}
+Enabled: yes

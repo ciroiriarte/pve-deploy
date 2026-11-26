@@ -1,0 +1,51 @@
+---
+# Apply path for bmc_config. Reached only when the caller has cleared the
+# Phase 01 apply gate (hardware_apply=true plus a site-named confirmation).
+#
+# The gate is implemented; this, the thing behind it, is not yet.
+#
+# It fails rather than warning on purpose, matching bios_config and raid_config:
+# an operator who deliberately asked to converge the BMC must not walk away from
+# a green run believing it happened.
+#
+# Implementing this means, per the Tier A lifecycle in README.md:
+#   1. Consume bmc_config_drift_items from audit_bmc.yml — the diff is already
+#      computed by the time execution reaches here, so do not re-read.
+#   2. PATCH only the drifted properties:
+#        NTP and protocol posture -> /redfish/v1/Managers/1/NetworkProtocol
+#        DNS (StaticNameServers)  -> the relevant Managers/1/EthernetInterfaces
+#        account policy           -> /redfish/v1/AccountService
+#   3. Re-read and verify each property, then re-render the report as a change
+#      report rather than an assessment.
+#
+# THREE THINGS THAT MAKE THIS DIFFERENT FROM BIOS
+#
+# Most of it needs no reboot. NTP, DNS and account policy take effect
+# immediately, so this should NOT inherit the single-reboot pattern wholesale —
+# only the properties that genuinely require a BMC restart should trigger one,
+# and a BMC restart is not a host reboot.
+#
+# Some of it can sever the connection running the play. Disabling a protocol,
+# changing BMC network settings, or tightening account policy can lock out the
+# session mid-run. Order matters: apply the changes that cannot cut the
+# connection first, and treat anything touching the BMC's own network
+# configuration as needing its own opt-in beyond the phase gate.
+#
+# Account mutation stays out of scope. This role reports on accounts and must
+# not create, delete or re-password them: locking yourself out of a BMC is
+# unrecoverable without physical access. Credential lifecycle deserves its own
+# role and its own confirmation.
+#
+# Not covered here at all, because they are OEM rather than standard Redfish and
+# belong behind the vendor driver seam: remote syslog, SMTP alert destinations,
+# SNMP trap targets, and Lenovo-specific security policy.
+
+- name: Fail because BMC configuration apply mode is not implemented yet
+  ansible.builtin.fail:
+    msg: >-
+      bmc_config was invoked in apply mode, but its apply path is not
+      implemented. {{ bmc_config_drift_count | default(0) }} drifted and
+      {{ bmc_config_absent_count | default(0) }} absent setting(s) were detected
+      on {{ parent_host | default(inventory_hostname) }} and NOTHING has been
+      changed. Re-run without hardware_apply to produce the assessment report,
+      and converge the BMC by hand until this path is built.

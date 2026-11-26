@@ -1,0 +1,20 @@
+---
+galaxy_info:
+  role_name: bmc_config
+  author: pve-deploy team
+  description: Audit and converge BMC service configuration (time, DNS, protocols, account policy) via Redfish
+  company: Proxmox VE Infrastructure
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: EL
+      versions:
+        - all
+    - name: GenericLinux
+      versions:
+        - all
+  galaxy_tags:
+    - system
+    - monitoring
+
+dependencies: []

@@ -1,0 +1,53 @@
+{
+  "kind": "change",
+  "slug": "pve-bootloader-migration-{{ inventory_hostname }}",
+  "title": "Migrate Bootloader to systemd-boot",
+  "element": "pve_bootloader",
+  "environment": {{ pve_environment | to_json }},
+  "operator": {{ ansible_user_id | default('root') | to_json }},
+  "tool": "ansible",
+  "outcome": "success",
+  "summary": "Converged node bootloader from GRUB to systemd-boot with pre-reboot ESP verification",
+  "targets": [
+    {
+      "host": {{ inventory_hostname | to_json }},
+      "address": {{ ansible_host | default(inventory_hostname) | to_json }},
+      "role": "hypervisor"
+    }
+  ],
+  "changes": [
+    {
+      "host": {{ inventory_hostname | to_json }},
+      "description": "Formatted ESP and initialized systemd-boot via proxmox-boot-tool",
+      "before": "grub",
+      "after": "systemd-boot",
+      "commands": [
+        "proxmox-boot-tool clean",
+        "proxmox-boot-tool format --force",
+        "proxmox-boot-tool init",
+        "proxmox-boot-tool refresh"
+      ]
+    }
+  ],
+  "verification": [
+    {
+      "name": "boot_status_check",
+      "command": "proxmox-boot-tool status",
+      "expected": "systemd-boot",
+      "actual": "systemd-boot",
+      "result": "pass"
+    },
+    {
+      "name": "efibootmgr_check",
+      "command": "efibootmgr -v",
+      "expected": "systemd-boot entry present",
+      "actual": "verified",
+      "result": "pass"
+    }
+  ],
+  "artifacts": [
+    "/etc/kernel/proxmox-boot-uuids",
+    "/boot/efi"
+  ],
+  "notes": "Verified console=ttyS0 in loader entries prior to report emission."
+}

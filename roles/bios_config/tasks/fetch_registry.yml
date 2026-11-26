@@ -1,0 +1,105 @@
+---
+# Fetches the BIOS attribute registry, which is the firmware's own statement of
+# what exists, what is settable, and what values are legal.
+#
+# The registry is resolved dynamically rather than hardcoded. Its name is
+# firmware-specific -- this fleet reports BiosAttributeRegistry.1.0.0 -- and a
+# BIOS or XCC upgrade can change both the version and the attribute set inside
+# it. Pinning the path would quietly validate against the wrong contract.
+
+- name: Initialize registry state
+  ansible.builtin.set_fact:
+    bios_registry: {}
+    bios_registry_name: ""
+    bios_registry_available: false
+  changed_when: false
+
+- name: Read the registry name the BIOS resource declares
+  ansible.builtin.uri:
+    url: "https://{{ ansible_host }}/redfish/v1/Systems/1/Bios"
+    method: GET
+    user: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_validate_certs }}"
+    timeout: "{{ bmc_timeout }}"
+    status_code: [200, 404]
+  register: bios_resource
+  no_log: true
+  failed_when: false
+  changed_when: false
+
+- name: Record the declared registry name
+  ansible.builtin.set_fact:
+    bios_registry_name: "{{ (bios_resource.json | default({})).AttributeRegistry | default('') }}"
+  changed_when: false
+
+- name: Resolve and load the registry
+  when: bios_registry_name | length > 0
+  block:
+    - name: Look up where the registry document lives
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}/redfish/v1/Registries/{{ bios_registry_name }}"
+        method: GET
+        user: "{{ bmc_username }}"
+        password: "{{ bmc_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ bmc_validate_certs }}"
+        timeout: "{{ bmc_timeout }}"
+        status_code: [200, 404]
+      register: bios_registry_pointer
+      no_log: true
+      failed_when: false
+      changed_when: false
+
+    - name: Fetch the registry document
+      ansible.builtin.uri:
+        url: >-
+          https://{{ ansible_host }}{{ ((bios_registry_pointer.json | default({})).Location | default([{}]) | first).Uri | default('') }}
+        method: GET
+        user: "{{ bmc_username }}"
+        password: "{{ bmc_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ bmc_validate_certs }}"
+        # The document is ~350KB on this firmware, so it needs longer than a
+        # property read.
+        timeout: "{{ bios_registry_timeout | default(120) }}"
+        status_code: [200, 404]
+      register: bios_registry_doc
+      no_log: true
+      failed_when: false
+      changed_when: false
+      when: >-
+        ((bios_registry_pointer.json | default({})).Location | default([{}]) | first).Uri | default('') | length > 0
+
+    # Reduced to just what validation needs, keyed by attribute name. Carrying
+    # the whole 350KB document through every later task is wasteful, and the
+    # useful part is four fields per attribute.
+    - name: Index the registry by attribute name
+      ansible.builtin.set_fact:
+        bios_registry: >-
+          {%- set out = {} -%}
+          {%- for a in ((bios_registry_doc.json | default({})).RegistryEntries | default({})).Attributes | default([]) -%}
+          {%-   set _ = out.update({a.AttributeName: {
+                  'read_only': a.ReadOnly | default(false),
+                  'type': a.Type | default(''),
+                  'allowed': (a.Value | default([]) | map(attribute='ValueName') | list),
+                  'lower': a.LowerBound | default(none),
+                  'upper': a.UpperBound | default(none)
+                }}) -%}
+          {%- endfor -%}
+          {{ out }}
+        bios_registry_available: true
+      changed_when: false
+      when: bios_registry_doc.status | default(0) == 200
+
+- name: Report whether the registry could be loaded
+  ansible.builtin.debug:
+    msg: >-
+      {{ bios_registry_available
+         | ternary('BIOS registry ' ~ bios_registry_name ~ ' loaded: '
+                   ~ (bios_registry | length) ~ ' attributes indexed',
+                   'BIOS registry unavailable on ' ~ (parent_host | default(inventory_hostname))
+                   ~ '; baseline values cannot be validated against the firmware and will be '
+                   ~ 'compared as-is') }}
+  changed_when: false

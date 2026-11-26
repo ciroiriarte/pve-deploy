@@ -1,0 +1,379 @@
+---
+# Default variables for os_install role
+
+# ---------------------------------------------------------------------------
+# BMC connection
+# ---------------------------------------------------------------------------
+#
+# Repeated here rather than borrowed from bmc_config: role defaults do not cross
+# role boundaries, so a play that runs os_install without bmc_config would have
+# found these undefined. Same values, same reasoning as that role -- and
+# bmc_password is deliberately absent, because an empty default would satisfy an
+# "is defined" check and turn a missing vault into an auth failure against every
+# BMC in the run.
+bmc_username: "USERID"
+bmc_validate_certs: false
+bmc_timeout: 30
+
+# ---------------------------------------------------------------------------
+# Where the installer gets its answer file
+# ---------------------------------------------------------------------------
+#
+#   iso  - the answer is embedded in a per-host ISO. The installer needs NO
+#          network at all to read it.
+#   http - the installer POSTs its system information to a URL and receives the
+#          answer back. One generic ISO serves a whole fleet, and answers are
+#          data you can edit without rebuilding an image.
+#
+# DEFAULT IS `iso`, BECAUSE `http` NEEDS A WORKING NETWORK BEFORE THE OS EXISTS.
+#
+# The Proxmox answer file describes exactly one interface. It has no concept of
+# a bond or a VLAN tag -- the whole [network] section is source, cidr, dns,
+# gateway and an optional NIC filter. So during installation the machine can
+# only speak untagged, on a single link.
+#
+# On the reference site every server port is an LACP member carrying tagged VLANs
+# (pve_management_bond: bond0 over the ConnectX-6 OCP ports to the ToR switch).
+# A lone interface that does not negotiate LACP will not pass traffic through
+# such a port, and untagged frames would not reach the management VLAN even if
+# it did. There is therefore no moment during installation at which the
+# installer could fetch anything over the network, and `http` cannot work here.
+#
+# `http` is kept because it is the better model wherever the install-time port
+# is a plain access port: no per-host image to build, publish or keep in sync.
+# Choose it per environment, not per preference.
+os_install_answer_source: iso
+
+# Only used when os_install_answer_source == 'http'.
+os_install_answer_url: ""
+# Form is "<name>:<secret>". The installer sends it as
+# `Authorization: Bearer <name>:<secret>`.
+#
+# Proxmox documents that this token is stored in PLAINTEXT inside the prepared
+# ISO. It authenticates "something booted our image", not "this host is
+# trusted". Treat the ISO as carrying a credential.
+os_install_answer_auth_token: ""
+# SHA256 fingerprint pinning, for an HTTPS answer server whose certificate the
+# installer would not otherwise trust.
+os_install_answer_cert_fingerprint: ""
+
+# ---------------------------------------------------------------------------
+# Network configuration for the installed system
+# ---------------------------------------------------------------------------
+#
+# `from-answer` on purpose: every value is stated explicitly.
+#
+# `from-dhcp` is deliberately NOT the default and is not used on the reference site, which has
+# no DHCP on PVE Management. Beyond availability, a DHCP-derived install is not
+# reproducible -- the address a node receives depends on lease state at the
+# moment it booted, so two runs of the same playbook can produce two different
+# machines. Explicit values make the install a function of the inventory.
+os_install_network_source: from-answer
+
+# Per-host, from inventory. No defaults: a wrong address here installs a node
+# that either cannot be reached or collides with something that can.
+os_install_cidr: ""
+os_install_gateway: ""
+os_install_dns: ""
+
+# UDEV filter selecting the install-time NIC, e.g.
+#   {"ID_NET_NAME": "ens13f0np0"}   or   {"ID_NET_NAME_MAC": "*1e05bc"}
+#
+# REQUIRED whenever os_install_network_source is from-answer. It does NOT
+# default to "whatever link is up" -- that was an assumption in an earlier
+# version of this file and it was wrong. The installer aborts with
+# "ERROR: Installation failed: no filter defined" and writes nothing.
+#
+# The abort happens at the network step, which runs BEFORE disk setup, so the
+# symptom is an installer that boots, reads the answer, prints one error and
+# stops. From outside it is indistinguishable from a hang: no disk activity, no
+# network, and roughly 160 MB of ISO read (kernel plus initrd) before silence.
+#
+# Discover the available properties on the target with:
+#   proxmox-auto-install-assistant device-info --type network
+os_install_nic_filter: {}
+
+# Pin interface names by MAC so the installed system's NIC names are stable and
+# match what 11-network expects, rather than depending on enumeration order.
+os_install_nic_pinning_enabled: false
+os_install_nic_pinning_map: {}
+
+# ---------------------------------------------------------------------------
+# Identity and access
+# ---------------------------------------------------------------------------
+os_install_fqdn: ""
+os_install_keyboard: "en-us"
+os_install_country: ""
+os_install_timezone: ""
+os_install_mailto: ""
+
+# Public keys authorised for root on the installed system.
+#
+# Set this per environment. Without at least one key, or a root password, the
+# installed node is unreachable and needs console access to recover.
+os_install_root_ssh_keys: []
+
+# Install-time root password.
+#
+# Treat it as ephemeral. It is written into the answer file, and where the
+# answer travels inside an ISO served over HTTP, anyone who can fetch the image
+# can read it. Phase 10 should rotate it before the node is considered ready;
+# what leaks is then a credential already scheduled for replacement.
+os_install_root_password: ""
+
+# ---------------------------------------------------------------------------
+# Disk layout
+# ---------------------------------------------------------------------------
+#
+# Selecting by filter rather than by device name: sda is an enumeration
+# accident, and installing to the wrong disk is the failure this role must not
+# have. On the reference SR655 V3 nodes the boot mirror is the M.2 B540i-2i virtual
+# disk, which reports ID_MODEL=RAID_B540i-2i and is therefore distinguishable
+# from the 940-8i data drives without naming a serial per host.
+os_install_filesystem: "zfs"
+os_install_zfs_raid: "raid1"
+os_install_disk_filter: {}
+os_install_disk_list: []
+
+# How many devices the selection above is expected to match on the target.
+#
+# Only consulted for topologies needing more than one device, where it is the
+# difference between a named pre-flight failure and an installer sitting at an
+# error screen. It has to be stated rather than discovered: a filter's match
+# count is only knowable on the target, and this fleet's BMCs report zero
+# Volumes over Redfish even where a RAID volume plainly exists, so it cannot be
+# counted out-of-band either.
+#
+# A HARDWARE RAID VOLUME IS ONE DEVICE, however many drives back it. That is the
+# mistake this exists to catch.
+os_install_expected_disk_count: 0
+
+# ---------------------------------------------------------------------------
+# ISO build and publication
+# ---------------------------------------------------------------------------
+#
+# The assistant must match the ISO it prepares: a 8.x assistant is not the right
+# tool for a 9.2 image.
+os_install_source_iso: ""
+os_install_build_host: ""
+
+# Directory on the build host holding both the source ISO and the per-host
+# images built from it. This is the directory the web server publishes, so a
+# built image is reachable the moment it exists -- no copy step in between, and
+# nothing to go stale.
+os_install_iso_dir: "/srv/iso"
+
+# Where the rendered answer file and first-boot hook are staged before being
+# baked in. Deliberately NOT under os_install_iso_dir: the answer contains the
+# install-time root password in cleartext, and publishing that alongside the
+# image would hand it to anyone who can reach the web server.
+os_install_work_dir: "/root/pve-deploy-build"
+
+# Base URL under which os_install_iso_dir is served, with a trailing slash. The
+# BMC fetches the image from here, so it must be resolvable and routable FROM
+# THE BMC, not from the control node.
+os_install_publish_to: ""
+
+# ---------------------------------------------------------------------------
+# Media attachment
+# ---------------------------------------------------------------------------
+#
+# Which backend attaches the image to the machine. Split out because the
+# mechanism is the one genuinely vendor-specific part of this role: everything
+# else here is either DMTF-standard Redfish or the Proxmox installer.
+#
+#   lenovo_xcc - Lenovo XClarity Controller OEM RemoteMap service.
+#
+# XCC does NOT implement the standard VirtualMedia.InsertMedia action. All ten
+# of its virtual-media slots (EXT1-4, Remote1-4, RDOC1-2) report `Actions: []`
+# on firmware KAX368P 6.20. Mounting goes through
+# /redfish/v1/Managers/1/Oem/Lenovo/RemoteMap instead, and is a two-step
+# operation: register the image in the MountImages collection, then call
+# LenovoRemoteMapService.Mount -- which takes no parameters and mounts whatever
+# is registered.
+#
+# When a second vendor is added, `virtual_media` (the standard InsertMedia path)
+# is the backend to write, and it will be the simpler of the two.
+os_install_media_backend: "lenovo_xcc"
+
+# Transport the BMC uses to read the image. XCC's LenovoRemoteMapMedia schema
+# advertises: Samba, NFS, Local, HTTP, HTTPS, SFTP, FTP.
+#
+# HTTP is used here rather than HTTPS because the ISO host has no certificate
+# the BMCs would trust. The image is a public installer plus a per-host answer
+# file, and the answer file is why this is not simply harmless -- see
+# os_install_root_password.
+os_install_media_protocol: "HTTP"
+
+# The BMC reads the image SPARSELY, not sequentially: a mount on this hardware
+# produced 17 ranged requests totalling ~0.5 MB against a 1.6 GB image, because
+# it parses ISO structures on attach. HTTP 206 support in the publishing server
+# is therefore a hard requirement -- a server that ignored Range headers would
+# appear to mount correctly and then stall the install.
+
+# ---------------------------------------------------------------------------
+# Boot override and power
+# ---------------------------------------------------------------------------
+#
+# `Once` rather than `Continuous`, deliberately. A one-shot override is consumed
+# by the boot it causes, so the reboot at the end of installation goes to the
+# freshly written disk on its own. With `Continuous`, a node whose install
+# succeeded would boot straight back into the installer and wipe itself again --
+# turning one good install into a loop.
+os_install_boot_target: "Cd"
+os_install_boot_override: "Once"
+# This fleet reports BootSourceOverrideMode: UEFI. Forcing Legacy on a system
+# installed in UEFI mode produces a machine that boots to nothing.
+os_install_boot_mode: "UEFI"
+
+# ForceRestart when already powered on, On when off. XCC's ResetActionInfo
+# allows On, Nmi, GracefulShutdown, GracefulRestart, ForceOn, ForceOff and
+# ForceRestart -- there is no PowerCycle, so it is not offered here.
+#
+# Graceful is not the default: the machine being reinstalled is either bare or
+# holds an OS about to be destroyed, so there is nothing to shut down cleanly,
+# and a graceful request that no OS answers just stalls until it times out.
+os_install_reset_type: "ForceRestart"
+
+# ---------------------------------------------------------------------------
+# Completion detection
+# ---------------------------------------------------------------------------
+#
+# ssh: poll the management address until it answers.
+#
+# The obvious alternative -- the answer file's [post-installation-webhook] --
+# cannot work here, and for exactly the reason `--fetch-from http` cannot: the
+# webhook is sent by the INSTALLER, over the same single untagged link facing an
+# LACP port that will not pass its traffic. It would silently never arrive.
+#
+# So on the reference site the first moment the node can be observed is after the first-boot
+# hook has laid down the bond and VLAN and the system has finished booting.
+# That makes SSH the only usable signal, and it is a strong one: it means the
+# disk was written, the bootloader works, the hook ran, and the network came up.
+#
+# Environments installing over a plain access port should prefer the webhook --
+# it reports completion of the install itself rather than of everything after
+# it, so it distinguishes "install failed" from "install worked, network did
+# not".
+os_install_completion_check: "ssh"
+os_install_mgmt_ip: "{{ os_install_cidr | regex_replace('/.*$', '') }}"
+os_install_mgmt_port: 22
+
+# Generous on purpose. A ZFS mirror install on this hardware takes minutes, but
+# the timer also covers POST on a two-socket machine with a lot of memory to
+# train, which is itself several minutes before the installer is even reached.
+# Too short a timeout aborts a healthy install and reports it as a failure.
+os_install_wait_timeout: 3600
+os_install_wait_delay: 120
+os_install_wait_interval: 30
+
+# ---------------------------------------------------------------------------
+# The destructive gate
+# ---------------------------------------------------------------------------
+#
+# Everything up to and including the boot override is reversible. This flag is
+# what commits to the power cycle, and it defaults to a dry run so the whole
+# chain can be exercised against a live node without consequence.
+os_install_dry_run: true
+
+# The way back out of a dry run, which deliberately leaves the image attached
+# and the override set. Set true to detach and clear, doing nothing else.
+os_install_cleanup_only: false
+
+# Install result, initialised here rather than only on the success path.
+# cleanup_media reads it to decide whether detaching is safe, and it runs from
+# an `always` block -- so it can be reached before anything has set it.
+os_install_outcome: "not-started"
+
+# True from the instant a power cycle is ATTEMPTED, and the single input to
+# cleanup_media's decision not to pull media out of a running installer.
+#
+# It must be initialised here, and it must be set before the reset rather than
+# after. Both matter: cleanup runs from an `always` block and can therefore be
+# reached at any point, including one where the reset fired and the very next
+# task failed.
+os_install_committed: false
+
+# Optional first-boot hook.
+#
+# Relevant on the reference site specifically: because the answer file cannot express a bond
+# or a VLAN, a node installed here comes up with a single untagged interface and
+# no path to the management VLAN. A first-boot script is the supported way to
+# lay down the real topology so the node is reachable before 11-network runs.
+os_install_first_boot_enabled: false
+os_install_first_boot_source: "from-iso"
+os_install_first_boot_ordering: "before-network"
+os_install_first_boot_file: ""
+
+# What the first-boot hook configures.
+#
+# Management reachability only: the bond and the one VLAN that carries it. The
+# rest of the topology -- remaining bonds, SDN underlay, Ceph networks, bridges,
+# MTU policy -- belongs to 11-network, which is the authority on it. A second
+# definition here would be the copy nobody remembers to update.
+os_install_first_boot_bond: ""
+os_install_first_boot_vlan: ""
+os_install_first_boot_slaves: []
+
+# The bond carries jumbo frames while the management VLAN on top of it does not,
+# which is why these are separate rather than one value.
+os_install_first_boot_bond_mtu: 9216
+os_install_first_boot_vlan_mtu: 1500
+
+# ---------------------------------------------------------------------------
+# Serial console
+# ---------------------------------------------------------------------------
+#
+# DELIBERATE DUPLICATION, kept as a safety net. Read this before "simplifying".
+#
+# pve_baseline (phase 10) is the AUTHORITY on the installed kernel command line:
+# it writes /etc/kernel/cmdline wholesale from pve_kernel_cmdline_default, which
+# already carries console=tty0 console=ttyS0,115200n8. Nothing here overrides
+# that, and it should not try to.
+#
+# What this covers is the window phase 10 cannot: the interval between a node
+# being installed and phase 10 having run on it. A stock Proxmox install has no
+# serial console at all -- no console= on the kernel command line, so no getty --
+# so a node that comes up with a broken network in that window has no way in
+# except the BMC's graphical console. Since phase 11 rewrites the network, and a
+# mistake there removes the only remaining path, the gap is worth closing early.
+#
+# The hook checks for an existing console= before touching anything, so once
+# phase 10 has run the two agree and this becomes a no-op.
+os_install_serial_console_enabled: true
+
+# Empty means autodetect from /proc/tty/driver/serial, taking the first port
+# backed by real hardware.
+#
+# Left empty deliberately rather than defaulted to ttyS0: which UART is wired to
+# the BMC is a property of the server model, and a hardcoded default would be
+# silently wrong on the first machine that differs -- producing a node that
+# looks configured and has no console. Pin it here only for a model where the
+# autodetection picks the wrong port.
+os_install_serial_device: ""
+os_install_serial_speed: 115200
+
+# Give the INSTALLER a serial console too, not just the installed system.
+#
+# Separate setting because it solves a separate problem. The first-boot hook
+# helps only once an install has succeeded; this is what makes a FAILING install
+# visible. A stock ISO boots with no console=, so Linux writes nothing to the
+# serial port and an auto-install that stops on a bad answer file reports
+# absolutely nothing over SoL -- the error sits on a screen reachable only
+# through the BMC's graphical console. That cost a full day of diagnosis once.
+#
+# Note the serial device here is the INSTALLER's view of the hardware, which is
+# why it reuses os_install_serial_device: the port is a property of the machine,
+# not of the operating system looking at it. Autodetection is not possible at
+# this point -- nothing is running on the target yet -- so an empty value falls
+# back to ttyS0, the near-universal first UART.
+os_install_iso_serial_console: true
+
+# Derived image name. Kept alongside the stock ISO rather than replacing it, so
+# the original stays available for comparison and for re-deriving after an
+# upstream refresh.
+os_install_serial_iso: "{{ os_install_source_iso | regex_replace('\\.iso$', '') }}-serial.iso"
+
+# Hosts (parent_host names) that must never be installed, in addition to the
+# pbs group: e.g. database or appliance servers whose BMCs share the bmc group.
+os_install_protected_hosts: []

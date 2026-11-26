@@ -1,0 +1,30 @@
+---
+# A joining node must hold no guests.
+#
+# `man pvecm`: "a joining node cannot hold any guests, since guest IDs could
+# otherwise conflict, and the node will inherit the cluster's storage
+# configuration." pvecm itself refuses, but failing here means failing before
+# anything has been touched, with a message that says what to do about it.
+
+- name: Count guests on this node
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      printf '%s' "$(( $(qm list 2>/dev/null | tail -n +2 | wc -l) \
+                     + $(pct list 2>/dev/null | tail -n +2 | wc -l) ))"
+    executable: /bin/bash
+  register: pve_cluster_guest_count
+  changed_when: false
+  check_mode: false
+
+- name: Refuse to join a node that holds guests
+  ansible.builtin.assert:
+    that:
+      - pve_cluster_guest_count.stdout | int == 0
+    fail_msg: >-
+      {{ inventory_hostname }} holds {{ pve_cluster_guest_count.stdout }} guest(s).
+      Joining a cluster overwrites /etc/pve entirely, so those guest
+      configurations would be lost and their IDs could collide with the
+      cluster's. Back them up and remove them, or join a different node.
+    quiet: true
+  changed_when: false

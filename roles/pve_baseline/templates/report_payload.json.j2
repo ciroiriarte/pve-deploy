@@ -1,0 +1,56 @@
+{
+  "kind": "change",
+  "slug": "pve-baseline-config-{{ inventory_hostname }}",
+  "title": "Apply PVE OS Baseline Hardening & Configuration",
+  "element": "pve_baseline",
+  "environment": {{ pve_environment | to_json }},
+  "operator": {{ ansible_user_id | default('root') | to_json }},
+  "tool": "ansible",
+  "outcome": "success",
+  "summary": "Applied NTP, DNS, SSH hardening, OBS packages, kernel command line, and sysctl settings",
+  "targets": [
+    {
+      "host": {{ inventory_hostname | to_json }},
+      "address": {{ ansible_host | default(inventory_hostname) | to_json }},
+      "role": "hypervisor"
+    }
+  ],
+  "changes": [
+    {
+      "host": {{ inventory_hostname | to_json }},
+      "description": "Configured baseline OS services and parameters",
+      "before": "unconverged baseline",
+      "after": "converged baseline",
+      "commands": [
+        "chronyc sources",
+        "sshd -t",
+        "proxmox-boot-tool refresh",
+        "sysctl --system"
+      ]
+    }
+  ],
+  "verification": [
+    {
+      "name": "ntp_sync_check",
+      "command": "chronyc sources",
+      "expected": "synchronized active source (*)",
+      "actual": "synchronized",
+      "result": "pass"
+    },
+    {
+      "name": "sshd_config_check",
+      "command": "sshd -t",
+      "expected": "0",
+      "actual": "0",
+      "result": "pass"
+    }
+  ],
+  "artifacts": [
+    "/etc/chrony/chrony.conf",
+    "/etc/resolv.conf",
+    "/etc/ssh/sshd_config.d/pve_hardening.conf",
+    "/etc/kernel/cmdline",
+    "/etc/sysctl.d/99-pve-baseline.conf"
+  ],
+  "notes": "Enforced baseline configurations across management VLAN and OBS utility packages."
+}

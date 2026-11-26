@@ -1,0 +1,12 @@
+[Unit]
+Description=Disable rp_filter on all interfaces (EVPN symmetric-IRB / asymmetric routing)
+After=network-online.target frr.service pve-firewall.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'sysctl -w net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1; for f in /proc/sys/net/ipv4/conf/*/rp_filter; do echo 0 > "$f" 2>/dev/null || true; done'
+
+[Install]
+WantedBy=multi-user.target

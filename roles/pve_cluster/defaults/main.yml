@@ -1,0 +1,97 @@
+---
+# Default variables for pve_cluster role
+
+# Apply gate. Creating a cluster is not reversible in any useful sense: joining
+# a node overwrites its /etc/pve wholesale, and unpicking a cluster means
+# delnode plus a rebuild of the node that left. Default off, like pve_network.
+pve_cluster_apply: false
+
+# Second key, and deliberately not a boolean -- same reasoning as the phase 01
+# and phase 02 gates. Must name the site, so an inherited -e or a stale CI
+# variable cannot form a cluster by accident.
+pve_cluster_confirm: ""
+
+pve_cluster_name: "pve-cluster"
+
+# ---------------------------------------------------------------------------
+# Corosync links
+# ---------------------------------------------------------------------------
+#
+# THE POINT OF THIS ROLE. Corosync must NOT run on the management network.
+#
+# pvecm defaults link0 to the address the node's hostname resolves to, which
+# here is the management VLAN -- so an unqualified `pvecm create` silently puts
+# cluster messaging on the same subnet as SSH, the web UI and everything else an
+# operator does. Corosync is latency-sensitive to the point where losing it
+# costs quorum, and in an HA cluster lost quorum means fencing: running guests
+# rebooted. It gets its own network, named here by inventory key.
+pve_cluster_link0_network: "pve_corosync"
+
+# Optional second ring. Empty means single link.
+#
+# Worth understanding before setting it: a second link only buys redundancy if
+# it lands on DIFFERENT physical NICs. On this layout pve_management and
+# pve_corosync are both VLANs on bond0, so a link1 on management protects
+# against nothing -- bond0 failing takes both. A genuinely redundant ring needs
+# a network on bond1/2/3.
+pve_cluster_link1_network: ""
+
+# Link priorities, used only when a second link exists. Higher wins under the
+# `passive` link_mode knet uses by default.
+pve_cluster_link0_priority: 20
+pve_cluster_link1_priority: 10
+
+# ---------------------------------------------------------------------------
+# Corosync QoS marking
+# ---------------------------------------------------------------------------
+#
+# Corosync supports DSCP natively: ip_dscp in the totem directive, set via the
+# IP_TOS socket option. No iptables or tc shim is needed.
+#
+# cs6 is RFC 4594's "Network Control" class. It is the right class for traffic
+# whose loss costs quorum, and it does not collide with ef, which is reserved
+# for voice in most enterprise markings.
+#
+# THIS ONLY HELPS IF THE SWITCH TRUSTS IT. Marking is free; honouring it is a
+# switch-side configuration (`config switch qos ip-dscp-map` plus
+# `set trust-ip-dscp-map` on the trunk). Marked-but-untrusted traffic is
+# marked traffic in the same queue as everything else. Set the switch side, or
+# know that this line is aspirational.
+#
+# Empty disables marking and leaves the field to the transport's default.
+pve_cluster_corosync_dscp: "cs6"
+
+# ---------------------------------------------------------------------------
+# Live migration
+# ---------------------------------------------------------------------------
+#
+# Also NOT management. A migration moves guest memory at line rate; pointing it
+# at the management VLAN puts multi-gigabyte transfers alongside the API, the
+# web UI and -- on this layout, since both are VLANs on bond0 -- corosync.
+#
+# PVE takes a CIDR here, not an interface: it selects the local address within
+# that subnet. Resolved from the inventory network key so the planning sheet
+# stays the source.
+pve_cluster_migration_network: "pve_live_migration"
+
+# secure (SSH-tunnelled) or insecure (plain TCP).
+#
+# `secure` is the PVE default and is kept. `insecure` is materially faster
+# because it skips SSH encryption, and is only defensible on a physically
+# isolated migration segment. VLAN 2003 here is dedicated but not isolated --
+# it shares bond0 with management -- so the faster option is not the safer one.
+pve_cluster_migration_type: "secure"
+
+# ---------------------------------------------------------------------------
+# Verification
+# ---------------------------------------------------------------------------
+pve_cluster_expected_votes: "{{ groups['pve'] | length }}"
+pve_cluster_quorum_retries: 12
+pve_cluster_quorum_delay: 5
+
+# Reporting
+pve_environment: "production"
+pve_site_name: "default"
+pve_deploy_root: "{{ (playbook_dir ~ '/..') | realpath }}"
+pve_site_root: "{{ pve_deploy_root }}"
+reports_dir: "{{ pve_site_root }}/reports"

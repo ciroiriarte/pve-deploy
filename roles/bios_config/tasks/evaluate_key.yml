@@ -1,0 +1,58 @@
+---
+- name: Extract attribute values for {{ baseline_item.key }}
+  ansible.builtin.set_fact:
+    eval_key: "{{ baseline_item.key }}"
+    eval_desired: "{{ baseline_item.value }}"
+    eval_current: "{{ bios_attributes[baseline_item.key] | default(none) }}"
+    eval_pending: "{{ bios_pending_attributes[baseline_item.key] | default(none) }}"
+    eval_severity: "{{ (baseline_item.key == bios_critical_attribute) | ternary('critical', 'warning') }}"
+  changed_when: false
+
+- name: Classify attribute status when key is absent
+  ansible.builtin.set_fact:
+    eval_status: "absent"
+    bios_audit_absent_count: "{{ bios_audit_absent_count | int + 1 }}"
+  when: eval_current is none
+  changed_when: false
+
+- name: Classify attribute status when current matches baseline
+  ansible.builtin.set_fact:
+    eval_status: "match"
+    bios_audit_match_count: "{{ bios_audit_match_count | int + 1 }}"
+  when:
+    - eval_current is not none
+    - eval_current == eval_desired
+  changed_when: false
+
+- name: Classify attribute status when current drifts from baseline
+  ansible.builtin.set_fact:
+    eval_status: "drift"
+    bios_audit_critical_count: "{{ (eval_severity == 'critical') | ternary(bios_audit_critical_count | int + 1, bios_audit_critical_count) }}"
+    bios_audit_warning_count: "{{ (eval_severity == 'warning') | ternary(bios_audit_warning_count | int + 1, bios_audit_warning_count) }}"
+  when:
+    - eval_current is not none
+    - eval_current != eval_desired
+  changed_when: false
+
+- name: Record evaluated drift item for {{ eval_key }}
+  vars:
+    eval_secure_boot_note: >-
+      CRITICAL: precondition for systemd-boot bootloader derivation
+    eval_baseline_note: >-
+      performance/virtualization baseline
+    eval_note: >-
+      {{ (eval_key == bios_critical_attribute)
+         | ternary(eval_secure_boot_note, eval_baseline_note) }}
+  ansible.builtin.set_fact:
+    bios_drift_items: >-
+      {{ bios_drift_items + [{
+           'key': eval_key,
+           'desired': eval_desired,
+           'current': eval_current | default('ABSENT'),
+           'pending': eval_pending | default('none'),
+           'status': eval_status,
+           'severity': eval_severity,
+           'pending_staged': (eval_pending is not none and eval_pending != eval_current),
+           'note': eval_note
+         }] }}
+  changed_when: false

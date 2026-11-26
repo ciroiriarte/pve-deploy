@@ -1,0 +1,375 @@
+---
+- name: Assert required BMC inventory variables are present.
+  ansible.builtin.assert:
+    that:
+      - ansible_host is defined
+      - parent_host is defined
+      - parent_host | length > 0
+      - bmc_username is defined
+      - bmc_password is defined
+    fail_msg: "BMC audit requires ansible_host, parent_host, bmc_username, and vaulted bmc_password."
+    quiet: true
+  changed_when: false
+  no_log: true
+  tags:
+    - audit
+    - bmc
+    - readonly
+
+- name: Ensure BMC evidence directory exists on the control node.
+  ansible.builtin.file:
+    path: "{{ bmc_inventory_evidence_dir }}"
+    state: directory
+    mode: "0750"
+  delegate_to: localhost
+  check_mode: false
+  changed_when: false
+  tags:
+    - audit
+    - bmc
+    - readonly
+
+- name: Gather read-only Redfish facts from this BMC.
+  block:
+    - name: Run read-only Redfish inventory collection.
+      ansible.builtin.include_tasks: redfish_gather.yml
+      tags:
+        - audit
+        - bmc
+        - readonly
+
+    - name: Record successful or partial BMC inventory status.
+      # Status is derived from the DATA ACTUALLY GATHERED, not merely from tasks
+      # not having failed. Every gathering task carries failed_when: false so one
+      # unsupported endpoint cannot abort the run, and the evidence template fills
+      # missing keys with nulls -- so judging success by task results alone reports
+      # "success" over an entirely empty document. That is exactly what happened
+      # when a network path dropped mid-run: 37 tasks "ok", every field null.
+      vars:
+        # redfish_info wraps results as entries: [[{resource_uri}, <payload>]],
+        # so the payload needs "| first | last", not "| first". Using "| first"
+        # yields the (uri, payload) pair and every lookup below silently
+        # resolves to null.
+        bmc_probe_sys_entries: >-
+          {{ (((bmc_rf_system | default({})).redfish_facts | default({})).system | default({})).entries
+             | default([]) }}
+        bmc_probe_serial: >-
+          {{ (bmc_probe_sys_entries | first | default([]) | last | default({}))
+             if (bmc_probe_sys_entries | length) > 0 else {} }}
+        bmc_probe_nic_entries: >-
+          {{ (((bmc_rf_nic | default({})).redfish_facts | default({})).nic | default({})).entries
+             | default([]) }}
+        bmc_probe_nics: >-
+          {{ (bmc_probe_nic_entries | first | default([]) | last | default([]))
+             if (bmc_probe_nic_entries | length) > 0 else [] }}
+        # Counts, not booleans. "{{ x > 0 }}" renders to the STRING "True"/"False"
+        # and each reader has to put it back through `| bool`; the round-trip works
+        # at runtime but makes ansible-lint report "the bool filter coerced invalid
+        # value (str) to False ... removed in ansible-core 2.23" on every run,
+        # because lint evaluates this with the probe facts undefined and so passes
+        # `| bool` the unrendered template, which really is an invalid value.
+        bmc_identity_len: >-
+          {{ bmc_probe_serial.SerialNumber
+             | default(bmc_probe_serial.Model | default('')) | string | length }}
+        bmc_nic_count: "{{ bmc_probe_nics | length }}"
+      ansible.builtin.set_fact:
+        bmc_inventory_status: >-
+          {{
+            'failed' if (bmc_identity_len | int) == 0 and (bmc_nic_count | int) == 0
+            else ('success' if (bmc_identity_len | int) > 0 and (bmc_nic_count | int) > 0
+                  else 'partial')
+          }}
+        bmc_inventory_errors: >-
+          {{
+            ([bmc_rf_service.msg] if (bmc_rf_service is defined and bmc_rf_service is failed
+                                      and bmc_rf_service.msg is defined) else [])
+            + (['No system identity returned; the BMC answered but the Systems inventory was empty.']
+               if (bmc_identity_len | int) == 0 else [])
+            + (['No network interfaces returned; per-NIC MAC correlation is unavailable for this host.']
+               if (bmc_nic_count | int) == 0 else [])
+          }}
+      changed_when: false
+      tags:
+        - audit
+        - bmc
+        - readonly
+
+  rescue:
+    - name: Record failed BMC inventory status without aborting the play.
+      ansible.builtin.set_fact:
+        bmc_inventory_status: "failed"
+        bmc_inventory_errors:
+          - "{{ ansible_failed_result.msg | default('Redfish collection failed before host evidence could be completed.') }}"
+      changed_when: false
+      tags:
+        - audit
+        - bmc
+        - readonly
+
+- name: Set this host evidence artifact path.
+  ansible.builtin.set_fact:
+    bmc_inventory_evidence_path: "{{ bmc_inventory_evidence_dir }}/{{ parent_host }}-hardware-{{ bmc_inventory_stamp }}.json"
+  changed_when: false
+  tags:
+    - audit
+    - bmc
+    - readonly
+
+- name: Write per-host hardware evidence JSON on the control node.
+  ansible.builtin.template:
+    src: hardware.json.j2
+    dest: "{{ bmc_inventory_evidence_path }}"
+    mode: "0640"
+  delegate_to: localhost
+  check_mode: false
+  changed_when: false
+  tags:
+    - audit
+    - bmc
+    - readonly
+
+- name: Calculate per-host hardware evidence checksum.
+  ansible.builtin.stat:
+    path: "{{ bmc_inventory_evidence_path }}"
+    checksum_algorithm: sha256
+    get_checksum: true
+  delegate_to: localhost
+  check_mode: false
+  changed_when: false
+  register: bmc_inventory_evidence_stat
+  tags:
+    - audit
+    - bmc
+    - readonly
+
+- name: Record per-host hardware evidence checksum.
+  ansible.builtin.set_fact:
+    bmc_inventory_evidence_sha256: "{{ bmc_inventory_evidence_stat.stat.checksum | default('') }}"
+  changed_when: false
+  tags:
+    - audit
+    - bmc
+    - readonly
+
+- name: Write consolidated BMC hardware summary on the control node.
+  ansible.builtin.template:
+    src: summary.md.j2
+    dest: "{{ bmc_inventory_summary_path }}"
+    mode: "0640"
+  delegate_to: localhost
+  run_once: true
+  check_mode: false
+  changed_when: false
+  tags:
+    - audit
+    - bmc
+    - readonly
+
+- name: Calculate consolidated BMC hardware summary checksum.
+  ansible.builtin.stat:
+    path: "{{ bmc_inventory_summary_path }}"
+    checksum_algorithm: sha256
+    get_checksum: true
+  delegate_to: localhost
+  run_once: true
+  check_mode: false
+  changed_when: false
+  register: bmc_inventory_summary_stat
+  tags:
+    - audit
+    - bmc
+    - readonly
+
+- name: Build the report target list.
+  # An explicit loop rather than a filter chain: report.py wants dicts shaped
+  # {host, address, role}, and building that from hostvars in a single Jinja
+  # expression is unreadable and easy to get subtly wrong.
+  ansible.builtin.set_fact:
+    bmc_inventory_targets: >-
+      {{
+        bmc_inventory_targets | default([]) + [{
+          'host': hostvars[item].parent_host | default(item),
+          'address': hostvars[item].ansible_host | default(''),
+          'role': 'bmc'
+        }]
+      }}
+  loop: "{{ ansible_play_hosts_all }}"
+  run_once: true
+  delegate_to: localhost
+  check_mode: false
+  changed_when: false
+  tags:
+    - audit
+    - bmc
+    - readonly
+
+- name: Build the per-host evidence artifact list.
+  ansible.builtin.set_fact:
+    bmc_inventory_artifacts: >-
+      {{
+        bmc_inventory_artifacts | default([]) + [{
+          'path': hostvars[item].bmc_inventory_evidence_path | default(''),
+          'sha256': hostvars[item].bmc_inventory_evidence_sha256 | default(''),
+          'description': 'Per-host BMC hardware evidence JSON'
+        }]
+      }}
+  loop: "{{ ansible_play_hosts_all }}"
+  run_once: true
+  delegate_to: localhost
+  check_mode: false
+  changed_when: false
+  tags:
+    - audit
+    - bmc
+    - readonly
+
+- name: Write report renderer input for the BMC hardware audit.
+  ansible.builtin.copy:
+    dest: "{{ bmc_inventory_report_input_path }}"
+    mode: "0640"
+    content: "{{ bmc_inventory_report_payload | to_nice_json }}\n"
+  vars:
+    bmc_inventory_hosts: "{{ ansible_play_hosts_all }}"
+    # "extract" is a FILTER, not a test, so select('extract', ...) raises
+    # "No test named 'extract'". Beyond that, mapping to the status value and
+    # then selecting on it would yield a list of status strings rather than the
+    # hostnames we want. Map each host to its full hostvars dict, filter on the
+    # status attribute, then read inventory_hostname back out.
+    bmc_inventory_failed_hosts: >-
+      {{
+        bmc_inventory_hosts
+        | map('extract', hostvars)
+        | selectattr('bmc_inventory_status', 'defined')
+        | selectattr('bmc_inventory_status', 'equalto', 'failed')
+        | map(attribute='inventory_hostname')
+        | list
+      }}
+    bmc_inventory_partial_hosts: >-
+      {{
+        bmc_inventory_hosts
+        | map('extract', hostvars)
+        | selectattr('bmc_inventory_status', 'defined')
+        | selectattr('bmc_inventory_status', 'equalto', 'partial')
+        | map(attribute='inventory_hostname')
+        | list
+      }}
+    bmc_inventory_report_payload:
+      kind: "assessment"
+      slug: "{{ bmc_inventory_report_slug }}"
+      title: "{{ bmc_inventory_report_title }}"
+      element: "bmc"
+      environment: "{{ environment_name }}"
+      operator: "{{ bmc_inventory_report_operator }}"
+      tool: "{{ bmc_inventory_report_tool }}"
+      outcome: >-
+        {{
+          'failed'
+          if (bmc_inventory_failed_hosts | length == bmc_inventory_hosts | length)
+          else ('partial' if ((bmc_inventory_failed_hosts | length) + (bmc_inventory_partial_hosts | length)) > 0 else 'success')
+        }}
+      summary: >-
+        Read-only Redfish hardware audit completed for {{ bmc_inventory_hosts | length }} BMC target(s).
+        Evidence JSON was written per parent host and a consolidated summary was generated.
+      # Built by an explicit loop in a preceding task. report.py expects dicts
+      # with a "host" key and silently DROPS anything else, so emitting bare
+      # hostname strings here would render an empty Targets section with no
+      # error to explain it.
+      targets: "{{ bmc_inventory_targets }}"
+      verification:
+        - name: "BMC Redfish collection"
+          command: "ansible-playbook playbooks/01-hardware.yml --tags readonly"
+          expected: >-
+            Every BMC produces a per-host evidence document; unreachable
+            endpoints are recorded as partial or failed.
+          actual: >-
+            {{ bmc_inventory_hosts | length }} host(s) processed;
+            {{ bmc_inventory_failed_hosts | length }} failed;
+            {{ bmc_inventory_partial_hosts | length }} partial.
+          result: >-
+            {{
+              'fail' if (bmc_inventory_failed_hosts | length == bmc_inventory_hosts | length)
+              else (
+                'warn' if ((bmc_inventory_failed_hosts | length)
+                           + (bmc_inventory_partial_hosts | length)) > 0
+                else 'pass'
+              )
+            }}
+      # Deliberately NOT json_query: that filter requires the jmespath Python
+      # library, which is not a declared dependency of this repo and is absent
+      # on a stock control host, so it would fail at render time. Plain Jinja
+      # does the same job with no extra dependency.
+      artifacts: >-
+        {{
+          bmc_inventory_artifacts
+          + [
+              {
+                'path': bmc_inventory_summary_path,
+                'sha256': bmc_inventory_summary_stat.stat.checksum | default(''),
+                'description': 'Consolidated BMC hardware summary'
+              }
+            ]
+        }}
+      notes:
+        - "This is an assessment report. The role performs no Redfish POST, PATCH, PUT, BIOS changes, RAID changes, or power actions."
+        - "BMC credentials are referenced only through bmc_username and vaulted bmc_password."
+        - "Some Lenovo XCC raw Redfish member paths are gathered defensively and require confirmation against live hardware."
+  delegate_to: localhost
+  run_once: true
+  check_mode: false
+  changed_when: false
+  tags:
+    - audit
+    - bmc
+    - readonly
+
+- name: Render the BMC hardware audit report.
+  ansible.builtin.command:
+    argv:
+      - "python3"
+      - "tools/report.py"
+      - "render"
+      - "{{ bmc_inventory_report_input_path }}"
+      - "--out"
+      - "{{ bmc_inventory_report_dir }}"
+    # chdir anchors the relative tools/ path; invoking via python3 avoids
+    # depending on the file's executable bit surviving a checkout.
+    chdir: "{{ pve_deploy_root }}"
+  delegate_to: localhost
+  run_once: true
+  check_mode: false
+  register: bmc_inventory_report_render
+  failed_when: bmc_inventory_report_render.rc != 0
+  changed_when: false
+  tags:
+    - audit
+    - bmc
+    - readonly
+
+- name: Fail the audit when no host produced usable hardware evidence.
+  # An audit that gathers nothing must not exit 0. Without this gate a dropped
+  # network path mid-run yields a full set of evidence files containing only
+  # nulls, a report saying "success", and a green exit code -- which is worse
+  # than an outright failure because nobody goes back to look.
+  ansible.builtin.assert:
+    that:
+      - >-
+        ansible_play_hosts_all
+        | map('extract', hostvars, 'bmc_inventory_status')
+        | select('equalto', 'success')
+        | list | length > 0
+    fail_msg: >-
+      No BMC returned usable hardware data. Every host is 'partial' or 'failed'.
+      Check the network path to the BMC subnet before trusting any evidence file
+      from this run; the JSON documents will contain null fields.
+    success_msg: >-
+      {{ ansible_play_hosts_all
+         | map('extract', hostvars, 'bmc_inventory_status')
+         | select('equalto', 'success') | list | length }} of
+      {{ ansible_play_hosts_all | length }} BMC(s) returned complete evidence.
+  delegate_to: localhost
+  run_once: true
+  changed_when: false
+  tags:
+    - audit
+    - bmc
+    - readonly

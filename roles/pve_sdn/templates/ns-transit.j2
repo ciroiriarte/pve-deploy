@@ -1,0 +1,15 @@
+{{ ansible_managed | comment }}
+# PVE SDN North/South transit sub-interfaces (VRF-bound), rendered per node.
+# The vrf_* devices are created by the EVPN zones (must have >=1 VNet to instantiate);
+# these sub-interfaces enslave to them. Applied via ifreload (safe: bond MAC pin).
+{% set idx = (groups['pve'] | sort).index(inventory_hostname) %}
+{% for t in pve_sdn_ns_transits %}
+{% set net24 = t.transit_net.split('.')[:3] | join('.') %}
+{% set mask = t.transit_net.split('/')[1] %}
+auto vmbr1.{{ t.vlan }}
+iface vmbr1.{{ t.vlan }} inet static
+    address {{ net24 }}.{{ t.node_ip_first + idx }}/{{ mask }}
+    mtu {{ pve_sdn_ns_transit_mtu | default(1500) }}
+    vrf {{ t.vrf }}
+
+{% endfor %}

@@ -1,0 +1,299 @@
+---
+# Flent (FLExible Network Tester) characterises latency under load -- the thing
+# iperf3 cannot show. iperf3 answers "how fast", flent answers "what happens to
+# latency while it is that fast", which is what exposes bufferbloat and AQM
+# problems on a converged fabric.
+#
+# Deliberately outside the pass/fail gate. A default RRUL run is tens of seconds
+# per pair, so a full mesh is a campaign, not a validation step; the result is a
+# baseline to compare against, not a verdict that blocks a deployment. Thresholds
+# are opt-in and produce warnings, never failures.
+#
+# Dependencies are NOT handled here. iperf3 is installed permanently by Phase 10
+# because it is small and broadly useful; flent pulls netperf and a Python/
+# matplotlib stack that has no business sitting on a hypervisor between tests, so
+# it is installed for the run and removed afterwards -- but by the playbook, once,
+# not by this file.
+#
+# This file is included by a `serial: 1` play, so it is re-read and re-executed on
+# every host's turn, and `run_once` inside a serial: 1 play fires once per BATCH,
+# which is once per host. Provisioning here therefore installed and removed ~130
+# packages across the whole fleet four times on a four-node cluster -- including on
+# the last node, which under a half mesh has no flent targets at all. That was most
+# of a 50-minute run, and it scales linearly with node count.
+#
+# Provisioning lives in play 1 of 13-validate-net.yml and teardown in play 3.
+# See that playbook for the set-difference bookkeeping, which must not be recomputed
+# after installation.
+- name: Run flent measurements.
+  tags: [phase13, pve_validate, flent]
+  block:
+    # shell, not command: `command -v` is a shell builtin, so ansible.builtin
+    # .command execs a nonexistent `command` binary and always returns rc=2.
+    - name: Verify flent and netperf are usable. # noqa: command-instead-of-shell
+      ansible.builtin.shell:
+        cmd: "command -v {{ item }}"
+      loop: "{{ pve_validate_flent_packages }}"
+      register: pve_validate_flent_bins
+      changed_when: false
+      failed_when: false
+
+    - name: Record flent tooling availability.
+      ansible.builtin.set_fact:
+        # The worst rc, not a boolean. Storing "{{ x == 0 }}" produces the STRING
+        # "True"/"False", which every reader then has to put through `| bool`; an
+        # int compares directly in a `when:` and reads as what it is.
+        pve_validate_flent_max_rc: >-
+          {{ pve_validate_flent_bins.results | map(attribute='rc') | max }}
+        pve_validate_checks: >-
+          {{ pve_validate_checks + [
+            {
+              'name': 'flent_tooling_present on ' ~ inventory_hostname,
+              'command': 'command -v ' ~ (pve_validate_flent_packages | join('; command -v ')),
+              'expected': 'flent and netperf usable',
+              'actual': 'rc=' ~ (pve_validate_flent_bins.results | map(attribute='rc') | map('string') | join(',')),
+              'result': ('pass' if (pve_validate_flent_bins.results | map(attribute='rc') | max) == 0 else 'warn')
+            }
+          ] }}
+      changed_when: false
+
+    - name: Select flent target pairs.
+      ansible.builtin.set_fact:
+        pve_validate_flent_targets: >-
+          {{ (pve_validate_peer_targets | default([]))
+             | selectattr('network_key', 'in', pve_validate_flent_networks)
+             | selectattr('target_host', 'gt', inventory_hostname) | list
+             if not (pve_validate_flent_full_mesh | bool)
+             else (pve_validate_peer_targets | default([]))
+                  | selectattr('network_key', 'in', pve_validate_flent_networks) | list }}
+      changed_when: false
+      when: pve_validate_flent_max_rc | int == 0
+
+    - name: Ensure the flent evidence directory exists.
+      ansible.builtin.file:
+        path: "{{ pve_validate_flent_evidence_dir }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      run_once: true
+      when: pve_validate_flent_max_rc | int == 0
+
+    # netserver is started ON THE TARGET BY ANSIBLE, not by the client host
+    # over SSH. Node-to-node root trust does not exist on these hosts -- PVE
+    # establishes it at cluster creation and this fleet is still standalone --
+    # so the ssh-based shape could never have worked. Ansible already holds
+    # credentials for every node.
+    # systemd-run with netserver -D (foreground): started through the command
+    # module the process dies with its SSH session, which is why every TCP stream
+    # came back "No data." while only ICMP ping worked.
+    # Once per distinct target HOST, not once per pair. netserver binds every
+    # interface, so a single unit serves all six segments; looping over pairs
+    # meant 36 systemd-run calls for 3 hosts, 33 of which failed with "unit
+    # already exists" and were swallowed by failed_when: false.
+    - name: Start netserver on each distinct flent target host.
+      ansible.builtin.command:
+        argv:
+          - systemd-run
+          - "--unit={{ pve_validate_flent_unit }}"
+          - --collect
+          - --description=pve-deploy flent netserver
+          - netserver
+          - -D
+          - -p
+          - "{{ pve_validate_flent_control_port | string }}"
+      delegate_to: "{{ item }}"
+      loop: >-
+        {{ pve_validate_flent_targets | default([])
+           | map(attribute='target_ssh_host') | unique | list }}
+      loop_control:
+        label: "{{ item }}"
+      changed_when: false
+      failed_when: false
+      when: pve_validate_flent_max_rc | int == 0
+
+    # One data directory per pair, so the data file can be found without knowing
+    # how flent names it. flent writes <test>-<timestamp>.<title>.flent.gz, NOT
+    # <title>.flent.gz -- the previous fetch guessed the latter, missed every
+    # file, and had failed_when: false, so twelve runs reported artifact paths
+    # that were never written and the evidence directory stayed empty.
+    - name: Give each flent pair its own data directory.
+      ansible.builtin.file:
+        path: "{{ pve_validate_flent_data_root }}/{{ item.network_key }}-{{ item.target_host }}"
+        state: directory
+        mode: "0700"
+      loop: "{{ pve_validate_flent_targets | default([]) }}"
+      loop_control:
+        label: "{{ item.network_key }} -> {{ item.target_host }}"
+      when: pve_validate_flent_max_rc | int == 0
+
+    - name: Run flent against each selected peer.
+      ansible.builtin.command:
+        argv:
+          - flent
+          - "{{ pve_validate_flent_test }}"
+          - -l
+          - "{{ pve_validate_flent_length | string }}"
+          - -H
+          - "{{ item.target_ip }}"
+          - --local-bind
+          - "{{ item.local_ip }}"
+          - --netperf-control-port
+          - "{{ pve_validate_flent_control_port | string }}"
+          - --data-dir
+          - "{{ pve_validate_flent_data_root }}/{{ item.network_key }}-{{ item.target_host }}"
+          - -t
+          - "{{ item.network_key }}-{{ item.target_host }}"
+      loop: "{{ pve_validate_flent_targets | default([]) }}"
+      loop_control:
+        label: "{{ item.network_key }} -> {{ item.target_host }}"
+      register: pve_validate_flent_results
+      changed_when: false
+      failed_when: false
+      when: pve_validate_flent_max_rc | int == 0
+
+    # Discovered rather than assumed: whatever flent chose to call the file, there
+    # is exactly one .flent.gz in that pair's directory.
+    - name: Locate the data file flent produced for each pair.
+      ansible.builtin.find:
+        paths: "{{ pve_validate_flent_data_root }}/{{ item.network_key }}-{{ item.target_host }}"
+        patterns: "*.flent.gz"
+      loop: "{{ pve_validate_flent_targets | default([]) }}"
+      loop_control:
+        label: "{{ item.network_key }} -> {{ item.target_host }}"
+      register: pve_validate_flent_datafiles
+      when: pve_validate_flent_max_rc | int == 0
+
+    # "net|target" -> source path, so the record step below can state an artifact
+    # only when one exists rather than printing a path on faith.
+    - name: Map each pair to the data file that actually exists.
+      ansible.builtin.set_fact:
+        pve_validate_flent_datafile_by_pair: >-
+          {{ (pve_validate_flent_datafile_by_pair | default({}))
+             | combine({ (item.item.network_key ~ '|' ~ item.item.target_host):
+                         ((item.files | default([]) | map(attribute='path') | list) | first | default('')) }) }}
+      loop: "{{ pve_validate_flent_datafiles.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.network_key }} -> {{ item.item.target_host }}"
+      changed_when: false
+      when: pve_validate_flent_datafiles.results is defined
+      throttle: 1
+
+    # Metrics are decomposed by direction. A single mean_mbps was previously
+    # taken from flent's "TCP totals", which is download sum PLUS upload sum, so
+    # a 2x25G bond reported 98,800 Mbps and looked impossible. RRUL saturates
+    # both directions at once, so the honest headline is latency under load with
+    # the per-direction sums as context.
+    #
+    # Units live in the key names -- the column header is the only place a reader
+    # learns what a number means. Note # is not a comment inside a Jinja
+    # expression; keep these at YAML level or the template fails to parse.
+    # Parsed from flent summary output. Kept in one place so the shape of the
+    # metrics dict is obvious when the parser needs adjusting for a newer flent.
+    - name: Record flent measurements.
+      ansible.builtin.set_fact:
+        pve_validate_checks: >-
+          {{ pve_validate_checks + [
+            {
+              'name': 'flent_' ~ item.item.network_key ~ '_' ~ inventory_hostname
+                      ~ '_to_' ~ item.item.target_host,
+              'command': 'flent ' ~ pve_validate_flent_test ~ ' -H ' ~ item.item.target_ip,
+              'expected': pve_validate_flent_test ~ ' completes and reports throughput',
+              'actual': (item.stdout | default('') | truncate(1200)),
+              'result': ('pass'
+                         if (item.rc == 0
+                             and (item.stdout | default('') | regex_findall('TCP totals\s+:\s+([0-9.]+)') | length) > 0)
+                         else 'warn'),
+              'metrics': {
+                'latency_ms': (((item.stdout | default('')
+                                 | regex_findall('Ping \(ms\) avg\s+:\s+([0-9.]+)'))
+                                + ['0']) | first | float),
+                'download_mbps': (((item.stdout | default('')
+                                    | regex_findall('TCP download sum\s+:\s+([0-9.]+)'))
+                                   + ['0']) | first | float),
+                'upload_mbps': (((item.stdout | default('')
+                                  | regex_findall('TCP upload sum\s+:\s+([0-9.]+)'))
+                                 + ['0']) | first | float),
+                'bidir_total_mbps': (((item.stdout | default('')
+                                       | regex_findall('TCP totals\s+:\s+([0-9.]+)'))
+                                      + ['0']) | first | float)
+              },
+              'artifacts': ([ pve_validate_flent_evidence_dir ~ '/' ~ item.item.network_key
+                              ~ '-' ~ inventory_hostname ~ '-' ~ item.item.target_host ~ '.flent.gz' ]
+                            if (pve_validate_flent_datafile_by_pair | default({}))
+                               [item.item.network_key ~ '|' ~ item.item.target_host] | default('')
+                            else [])
+            }
+          ] }}
+      loop: "{{ pve_validate_flent_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.network_key }} -> {{ item.item.target_host }}"
+      changed_when: false
+      when: pve_validate_flent_results.results is defined
+
+    # No failed_when: false. A run that measured successfully but whose evidence
+    # could not be retrieved is a broken evidence chain, and silencing it is how
+    # the empty evidence directory went unnoticed.
+    - name: Collect flent data files as evidence.
+      ansible.builtin.fetch:
+        src: "{{ pve_validate_flent_datafile_by_pair[item.item.network_key ~ '|' ~ item.item.target_host] }}"
+        dest: "{{ pve_validate_flent_evidence_dir }}/{{ item.item.network_key }}-{{ inventory_hostname }}-{{ item.item.target_host }}.flent.gz"
+        flat: true
+      loop: "{{ pve_validate_flent_results.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.network_key }} -> {{ item.item.target_host }}"
+      when:
+        - pve_validate_flent_results.results is defined
+        - item.rc | default(1) == 0
+        - pve_validate_flent_datafile_by_pair | default({})
+          | dict2items | selectattr('key', 'eq', item.item.network_key ~ '|' ~ item.item.target_host)
+          | selectattr('value') | list | length > 0
+      changed_when: false
+
+    # A measurement whose evidence never landed is reported, not assumed away.
+    - name: Record flent evidence collection.
+      vars:
+        expected: "{{ pve_validate_flent_targets | default([]) | length }}"
+        collected: >-
+          {{ (pve_validate_flent_datafile_by_pair | default({}))
+             | dict2items | selectattr('value') | list | length }}
+      ansible.builtin.set_fact:
+        pve_validate_checks: >-
+          {{ pve_validate_checks + [
+            {
+              'name': 'flent_evidence_collected on ' ~ inventory_hostname,
+              'command': 'find ' ~ pve_validate_flent_data_root ~ ' -name "*.flent.gz"',
+              'expected': expected ~ ' flent data file(s) retrieved',
+              'actual': collected ~ ' of ' ~ expected ~ ' retrieved',
+              'result': ('pass' if (collected | int) == (expected | int) else 'warn')
+            }
+          ] }}
+      changed_when: false
+      when: pve_validate_flent_max_rc | int == 0
+
+  always:
+    # In `always`, and over the whole group rather than over the computed target
+    # list, so an interrupted run cannot leave netserver listening on a production
+    # node. The previous shape stopped it inside the block and depended on
+    # pve_validate_flent_targets, which does not exist if the block failed before
+    # target selection. Stopping an inactive unit is a no-op.
+    - name: Stop netserver on every PVE host.
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - stop
+          - "{{ pve_validate_flent_unit }}.service"
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['pve'] }}"
+      loop_control:
+        label: "{{ item }}"
+      changed_when: false
+      failed_when: false
+      run_once: true
+
+    - name: Remove the on-node flent scratch directory.
+      ansible.builtin.file:
+        path: "{{ pve_validate_flent_data_root }}"
+        state: absent
+
+    # The scratch directory is per-host state, so it is removed on each host's turn.
+    # Package teardown is fleet state and belongs to play 3 of the playbook.

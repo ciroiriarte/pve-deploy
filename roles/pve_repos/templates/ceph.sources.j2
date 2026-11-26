@@ -1,0 +1,7 @@
+# Managed by Ansible role pve_repos
+Types: deb
+URIs: {{ 'https://enterprise.proxmox.com/debian/' ~ pve_ceph_archive if (pve_subscription_key | default('', true) | length > 0) else 'http://download.proxmox.com/debian/' ~ pve_ceph_archive }}
+Suites: {{ pve_apt_suite }}
+Components: {{ pve_ceph_component }}
+Signed-By: {{ pve_keyring_path }}
+Enabled: yes

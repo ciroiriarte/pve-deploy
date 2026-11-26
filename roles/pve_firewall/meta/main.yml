@@ -1,0 +1,12 @@
+---
+galaxy_info:
+  role_name: pve_firewall
+  author: pve-deploy
+  description: Safely converge Proxmox VE firewall rules before optional datacenter enable.
+  license: MIT
+  min_ansible_version: "2.15"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+dependencies: []

@@ -1,0 +1,76 @@
+---
+# H - GUARDED teardown. Deletes ONLY pools whose name starts with the tst- prefix
+# and removes the EC profile. Production pools (.mgr, nvme, nvme-compressed,
+# cfs01_*) can never match. This file is tagged ceph_benchmark_teardown at the
+# include site, so it can be run on its own to clean up a partial benchmark.
+#
+# GOTCHA: `ceph osd pool delete` refuses unless mon_allow_pool_delete is true.
+# The role reads the current value, flips it on for the teardown window, and
+# restores it afterwards so the cluster is left as it was found.
+- name: Read the current mon_allow_pool_delete setting.
+  ansible.builtin.command:
+    cmd: ceph config get mon mon_allow_pool_delete
+  delegate_to: "{{ pve_ceph_first_node }}"
+  register: pve_ceph_benchmark_pooldel_prev
+  changed_when: false
+
+- name: Allow pool deletion for the teardown window.
+  ansible.builtin.command:
+    cmd: ceph config set mon mon_allow_pool_delete true
+  delegate_to: "{{ pve_ceph_first_node }}"
+  register: pve_ceph_benchmark_pooldel_on
+  changed_when: pve_ceph_benchmark_pooldel_on.rc == 0
+
+- name: List the benchmark (tst-) pools.
+  ansible.builtin.shell:
+    cmd: "ceph osd pool ls | grep '^{{ pve_ceph_benchmark_pool_prefix }}' || true"
+  delegate_to: "{{ pve_ceph_first_node }}"
+  register: pve_ceph_benchmark_tst_pools
+  changed_when: false
+
+- name: Delete each benchmark pool (double-guarded on the tst- prefix).
+  ansible.builtin.command:
+    cmd: ceph osd pool delete {{ item }} {{ item }} --yes-i-really-really-mean-it
+  delegate_to: "{{ pve_ceph_first_node }}"
+  loop: "{{ pve_ceph_benchmark_tst_pools.stdout_lines | default([]) }}"
+  loop_control:
+    label: "{{ item }}"
+  when: item.startswith(pve_ceph_benchmark_pool_prefix)
+  register: pve_ceph_benchmark_pool_delete
+  changed_when: pve_ceph_benchmark_pool_delete.rc == 0
+
+- name: Remove the erasure-code profile.
+  ansible.builtin.command:
+    cmd: ceph osd erasure-code-profile rm {{ pve_ceph_benchmark_ec_profile }}
+  delegate_to: "{{ pve_ceph_first_node }}"
+  register: pve_ceph_benchmark_ec_rm
+  changed_when: pve_ceph_benchmark_ec_rm.rc == 0
+  # Tolerate an already-absent profile so a repeated teardown is a no-op.
+  failed_when:
+    - pve_ceph_benchmark_ec_rm.rc != 0
+    - "'does not exist' not in (pve_ceph_benchmark_ec_rm.stderr | default(''))"
+    - "'No such' not in (pve_ceph_benchmark_ec_rm.stderr | default(''))"
+
+- name: Restore the previous mon_allow_pool_delete setting.
+  ansible.builtin.command:
+    cmd: ceph config set mon mon_allow_pool_delete {{ pve_ceph_benchmark_pooldel_prev.stdout | default('false') | trim | lower }}
+  delegate_to: "{{ pve_ceph_first_node }}"
+  register: pve_ceph_benchmark_pooldel_restore
+  changed_when: pve_ceph_benchmark_pooldel_restore.rc == 0
+
+- name: Read pools after teardown for the production-survival guard.
+  ansible.builtin.command:
+    cmd: ceph osd pool ls
+  delegate_to: "{{ pve_ceph_first_node }}"
+  register: pve_ceph_benchmark_pools_after
+  changed_when: false
+
+- name: Assert no tst- pool survived and production pools are intact.
+  ansible.builtin.assert:
+    that:
+      - (pve_ceph_benchmark_pools_after.stdout_lines | default([]) | select('match', '^' ~ pve_ceph_benchmark_pool_prefix) | list | length) == 0
+    fail_msg: >-
+      Teardown left tst- pools behind:
+      {{ pve_ceph_benchmark_pools_after.stdout_lines | default([]) | select('match', '^' ~ pve_ceph_benchmark_pool_prefix) | list | join(', ') }}
+    quiet: true
+  changed_when: false

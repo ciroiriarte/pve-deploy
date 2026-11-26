@@ -1,0 +1,49 @@
+---
+# Verification facts. The benchmark's numeric results live in the on-node result
+# bundle (REPORT-style logs); these checks confirm the cluster is clean after the
+# run rather than restating throughput figures.
+- name: Read Ceph status for verification.
+  ansible.builtin.command:
+    cmd: ceph -s -f json
+  delegate_to: "{{ pve_ceph_first_node }}"
+  register: pve_ceph_benchmark_status
+  changed_when: false
+
+- name: Read pools for verification.
+  ansible.builtin.command:
+    cmd: ceph osd pool ls
+  delegate_to: "{{ pve_ceph_first_node }}"
+  register: pve_ceph_benchmark_pools_verify
+  changed_when: false
+
+- name: Record benchmark verification facts.
+  ansible.builtin.set_fact:
+    pve_ceph_benchmark_verification: >-
+      {{ [
+        {
+          'name': 'Ceph health after benchmark',
+          'command': 'ceph -s -f json (.health.status)',
+          'expected': 'HEALTH_OK',
+          'actual': (_st.health.status | default('unknown')),
+          'result': ('pass' if (_st.health.status | default('')) == 'HEALTH_OK' else 'fail')
+        },
+        {
+          'name': 'No temporary (tst-) pools remain',
+          'command': 'ceph osd pool ls',
+          'expected': '0 tst- pools',
+          'actual': (_tst | join(', ')) | default('none', true),
+          'result': ('pass' if (_tst | length) == 0 else 'fail')
+        },
+        {
+          'name': 'Benchmark result bundle recorded',
+          'command': 'BENCHMARK_DONE_MARKER',
+          'expected': 'a result directory on the first node',
+          'actual': (pve_ceph_benchmark_out_dir | default('unknown')),
+          'result': ('pass' if (pve_ceph_benchmark_out_dir | default('unknown')) != 'unknown' else 'warn')
+        }
+      ] }}
+  vars:
+    _st: "{{ pve_ceph_benchmark_status.stdout | default('{}', true) | from_json }}"
+    _tst: "{{ pve_ceph_benchmark_pools_verify.stdout_lines | default([]) | select('match', '^' ~ pve_ceph_benchmark_pool_prefix) | list }}"
+  delegate_to: "{{ pve_ceph_first_node }}"
+  changed_when: false

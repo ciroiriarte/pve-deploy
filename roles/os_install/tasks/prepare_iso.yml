@@ -1,0 +1,268 @@
+---
+# Renders the per-host answer file and first-boot hook, bakes them into an ISO,
+# and publishes it where the BMC can fetch it.
+#
+# Runs on os_install_build_host rather than the control node, because
+# proxmox-auto-install-assistant must match the ISO it prepares -- a 8.x
+# assistant is not the right tool for a 9.2 image. The build host is also where
+# the source ISO already lives, so nothing large crosses the network twice.
+
+# Proves the delegation actually left the control node.
+#
+# This phase runs with `connection: local` at play level, and a delegated task
+# INHERITS that unless the delegate host declares its own ansible_connection. A
+# site that omits it gets every build step silently executed on the control
+# node: the workspace, the rendered answer, the prepare-iso call. The symptom is
+# a confusing failure several tasks later, or -- worse, if the control node
+# happens to have the assistant installed -- an ISO built in the wrong place
+# that nothing ever publishes.
+#
+# One command, checked once, turns that into a named error here.
+- name: Confirm the build steps are running on the build host
+  ansible.builtin.command:
+    cmd: hostname
+  delegate_to: "{{ os_install_build_host }}"
+  register: os_install_build_hostname
+  changed_when: false
+
+- name: Refuse to build anywhere but the build host
+  ansible.builtin.assert:
+    that:
+      - os_install_build_hostname.stdout | trim | split('.') | first == os_install_build_host | split('.') | first
+    fail_msg: >-
+      Build steps are executing on '{{ os_install_build_hostname.stdout | trim }}'
+      but os_install_build_host is '{{ os_install_build_host }}'. This phase runs
+      connection=local, and a delegate inherits that unless it sets
+      ansible_connection explicitly -- so the build is almost certainly running
+      on the control node. Add `ansible_connection: ssh` to
+      {{ os_install_build_host }} in the inventory.
+    quiet: true
+  changed_when: false
+
+# Named for the NODE, not for the BMC inventory host.
+#
+# inventory_hostname here is pve-01-bmc, because this phase is driven
+# through the BMC. But the artefacts describe the machine being installed, and
+# an operator looking at /srv/iso wants to see which node an image is for --
+# "-bmc" in the filename of an OS installer is just noise that reads as an
+# error.
+- name: Set the per-host artefact names
+  ansible.builtin.set_fact:
+    os_install_target_name: "{{ parent_host | default(inventory_hostname) }}"
+  changed_when: false
+
+- name: Derive the artefact paths
+  ansible.builtin.set_fact:
+    os_install_answer_path: "{{ os_install_work_dir }}/answer-{{ os_install_target_name }}.toml"
+    os_install_hook_path: "{{ os_install_work_dir }}/first-boot-{{ os_install_target_name }}.sh"
+    os_install_output_iso: "{{ os_install_target_name }}-{{ os_install_source_iso | regex_replace('\\.iso$', '') }}-auto.iso"
+  changed_when: false
+
+- name: Ensure the build workspace exists
+  ansible.builtin.file:
+    path: "{{ os_install_work_dir }}"
+    state: directory
+    mode: "0700"
+  delegate_to: "{{ os_install_build_host }}"
+  changed_when: false
+
+# 0600: the answer carries the install-time root password in cleartext.
+- name: Render the answer file
+  ansible.builtin.template:
+    src: answer.toml.j2
+    dest: "{{ os_install_answer_path }}"
+    mode: "0600"
+  delegate_to: "{{ os_install_build_host }}"
+  changed_when: false
+
+- name: Render the first-boot hook
+  ansible.builtin.template:
+    src: first-boot.sh.j2
+    dest: "{{ os_install_hook_path }}"
+    mode: "0700"
+  delegate_to: "{{ os_install_build_host }}"
+  changed_when: false
+  when: os_install_first_boot_enabled | bool
+
+# Validated before it is baked in, not after. The assistant will reject a
+# malformed answer at prepare time anyway, but its message names the file rather
+# than the host, and by then the failure is buried in a longer command.
+#
+# failed_when is doing the actual work here. validate-answer EXITS 0 EVEN WHEN
+# IT REJECTS THE FILE -- it prints "Error: Found issues in the answer file." to
+# stderr and returns success anyway. Without this the task could never fail, and
+# was decorative: a short root password sailed past it and was caught two tasks
+# later by the ISO-exists check instead.
+#
+# A passing validation is completely silent, so any output at all is the signal.
+# Keying on "Error" rather than on non-empty stderr leaves room for the tool to
+# start emitting warnings without turning them into failures.
+- name: Validate the rendered answer file
+  ansible.builtin.command:
+    cmd: "proxmox-auto-install-assistant validate-answer {{ os_install_answer_path }}"
+  delegate_to: "{{ os_install_build_host }}"
+  register: os_install_answer_check
+  changed_when: false
+  failed_when: >-
+    os_install_answer_check.rc != 0
+    or 'Error' in (os_install_answer_check.stdout | default(''))
+    or 'Error' in (os_install_answer_check.stderr | default(''))
+
+- name: Confirm the source ISO is present on the build host
+  ansible.builtin.stat:
+    path: "{{ os_install_iso_dir }}/{{ os_install_source_iso }}"
+  delegate_to: "{{ os_install_build_host }}"
+  register: os_install_src_stat
+  changed_when: false
+
+- name: Fail when the source ISO is missing
+  ansible.builtin.fail:
+    msg: >-
+      Source ISO {{ os_install_iso_dir }}/{{ os_install_source_iso }} not found
+      on {{ os_install_build_host }}. Fetch and checksum it before building
+      installation media.
+  when: not os_install_src_stat.stat.exists
+
+# Give the INSTALLER a serial console, separately from the installed system.
+#
+# The first-boot hook covers the installed node, but that only helps once an
+# install has succeeded. A failing install -- a bad answer file, an unsatisfiable
+# disk filter -- produces no output at all over SoL, because the stock ISO boots
+# with no console= and Linux therefore writes nothing to the serial port. GRUB's
+# own menu IS on serial, which makes the silence afterwards read as a hang.
+#
+# Patched once into a derived source image rather than per host: the change is
+# identical for every node, and prepare-iso carries it through into each per-host
+# ISO along with the answer file.
+- name: Give the installer a serial console
+  when: os_install_iso_serial_console | bool
+  block:
+    - name: Copy the ISO patch tool to the build host
+      ansible.builtin.copy:
+        src: patch_iso_serial.py
+        dest: "{{ os_install_work_dir }}/patch_iso_serial.py"
+        mode: "0700"
+      delegate_to: "{{ os_install_build_host }}"
+      changed_when: false
+
+    # Idempotent by content: the tool refuses to double-patch, and re-running it
+    # on an already-patched image is a no-op rather than a second console=.
+    - name: Derive a serial-console source ISO
+      ansible.builtin.command:
+        cmd: >-
+          python3 {{ os_install_work_dir }}/patch_iso_serial.py
+          {{ os_install_iso_dir }}/{{ os_install_source_iso }}
+          {{ os_install_iso_dir }}/{{ os_install_serial_iso }}
+          'console=tty0 console={{ os_install_serial_device | default('ttyS0', true) }},{{ os_install_serial_speed }}'
+        creates: "{{ os_install_iso_dir }}/{{ os_install_serial_iso }}"
+      delegate_to: "{{ os_install_build_host }}"
+      register: os_install_iso_patch
+
+    - name: Report the patched installer image
+      ansible.builtin.debug:
+        msg: "{{ os_install_iso_patch.stdout_lines | default(['already present']) }}"
+      changed_when: false
+
+# Which image prepare-iso actually builds from. Kept as one fact so the command
+# below has a single source rather than repeating the conditional.
+- name: Select the image to build from
+  ansible.builtin.set_fact:
+    os_install_build_iso: >-
+      {{ (os_install_iso_serial_console | bool)
+         | ternary(os_install_serial_iso, os_install_source_iso) }}
+  changed_when: false
+
+# Rebuilt every run rather than reused.
+#
+# The answer embeds a per-host address and a root password, and the hook embeds
+# the bond members. Reusing a stale image is how a node ends up installed with
+# another host's identity, and the cost of rebuilding is under a minute against
+# an image that is already local.
+- name: Remove any previous build of this host's media
+  ansible.builtin.file:
+    path: "{{ os_install_iso_dir }}/{{ os_install_output_iso }}"
+    state: absent
+  delegate_to: "{{ os_install_build_host }}"
+  changed_when: false
+
+- name: Bake the answer and first-boot hook into a per-host ISO
+  ansible.builtin.command:
+    cmd: >-
+      proxmox-auto-install-assistant prepare-iso
+      {{ os_install_iso_dir }}/{{ os_install_build_iso }}
+      --fetch-from {{ os_install_answer_source }}
+      {% if os_install_answer_source == 'iso' %}--answer-file {{ os_install_answer_path }}{% endif %}
+      {% if os_install_answer_source == 'http' %}--url {{ os_install_answer_url }}{% endif %}
+      {% if os_install_answer_source == 'http' and os_install_answer_auth_token | length > 0 %}--answer-auth-token {{ os_install_answer_auth_token }}{% endif %}
+      {% if os_install_answer_source == 'http' and os_install_answer_cert_fingerprint | length > 0 %}--cert-fingerprint {{ os_install_answer_cert_fingerprint }}{% endif %}
+      {% if os_install_first_boot_enabled | bool %}--on-first-boot {{ os_install_hook_path }}{% endif %}
+      --output {{ os_install_iso_dir }}/{{ os_install_output_iso }}
+  delegate_to: "{{ os_install_build_host }}"
+  register: os_install_prepare
+  changed_when: os_install_prepare.rc == 0
+
+# The exit code of prepare-iso is NOT evidence that an ISO was produced.
+#
+# Observed on assistant 9.2.7: with xorriso absent it prints
+# "Error: Could not find the 'xorriso' binary" and exits 0, having written
+# nothing. Ansible's command module sees rc=0 and reports the task changed, so
+# the run continues, publishes a URL for a file that does not exist, and fails
+# several tasks later at the BMC with an opaque HTTP 500.
+#
+# Checking that the file is there is the only honest confirmation. See
+# docs/UPSTREAM-GAPS.md.
+- name: Confirm the prepared ISO actually exists
+  ansible.builtin.stat:
+    path: "{{ os_install_iso_dir }}/{{ os_install_output_iso }}"
+  delegate_to: "{{ os_install_build_host }}"
+  register: os_install_built_stat
+  changed_when: false
+
+- name: Fail when prepare-iso produced nothing
+  ansible.builtin.fail:
+    msg: >-
+      proxmox-auto-install-assistant exited 0 but
+      {{ os_install_iso_dir }}/{{ os_install_output_iso }} does not exist on
+      {{ os_install_build_host }}. The assistant reports some failures on stdout
+      while still exiting 0 -- a missing xorriso binary does exactly this.
+      Its output was:
+      {{ (os_install_prepare.stdout_lines | default([]) + os_install_prepare.stderr_lines | default([])) | join(' | ') }}
+  when: not os_install_built_stat.stat.exists
+
+# A built ISO can still be the wrong ISO: prepare-iso will happily produce an
+# image with no answer embedded if the flags did not come through as intended.
+# inspect-iso reports what is actually inside it.
+- name: Confirm the prepared ISO carries the expected configuration
+  ansible.builtin.command:
+    cmd: "proxmox-auto-install-assistant inspect-iso {{ os_install_iso_dir }}/{{ os_install_output_iso }}"
+  delegate_to: "{{ os_install_build_host }}"
+  register: os_install_inspect
+  changed_when: false
+
+# Matched against the "Fetch mode:" line specifically, not against the whole
+# output. A bare search for "iso" succeeds on the filename, on "Source ISO:" and
+# on the product name, so it would pass for an image built with --fetch-from
+# http and prove nothing at all.
+- name: Confirm auto-install is enabled and reads its answer as intended
+  ansible.builtin.assert:
+    that:
+      - os_install_inspect.stdout_lines | select('match', '^\\s*Auto-install:\\s*enabled') | list | length > 0
+      - os_install_inspect.stdout_lines
+        | select('match', '^\\s*Fetch mode:\\s*' ~ os_install_answer_source ~ '\\s*$')
+        | list | length > 0
+    fail_msg: >-
+      {{ os_install_output_iso }} was built but does not report auto-install
+      enabled with fetch mode '{{ os_install_answer_source }}'. inspect-iso said:
+      {{ os_install_inspect.stdout_lines | default([]) | join(' | ') }}
+    quiet: true
+  changed_when: false
+
+- name: Report the prepared media
+  ansible.builtin.debug:
+    msg:
+      - "built    : {{ os_install_output_iso }}"
+      - "answer   : {{ os_install_answer_source }}{{ ' (embedded)' if os_install_answer_source == 'iso' else ' from ' ~ os_install_answer_url }}"
+      - "first-boot: {{ 'embedded' if os_install_first_boot_enabled | bool else 'none' }}"
+      - "url      : {{ os_install_publish_to }}{{ os_install_output_iso }}"
+      - "inspect  : {{ os_install_inspect.stdout_lines | default([]) | join(' | ') | truncate(200) }}"
+  changed_when: false

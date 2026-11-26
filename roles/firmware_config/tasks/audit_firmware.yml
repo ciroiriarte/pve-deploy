@@ -1,0 +1,100 @@
+---
+# Builds the update plan: one entry per component, ordered by update class.
+#
+# The plan is the single artifact both modes consume. Audit renders it; apply
+# executes it. There is no second code path that could compute something
+# different from what the report showed.
+
+- name: Initialize firmware audit results
+  ansible.builtin.set_fact:
+    firmware_plan: []
+    firmware_up_to_date_count: 0
+    firmware_update_count: 0
+    firmware_unknown_count: 0
+    firmware_config_outcome: "success"
+  changed_when: false
+
+# Ordered by firmware_update_order, then by id within a class for stable output.
+# The order is not cosmetic: the BMC performs every other update, so it is
+# flashed first, and drives and PSUs come last because they are the least likely
+# to strand the host if something goes wrong mid-sequence.
+- name: Build the ordered firmware update plan
+  ansible.builtin.set_fact:
+    firmware_plan: >-
+      {%- set plan = [] -%}
+      {%- for cls in firmware_update_order -%}
+      {%-   for item in firmware_inventory_items | sort(attribute='id') -%}
+      {%-     if item.class == cls -%}
+      {%-       set tgt = firmware_targets[item.id] | default({}) -%}
+      {%-       set target_version = tgt.version | default('') -%}
+      {%-       if target_version | length == 0 -%}
+      {%-         set state = 'no_target' -%}
+      {%-       elif target_version == item.version -%}
+      {%-         set state = 'up_to_date' -%}
+      {%-       elif not item.updateable -%}
+      {%-         set state = 'not_updateable' -%}
+      {%-       elif (tgt.file | default('')) | length == 0 -%}
+      {%-         set state = 'payload_missing' -%}
+      {%-       else -%}
+      {%-         set state = 'update_required' -%}
+      {%-       endif -%}
+      {%-       set _ = plan.append({
+                  'id': item.id,
+                  'name': item.name,
+                  'class': item.class,
+                  'current_version': item.version,
+                  'target_version': target_version,
+                  'target_source': tgt.source | default(''),
+                  'payload_file': tgt.file | default(''),
+                  'updateable': item.updateable,
+                  'state': state
+                }) -%}
+      {%-     endif -%}
+      {%-   endfor -%}
+      {%- endfor -%}
+      {{ plan }}
+  changed_when: false
+
+- name: Count the plan outcomes
+  ansible.builtin.set_fact:
+    firmware_up_to_date_count: "{{ firmware_plan | selectattr('state', 'equalto', 'up_to_date') | list | length }}"
+    firmware_update_count: "{{ firmware_plan | selectattr('state', 'equalto', 'update_required') | list | length }}"
+    firmware_unknown_count: >-
+      {{ firmware_plan | rejectattr('state', 'in', ['up_to_date', 'update_required']) | list | length }}
+  changed_when: false
+
+# A plan in which nothing has a target is not a compliant fleet; it is a
+# baseline or catalog that does not describe this hardware. Reporting it as
+# success is the vacuous-pass failure the BIOS audit already demonstrated.
+- name: Fail when no component resolved to a target version
+  ansible.builtin.fail:
+    msg: >-
+      No component on {{ parent_host | default(inventory_hostname) }} resolved to
+      a target version: {{ firmware_plan | length }} component(s) inspected,
+      none matched an entry in
+      {{ (firmware_target_mode == 'baseline') | ternary('firmware_baseline', firmware_catalog_file) }}.
+      That means the {{ firmware_target_mode }} definition does not describe this
+      hardware, not that the firmware is current. Refusing to report a vacuous
+      pass.
+  when:
+    - firmware_plan | length > 0
+    - firmware_plan | selectattr('state', 'equalto', 'no_target') | list | length == firmware_plan | length
+
+# payload_missing is called out separately from update_required. Both mean "not
+# at the target version", but only one of them is actionable right now, and an
+# apply run that silently skipped the others would look like it had converged.
+- name: Warn when a required payload is absent from the catalog
+  ansible.builtin.debug:
+    msg: >-
+      {{ firmware_plan | selectattr('state', 'equalto', 'payload_missing') | map(attribute='id') | join(', ') }}
+      need updating on {{ parent_host | default(inventory_hostname) }} but no
+      payload file is recorded for the target version. Refresh the catalog or
+      place the payload in {{ firmware_payload_dir }} before applying.
+  when: firmware_plan | selectattr('state', 'equalto', 'payload_missing') | list | length > 0
+
+- name: Determine the overall firmware audit outcome
+  ansible.builtin.set_fact:
+    firmware_config_outcome: >-
+      {{ ((firmware_update_count | int) > 0 or (firmware_unknown_count | int) > 0)
+         | ternary('partial', 'success') }}
+  changed_when: false

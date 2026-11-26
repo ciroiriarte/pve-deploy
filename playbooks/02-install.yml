@@ -1,0 +1,273 @@
+---
+# Phase 02 - Proxmox VE bare-metal installation (Tier A -> Tier B bridge)
+#
+# DEFAULTS TO A DRY RUN. The role builds the image, attaches it and sets the
+# boot override -- all reversible -- and then stops. Committing to the power
+# cycle that erases the disks needs -e os_install_dry_run=false on top of the
+# gate below.
+#
+#
+# POSITION
+#
+# Runs after 01-hardware because the install target IS the boot mirror that
+# phase converges. Runs before 10-baseline because that phase configures an
+# operating system which has to exist first.
+#
+# This is the only phase that starts out-of-band and ends in-band: it drives
+# the BMC to install, then hands a running node to Tier B.
+#
+#
+# INSTALL TRANSPORT
+#
+# Remote media over HTTP, not PXE. It needs no DHCP/TFTP infrastructure to own,
+# and the BMC fetches the image itself. PXE remains reasonable where that
+# infrastructure already exists, but it should not be the default.
+#
+# Sequence: build a per-host auto-install ISO, register and mount it, set a
+# one-time boot override, power-cycle, wait for install, unmount, verify.
+#
+# LENOVO XCC DOES NOT EXPOSE STANDARD RedfishVirtualMedia.InsertMedia.
+#
+# Verified against XCC firmware KAX368P 6.20 on a production SR655 V3 fleet: all ten
+# virtual-media slots (EXT1-4, Remote1-4, RDOC1-2) report Actions: [], so the
+# DMTF InsertMedia action is simply absent. Mounting goes through the OEM
+# service instead:
+#
+#   /redfish/v1/Managers/1/Oem/Lenovo/RemoteMap
+#     Actions: LenovoRemoteMapService.Mount / .UMount / .Reset
+#     MountImages -> .../RemoteMap/MountImages
+#
+# Mount takes NO parameters -- its schema declares "parameters": {} -- because it
+# mounts whatever is already registered in the MountImages collection. The image
+# has to be POSTed there first with FilePath and Type, optionally Username,
+# Password, Options and Readonly. Calling Mount with a URL in the body returns
+# HTTP 204 and mounts nothing.
+#
+# Supported Type values, from the live schema
+# (/redfish/v1/schemas/LenovoRemoteMapMedia.v1_0_0.json):
+#
+#   ['Samba', 'NFS', 'Local', 'HTTP', 'HTTPS', 'SFTP', 'FTP']
+#
+# So HTTP is a first-class transport here, which is what makes an ISO web host
+# viable. Writing this against the DMTF InsertMedia action would fail on every
+# node in this fleet.
+#
+#
+# TWO CONSTRAINTS THAT SHAPE EVERYTHING
+#
+# 1. ONE NIC. The Proxmox auto-install answer file supports exactly one network
+#    interface — no bonds, no VLANs, no bridges, no MTU. Install therefore lands
+#    on a single temporary bootstrap port, and 11-network builds the real
+#    topology afterwards. See docs/OPERATOR.md.
+#
+# 2. BOOT DISK IDENTITY BY SERIAL. The answer file has to name the install
+#    target unambiguously, and Tier B has to be told what it is. With NVMe
+#    behind two controllers, Linux device names are not stable across boots.
+#    Pass serial/WWN, never /dev/sdX. 01-hardware already refuses to proceed
+#    when boot_device_confident is false, and this phase must honour the same
+#    signal: an uncertain boot device means stop, because the failure mode is
+#    installing over Ceph data.
+#
+#
+# REINSTALLING A NODE THAT IS ALREADY IN A CLUSTER
+#
+# --limit alone does NOT make this safe. Ansible scoping bounds which host is
+# touched; it does nothing about that host's membership in a live cluster.
+# Reinstalling an active member without preparation loses its OSDs and brings it
+# back with a conflicting cluster identity.
+#
+# The required sequence, none of which exists yet:
+#
+#   1. Migrate or stop every guest on the node.
+#   2. Mark its Ceph OSDs out, wait for backfill to complete, then purge them.
+#   3. pvecm delnode, and confirm the remaining members still hold quorum.
+#   4. Install.
+#   5. Rejoin the cluster, recreate OSDs, verify.
+#
+# Quorum is the hard limit: 4 nodes tolerate exactly one member out. serial: 1
+# is therefore load-bearing for cluster survival, not tidiness, and this phase
+# must refuse to target more than one cluster member at a time regardless of
+# what --limit was given.
+#
+# Greenfield installs have none of these constraints, and the two cases should
+# be distinguishable by an explicit flag rather than inferred from whether the
+# node happens to answer on the cluster network.
+
+- name: Phase 02 - Proxmox VE bare-metal installation (Tier A -> Tier B bridge)
+  hosts: bmc
+  connection: local
+  gather_facts: false
+  serial: 1
+  any_errors_fatal: true
+  vars:
+    # Second key, and deliberately not a boolean -- the same reasoning as
+    # hardware_apply_confirm in Phase 01. os_install_dry_run=false could arrive
+    # from an inherited -e or a stale CI variable; a value that has to name the
+    # site being targeted cannot arrive by accident, and a run aimed at the
+    # wrong inventory fails closed rather than erasing another site's fleet.
+    install_confirm: ""
+
+    # Greenfield vs reinstall, stated explicitly rather than inferred.
+    #
+    # Inferring it from whether the node answers on the cluster network would be
+    # wrong in the direction that matters: a member that is merely down would
+    # look greenfield, and this phase would erase it.
+    install_is_cluster_member: false
+
+    # Settings that decide what THIS RUN does, as opposed to what gets
+    # installed. Excluded from the adoption below so that a value in a site file
+    # can never turn a dry run into an install, or suppress a cleanup.
+    install_run_control_vars:
+      - os_install_dry_run
+      - os_install_cleanup_only
+
+  pre_tasks:
+    # Installation is limited to the four new Lenovo PVE nodes.
+    #
+    # This phase WIPES the target. The bmc group is deliberately broader than the
+    # install scope: it also carries pbs-01 (the backup server) and
+    # db-01 (a database server), neither of which is part of this
+    # build and neither of which may ever be installed by it.
+    #
+    # Expressed as a positive allowlist keyed on the pve inventory group, so
+    # adding a BMC to the site cannot silently widen what may be wiped. The pve
+    # group resolves to exactly pve-01..04.
+    #
+    # The separate cluster that hosts the ISO web server is not in this
+    # inventory at all and therefore unreachable from here — but that is an absence, not a guarantee, so the allowlist below is
+    # what actually enforces the boundary.
+    - name: Refuse to install a host outside the pve group.
+      ansible.builtin.assert:
+        that:
+          - parent_host is defined
+          - parent_host in groups.get('pve', [])
+        fail_msg: >-
+          {{ inventory_hostname }} belongs to {{ parent_host | default('an unknown host') }},
+          which is not in the pve inventory group. Installation WIPES the target
+          and is limited to the PVE nodes
+          ({{ groups.get('pve', []) | join(', ') }}). Refusing.
+        quiet: true
+      changed_when: false
+      tags:
+        - always
+
+    # Named separately from the group check so the failure says which of the two
+    # protections stopped the run.
+    - name: Refuse to install the backup or database servers under any circumstance.
+      ansible.builtin.assert:
+        that:
+          - parent_host not in (groups.get('pbs', []) + (os_install_protected_hosts | default([])))
+        fail_msg: >-
+          {{ parent_host }} is a backup or database server. These are managed
+          hardware but are NOT part of the PVE build and must never be installed
+          by this phase. Refusing.
+        quiet: true
+      changed_when: false
+      tags:
+        - always
+
+    - name: Refuse to run without a vaulted BMC password.
+      ansible.builtin.assert:
+        that:
+          - bmc_password is defined
+          - bmc_password | length > 0
+        fail_msg: "Define bmc_password in Ansible Vault, for example group_vars/bmc/vault.yml."
+        quiet: true
+      changed_when: false
+      no_log: true
+      tags:
+        - always
+
+    - name: Require an explicit, site-named confirmation before erasing disks.
+      ansible.builtin.assert:
+        that:
+          - install_confirm == pve_site_name
+        fail_msg: >-
+          os_install_dry_run=false ERASES EVERY DISK matching the install filter
+          on {{ inventory_hostname }}. Confirm the site by re-running with
+          -e install_confirm={{ pve_site_name }} and constrain the blast radius
+          with --limit. Refusing to continue.
+        quiet: true
+      when:
+        - not (os_install_dry_run | bool)
+        - not (os_install_cleanup_only | bool)
+      changed_when: false
+      tags:
+        - always
+
+    # Reinstalling an active cluster member is not what this phase does.
+    #
+    # --limit bounds which host Ansible touches; it does nothing about that
+    # host's membership in a live cluster. The evacuate/delnode/rejoin sequence
+    # in the header above is not implemented, so the honest position is to
+    # refuse rather than to half-support it. A greenfield node is not in a
+    # cluster and clears this trivially.
+    - name: Refuse to install a node that is already a cluster member.
+      ansible.builtin.assert:
+        that:
+          - not (install_is_cluster_member | default(false) | bool)
+        fail_msg: >-
+          {{ parent_host }} is marked as a live cluster member. Reinstalling one
+          needs its guests migrated, its OSDs marked out and purged, and
+          pvecm delnode run with quorum confirmed on the survivors -- none of
+          which this phase implements. Do that first, then clear
+          install_is_cluster_member.
+        quiet: true
+      when: not (os_install_cleanup_only | bool)
+      changed_when: false
+      tags:
+        - always
+
+    # Bridging the two halves of this phase's identity.
+    #
+    # The play runs on `hosts: bmc` because everything it does out-of-band --
+    # attach media, set the boot override, power cycle -- is addressed to the
+    # BMC. But WHAT to install is a property of the node behind that BMC: its
+    # fqdn, its management address, its bond members. Those live in
+    # group_vars/pve and in the PVE host's own host_vars, and they are simply
+    # not visible from the BMC inventory host.
+    #
+    # Rather than making every site restate them under group_vars/bmc/ with a
+    # hostvars[] prefix on each line, the settings are adopted here, once. This
+    # works because hostvars[x].y is templated in x's OWN context, so a value
+    # like "{{ networks.pve_management.ip }}" resolves against the PVE host
+    # exactly as it was written to.
+    #
+    # Run-control flags are excluded: those decide what THIS RUN does and must
+    # come from the command line, not from a site file that could quietly turn a
+    # dry run into an install.
+    - name: Adopt the target node's install settings.
+      ansible.builtin.set_fact:
+        "{{ item.key }}": "{{ item.value }}"
+      loop: >-
+        {{ hostvars[parent_host] | dict2items
+           | selectattr('key', 'match', '^os_install_')
+           | rejectattr('key', 'in', install_run_control_vars)
+           | list }}
+      loop_control:
+        label: "{{ item.key }}"
+      changed_when: false
+      tags:
+        - always
+
+    - name: Announce what this run will do.
+      ansible.builtin.debug:
+        msg: >-
+          {{ (os_install_cleanup_only | bool)
+             | ternary('CLEANUP ONLY',
+                       (os_install_dry_run | bool)
+                       | ternary('DRY RUN -- media built, attached and boot override set; disks untouched',
+                                 'INSTALLING -- DISKS WILL BE ERASED')) }}
+          on site '{{ pve_site_name }}':
+          {{ ansible_play_hosts_all | length }} host(s)
+          ({{ ansible_play_hosts_all | join(', ') }}), one at a time.
+      changed_when: false
+      run_once: true
+      tags:
+        - always
+
+  roles:
+    - role: os_install
+      tags:
+        - phase02
+        - install

@@ -1,0 +1,88 @@
+#!/bin/bash
+# {{ ansible_managed }}
+# Ceph pool-tier measurement, rendered by pve_ceph_benchmark (Phase G).
+#
+# Pools are created BEFORE this runs (tasks/pools.yml) and torn down AFTER
+# (tasks/teardown.yml); this script only prefills images and measures, so it is
+# safe to re-run and never creates or deletes a pool.
+#
+# fio READ validity: a freshly-created RBD image is sparse, so fio reads return
+# zero-fill without an OSD round-trip (a hand-run once reported an impossible
+# 159 GB/s). Every image is therefore fully prefilled with a sequential write
+# pass before any read measurement. fio writes and all rados bench are valid as-is.
+set -u
+TS=$(date -u +%Y%m%dT%H%M%SZ)
+OUT="{{ pve_ceph_benchmark_results_root }}/ceph-benchmark-$TS"
+mkdir -p "$OUT"
+IMG="{{ pve_ceph_benchmark_image }}"
+SZ="{{ pve_ceph_benchmark_image_size }}"
+ROUNDS={{ pve_ceph_benchmark_rounds }}
+RB_SECS={{ pve_ceph_benchmark_rados_secs }}
+FIO_RT={{ pve_ceph_benchmark_fio_runtime }}
+NODES="{% for n in pve_ceph_nodes %}{{ hostvars[n].ansible_host | default(n) }} {% endfor %}"
+
+log() { echo "[$(date -u +%T)] $*" | tee -a "$OUT/run.log"; }
+dropcache() { for n in $NODES; do ssh -o ConnectTimeout=6 -o BatchMode=yes root@"$n" 'sync; echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null; done; }
+
+log "=== benchmark start $TS -> $OUT ==="
+
+# label:datapool:metapool  (metapool empty => replicated image, no data-pool)
+POOLS=(
+{% for p in pve_ceph_benchmark_pools %}
+  "{{ p.label }}:{{ p.name }}:{{ p.meta }}"
+{% endfor %}
+)
+
+declare -A IMGPOOL
+log "prefill images (once) so reads are valid"
+for entry in "${POOLS[@]}"; do
+  IFS=: read -r label dp mp <<< "$entry"
+  if [ -z "$mp" ]; then
+    rbd create "$dp/$IMG" --size "$SZ" 2>/dev/null
+    IMGPOOL[$label]=$dp
+  else
+    rbd create --size "$SZ" --data-pool "$dp" "$mp/$IMG" 2>/dev/null
+    IMGPOOL[$label]=$mp
+  fi
+  log "prefill $label (pool ${IMGPOOL[$label]})"
+  fio --name=prefill --ioengine=rbd --clientname=admin --pool="${IMGPOOL[$label]}" \
+      --rbdname="$IMG" --rw=write --bs=4M --iodepth=32 --numjobs=1 --direct=1 \
+      --size="$SZ" --refill_buffers --buffer_compress_percentage=50 \
+      >/dev/null 2>>"$OUT/run.log"
+done
+
+for R in $(seq 1 "$ROUNDS"); do
+  log "########## ROUND $R / $ROUNDS ##########"
+  for entry in "${POOLS[@]}"; do
+    IFS=: read -r label dp mp <<< "$entry"
+    for T in 16 64; do
+      rados bench -p "$dp" "$RB_SECS" write -t "$T" --no-cleanup > "$OUT/r${R}-rados-$label-write-t$T.log" 2>&1
+      rados bench -p "$dp" "$RB_SECS" seq   -t "$T"              > "$OUT/r${R}-rados-$label-seq-t$T.log"   2>&1
+      rados bench -p "$dp" "$RB_SECS" rand  -t "$T"              > "$OUT/r${R}-rados-$label-rand-t$T.log"  2>&1
+      rados -p "$dp" cleanup >/dev/null 2>&1
+    done
+    log "round $R rados $label done"
+    P=${IMGPOOL[$label]}
+    for t in randread:4k:randread randwrite:4k:randwrite randrw70:4k:randrw seqread:1m:read seqwrite:1m:write; do
+      name=${t%%:*}; bs=$(echo "$t" | cut -d: -f2); rw=$(echo "$t" | cut -d: -f3)
+      dropcache
+      mix=""; [ "$name" = randrw70 ] && mix="--rwmixread=70"
+      fio --name="$name" --ioengine=rbd --clientname=admin --pool="$P" --rbdname="$IMG" \
+          --rw="$rw" $mix --bs="$bs" --iodepth=32 --numjobs=4 --direct=1 --time_based \
+          --runtime="$FIO_RT" --ramp_time=5 --group_reporting --randrepeat=0 --norandommap \
+          --refill_buffers --buffer_compress_percentage=50 --buffer_compress_chunk=4096 \
+          --output-format=json --output="$OUT/r${R}-fio-$label-$name.json" 2>>"$OUT/run.log"
+    done
+    log "round $R fio $label done"
+  done
+done
+
+# Remove only the benchmark images; the pools themselves are torn down by Ansible.
+for entry in "${POOLS[@]}"; do
+  IFS=: read -r label dp mp <<< "$entry"
+  P=${IMGPOOL[$label]}
+  rbd rm "$P/$IMG" >/dev/null 2>&1
+done
+
+log "=== benchmark complete -> $OUT ==="
+echo "BENCHMARK_DONE_MARKER $OUT" | tee -a "$OUT/run.log"

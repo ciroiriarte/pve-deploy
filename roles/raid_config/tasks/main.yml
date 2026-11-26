@@ -1,0 +1,45 @@
+---
+- name: Execute Storage Topology and Ceph Candidate Audit Block
+  tags:
+    - audit
+    - bmc
+    - readonly
+    - raid
+  block:
+    - name: Gather storage inventory evidence
+      ansible.builtin.include_tasks: gather_evidence.yml
+
+    - name: Audit storage controllers and derive Ceph OSD candidates
+      ansible.builtin.include_tasks: audit_storage.yml
+
+    - name: Generate storage evidence and assessment reports
+      ansible.builtin.include_tasks: generate_reports.yml
+
+  rescue:
+    - name: Record storage audit failure state
+      ansible.builtin.set_fact:
+        raid_audit_outcome: "failed"
+        raid_audit_failure_reason: "{{ ansible_failed_result.msg | default('BMC Storage Redfish request failed') }}"
+      changed_when: false
+
+    - name: Generate storage failure evidence and report
+      ansible.builtin.include_tasks: generate_reports.yml
+
+# Deliberately outside the block above, which carries the `readonly` tag. See the
+# same note in roles/bios_config/tasks/main.yml: the apply path used to inherit
+# `readonly`, so the tag that is supposed to prove a run cannot write also
+# selected the mutating task.
+#
+# `| bool` is not redundant. raid_config_audit_only can arrive as a string rather
+# than a bool — a quoted group_var, an -e on the command line — and every
+# non-empty string is truthy in Jinja, including "False". Without the filter,
+# `not raid_config_audit_only` is therefore False for any string value, so an
+# operator who set audit_only=False to request a convergence gets a silently
+# skipped apply and a green run. The filter makes the value mean what it says.
+- name: Apply RAID configuration changes
+  ansible.builtin.include_tasks: apply_raid.yml
+  when: not (raid_config_audit_only | bool)
+  tags:
+    - bmc
+    - raid
+    - apply

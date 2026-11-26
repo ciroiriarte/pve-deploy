@@ -1,0 +1,123 @@
+---
+# Points the next boot at the attached media.
+#
+# Standard DMTF Redfish, not an OEM path -- unlike the attach step, every BMC
+# family implements Boot.BootSourceOverride*, so this file needs no vendor
+# dispatch.
+#
+# `Once`, never `Continuous`. A one-shot override is consumed by the boot it
+# causes, so the reboot at the end of installation goes to the newly written
+# disk without anyone clearing anything. `Continuous` would send a successfully
+# installed node straight back into the installer and wipe it again, on every
+# subsequent boot, until someone noticed.
+
+- name: Read the system's boot capabilities
+  ansible.builtin.uri:
+    url: "https://{{ ansible_host }}/redfish/v1/Systems/1"
+    method: GET
+    user: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_validate_certs }}"
+    timeout: "{{ bmc_timeout }}"
+  register: os_install_system
+  no_log: true
+  changed_when: false
+
+# Checked against what this firmware says it accepts, rather than assumed. A
+# rejected PATCH would otherwise leave the override unset while the run carried
+# on to power cycle the machine, which boots it from its existing disk and
+# reports an install that never started.
+- name: Assert this firmware accepts the requested override
+  ansible.builtin.assert:
+    that:
+      - os_install_boot_target in
+        ((os_install_system.json | default({})).Boot | default({}))['BootSourceOverrideTarget@Redfish.AllowableValues'] | default([])
+      - os_install_boot_override in
+        ((os_install_system.json | default({})).Boot | default({}))['BootSourceOverrideEnabled@Redfish.AllowableValues'] | default([])
+    fail_msg: >-
+      {{ inventory_hostname }} does not accept
+      target={{ os_install_boot_target }} override={{ os_install_boot_override }}.
+      Firmware allows targets
+      {{ ((os_install_system.json | default({})).Boot | default({}))['BootSourceOverrideTarget@Redfish.AllowableValues'] | default([]) | join(', ') }}
+      and modes
+      {{ ((os_install_system.json | default({})).Boot | default({}))['BootSourceOverrideEnabled@Redfish.AllowableValues'] | default([]) | join(', ') }}.
+    quiet: true
+  changed_when: false
+
+# Refusing rather than converting. The installed system's firmware mode has to
+# match the mode it was installed under, and this role cannot tell which one a
+# given site intends -- silently flipping a machine to Legacy because the
+# variable said so produces a node that installs and then boots to nothing.
+- name: Refuse to change the firmware boot mode
+  ansible.builtin.fail:
+    msg: >-
+      {{ inventory_hostname }} reports BootSourceOverrideMode
+      {{ ((os_install_system.json | default({})).Boot | default({})).BootSourceOverrideMode | default('unknown') }}
+      but os_install_boot_mode is {{ os_install_boot_mode }}. Changing the
+      firmware boot mode is a BIOS decision, not an install-time one -- set it in
+      the Phase 01 BIOS baseline and re-run that first.
+  when:
+    - ((os_install_system.json | default({})).Boot | default({})).BootSourceOverrideMode | default('') | length > 0
+    - ((os_install_system.json | default({})).Boot | default({})).BootSourceOverrideMode != os_install_boot_mode
+
+- name: Point the next boot at the attached media
+  ansible.builtin.uri:
+    url: "https://{{ ansible_host }}/redfish/v1/Systems/1"
+    method: PATCH
+    body_format: json
+    body:
+      Boot:
+        BootSourceOverrideEnabled: "{{ os_install_boot_override }}"
+        BootSourceOverrideTarget: "{{ os_install_boot_target }}"
+    headers:
+      # XCC rejects an unconditional PATCH on this resource without an ETag
+      # match. Using the ETag from the GET above also makes the write fail
+      # rather than clobber if something else changed the boot settings in
+      # between.
+      If-Match: "{{ os_install_system.etag | default('*') }}"
+    user: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_validate_certs }}"
+    timeout: "{{ bmc_timeout }}"
+    status_code: [200, 202, 204]
+  no_log: true
+  changed_when: true
+
+- name: Read the override back
+  ansible.builtin.uri:
+    url: "https://{{ ansible_host }}/redfish/v1/Systems/1"
+    method: GET
+    user: "{{ bmc_username }}"
+    password: "{{ bmc_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ bmc_validate_certs }}"
+    timeout: "{{ bmc_timeout }}"
+  register: os_install_system_after
+  no_log: true
+  changed_when: false
+
+# Read back because a 204 from the PATCH means the request was accepted, not
+# that the setting took. Everything after this point assumes the machine will
+# boot from the media, and a power cycle is a poor moment to discover it will
+# not.
+- name: Confirm the override took effect
+  ansible.builtin.assert:
+    that:
+      - ((os_install_system_after.json | default({})).Boot | default({})).BootSourceOverrideTarget | default('') == os_install_boot_target
+      - ((os_install_system_after.json | default({})).Boot | default({})).BootSourceOverrideEnabled | default('') == os_install_boot_override
+    fail_msg: >-
+      Boot override did not take on {{ inventory_hostname }}: firmware reports
+      target={{ ((os_install_system_after.json | default({})).Boot | default({})).BootSourceOverrideTarget | default('unset') }}
+      override={{ ((os_install_system_after.json | default({})).Boot | default({})).BootSourceOverrideEnabled | default('unset') }}.
+    quiet: true
+  changed_when: false
+
+- name: Report the boot override
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }}: next boot -> {{ os_install_boot_target }}
+      ({{ os_install_boot_override }}, {{ os_install_boot_mode }}),
+      power state {{ (os_install_system_after.json | default({})).PowerState | default('unknown') }}
+  changed_when: false

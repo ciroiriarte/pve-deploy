@@ -1,0 +1,23 @@
+---
+galaxy_info:
+  role_name: bmc_inventory
+  author: pve-deploy operators
+  description: Read-only Lenovo XCC Redfish hardware inventory and evidence capture.
+  license: MIT
+  min_ansible_version: "2.15"
+  platforms:
+    - name: EL
+      versions:
+        - all
+    - name: Debian
+      versions:
+        - all
+  galaxy_tags:
+    - redfish
+    - lenovo
+    - xcc
+    - bmc
+    - inventory
+    - audit
+
+dependencies: []

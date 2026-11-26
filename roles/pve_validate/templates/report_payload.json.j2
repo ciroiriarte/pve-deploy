@@ -1,0 +1,50 @@
+{
+  "kind": "assessment",
+  "slug": "pve-network-validation-{{ inventory_hostname }}",
+  "title": "PVE Network Validation for {{ inventory_hostname }}",
+  "element": "pve_network_validation",
+  "environment": {{ pve_environment | to_json }},
+  "operator": {{ ansible_user_id | default('root') | to_json }},
+  "tool": "pve-deploy 13-validate-net.yml",
+  "outcome": "{{ 'success' if (pve_validate_failed_checks | default([]) | length == 0) else 'failed' }}",
+  "summary": "Validated active/staged network config, LACP bonds, gateway reachability, peer ICMP/MTU paths, firewall state, fleet hardware firmware versions, and optional iperf3 mesh.",
+  "targets": [
+{% for host in ansible_play_hosts_all | default(groups.get('pve', [])) %}
+    {
+      "host": {{ host | to_json }},
+      "address": {{ hostvars[host].ansible_host | default(host) | to_json }},
+      "role": "pve"
+    }{{ ',' if not loop.last else '' }}
+{% endfor %}
+  ],
+  "changes": [],
+  "verification": [
+{% for check in pve_validate_checks | default([]) %}
+    {
+      "name": {{ check.name | to_json }},
+      "command": {{ check.command | to_json }},
+      "expected": {{ check.expected | to_json }},
+      "actual": {{ check.actual | to_json }},
+      "result": {{ check.result | to_json }}
+    }{{ ',' if not loop.last else '' }}
+{% endfor %}
+  ],
+  "artifacts": [
+    {
+      "path": "{{ reports_dir }}/{{ inventory_hostname }}-network-validation.json",
+      "description": "Structured Phase 13 network validation payload"
+    }{% if pve_validate_hardware_versions_enabled | bool %},
+    {
+      "path": "{{ pve_validate_hardware_version_targets_file }}",
+      "description": "Optional hardware firmware target-version map used by Phase 13"
+    }{% for artifact in (pve_validate_hardware_versions_payload.artifacts | default([])) %},
+    {
+      "path": {{ artifact.path | to_json }},
+      "description": {{ (artifact.description ~ ' for ' ~ artifact.host) | to_json }}
+    }{% endfor %}{% endif %}
+  ],
+  "notes": [
+    "Phase 13 is read-only by default. iperf3 validation is opt-in with pve_validate_iperf_enabled=true.",
+    "Hardware firmware validation consumes latest Phase 01 BMC evidence JSON and can enforce optional target versions with pve_validate_hardware_version_targets."
+  ]
+}

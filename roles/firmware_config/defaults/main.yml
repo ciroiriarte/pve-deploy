@@ -1,0 +1,141 @@
+---
+# Default variables for firmware_config role
+
+# Audit mode flag: MUST default to true. ZERO writes to the BMC.
+# Set from hardware_apply_scope.firmware by playbooks/00-firmware.yml. Consumers
+# must read it through `| bool`: a string value is truthy in Jinja whatever it
+# contains, including "False".
+firmware_config_audit_only: true
+
+# ---------------------------------------------------------------------------
+# What to converge toward
+# ---------------------------------------------------------------------------
+#
+#   baseline - every component moves to the version pinned in firmware_baseline.
+#              Deterministic and repeatable: two runs a month apart converge the
+#              fleet to the same place.
+#   latest   - every component moves to the newest version available in the
+#              catalog (see firmware_catalog_file / firmware_payload_dir).
+#
+# "latest available" deliberately means newest in the catalog this deployment
+# holds, not newest Lenovo has ever published. Resolving the latter would mean
+# scraping a vendor website mid-run, which makes the outcome depend on when the
+# playbook happened to execute and cannot be reproduced or reviewed beforehand.
+# Refresh the catalog as a separate, deliberate step; then a run is a function
+# of the catalog, and the catalog is a reviewable artifact.
+firmware_target_mode: baseline
+
+# ---------------------------------------------------------------------------
+# Where payloads come from
+# ---------------------------------------------------------------------------
+#
+#   local  - a directory of payload files already on the control host
+#   lxca   - Lenovo XClarity Administrator acts as the repository
+#
+# lxca is not the default here: a site XClarity Administrator
+# sits on VLAN240, which is currently unreachable — the same segment as the
+# broken OOBM resolver.
+firmware_payload_source: local
+firmware_payload_dir: "{{ pve_site_root }}/firmware/payloads"
+
+# Optional catalog describing available versions and their payload files.
+# Required for firmware_target_mode=latest; optional for baseline, where it is
+# used to locate the payload for each pinned version.
+#
+#   {
+#     "generated_at": "2026-07-31T0900",
+#     "machine_type": "7D9E",
+#     "components": {
+#       "BMC-Primary": [{"version": "68P-6.20", "file": "lnvgy_fw_xcc_....uxz"}]
+#     }
+#   }
+firmware_catalog_file: "{{ pve_site_root }}/firmware/catalog.json"
+
+# ---------------------------------------------------------------------------
+# How the payload reaches the BMC
+# ---------------------------------------------------------------------------
+#
+#   multipart_push - the control host POSTs the payload to the BMC's
+#                    MultipartHttpPushUri. The BMC is the server, so this needs
+#                    NO outbound reachability from the BMC.
+#   simple_update  - the BMC fetches the payload from a URL we hand it.
+#
+# multipart_push is the default because the OOBM-BMC segment is default-denied
+# outbound: VLAN303 is not a source in any allow policy. simple_update would
+# require opening BMC egress to a payload host first, which is a firewall change
+# and a decision, not an implementation detail.
+firmware_transport: multipart_push
+
+# Update order, by component class. The BMC goes first because it is the agent
+# performing every other update; flashing it last would mean applying the rest
+# through firmware that is about to be replaced.
+firmware_update_order:
+  - bmc
+  - uefi
+  - bootstrap
+  - adapter
+  - drive
+  - psu
+
+# Classification of FirmwareInventory ids into the classes above. First match
+# wins, so more specific patterns come first.
+#
+# The distinction that matters: Lenovo exposes adapters twice. "Slot_1.1" is a
+# read-only view reporting Updateable=false, while "Slot_1.Bundle" is the
+# updateable target for the same device. Targeting the former silently fails.
+firmware_component_class_patterns:
+  - {pattern: "^BMC-", class: bmc}
+  - {pattern: "^UEFI", class: uefi}
+  - {pattern: "^(LXPM|LXUM)", class: bootstrap}
+  - {pattern: "^Slot_[0-9]+\\.Bundle$", class: adapter}
+  - {pattern: "^Disk[0-9]+$", class: drive}
+  - {pattern: "^PSU[0-9]+$", class: psu}
+
+# Components never considered for update, whatever the catalog says.
+#
+#   *-Pending  : staging slots, not installed firmware. Version is null until
+#                something is staged, which would read as infinite drift.
+#   BMC-Backup : the fallback image. It is promoted by the BMC itself, and
+#                flashing both banks at once removes the recovery path.
+#   Slot_N.1   : read-only device views; Slot_N.Bundle is the real target.
+#   Bundle.current : an aggregate marker, not a flashable component.
+firmware_component_exclude_patterns:
+  - "-Pending$"
+  - "^BMC-Backup$"
+  - "^Slot_[0-9]+\\.[0-9]+$"
+  - "^Bundle\\."
+
+# ---------------------------------------------------------------------------
+# Pinned baseline
+# ---------------------------------------------------------------------------
+#
+# Empty by default on purpose. A shipped default would be wrong for every site
+# but one, and a wrong firmware baseline is not a cosmetic error. Populate it
+# per site, per machine type, from a version set that has actually been
+# qualified together.
+#
+# Values captured from a production SR655 V3 fleet on 2026-07-31 are recorded in
+# environments/<site>/firmware-baseline.yml as a starting point.
+firmware_baseline: {}
+
+# Audit result state. Defined here, not only in the task files, because the
+# rescue path renders the same templates without having run the audit.
+firmware_config_outcome: "failed"
+firmware_inventory_items: []
+firmware_plan: []
+firmware_up_to_date_count: 0
+firmware_update_count: 0
+firmware_unknown_count: 0
+firmware_catalog: {}
+
+# BMC connection defaults. bmc_password is deliberately NOT defaulted.
+bmc_username: "USERID"
+bmc_validate_certs: false
+bmc_timeout: 30
+
+environment_name: "production"
+pve_site_name: "default"
+pve_deploy_root: "{{ (playbook_dir ~ '/..') | realpath }}"
+pve_site_root: "{{ pve_deploy_root }}"
+evidence_dir: "{{ pve_site_root }}/environments/{{ pve_site_name }}/evidence"
+reports_dir: "{{ pve_site_root }}/reports"

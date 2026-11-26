@@ -1,0 +1,85 @@
+---
+# C2 - autotuning knobs. Config scopes follow the hand-run Phase C/D script:
+#   ceph config set osd    osd_memory_target_autotune false
+#   ceph config set osd    osd_memory_target 8589934592
+#   ceph balancer mode upmap && ceph balancer on
+#   ceph config set global osd_pool_default_pg_autoscale_mode on
+# Each is read before written so a re-run is a no-op.
+
+- name: Read the OSD memory autotune setting.
+  ansible.builtin.command:
+    cmd: ceph config get osd osd_memory_target_autotune
+  delegate_to: "{{ pve_ceph_first_node }}"
+  register: pve_ceph_reconcile_autotune_get
+  changed_when: false
+
+- name: Disable OSD memory autotune.
+  ansible.builtin.command:
+    cmd: ceph config set osd osd_memory_target_autotune {{ pve_ceph_osd_memory_target_autotune | string | lower }}
+  delegate_to: "{{ pve_ceph_first_node }}"
+  when: (pve_ceph_reconcile_autotune_get.stdout | default('') | trim | lower) != (pve_ceph_osd_memory_target_autotune | string | lower)
+  register: pve_ceph_reconcile_autotune_set
+  changed_when: pve_ceph_reconcile_autotune_set.rc == 0
+
+- name: Read the OSD memory target.
+  ansible.builtin.command:
+    cmd: ceph config get osd osd_memory_target
+  delegate_to: "{{ pve_ceph_first_node }}"
+  register: pve_ceph_reconcile_memtarget_get
+  changed_when: false
+
+- name: Pin the OSD memory target.
+  ansible.builtin.command:
+    cmd: ceph config set osd osd_memory_target {{ pve_ceph_osd_memory_target }}
+  delegate_to: "{{ pve_ceph_first_node }}"
+  when: (pve_ceph_reconcile_memtarget_get.stdout | default('') | trim) != (pve_ceph_osd_memory_target | string)
+  register: pve_ceph_reconcile_memtarget_set
+  changed_when: pve_ceph_reconcile_memtarget_set.rc == 0
+
+# `ceph balancer status` prints a JSON object, so parse it rather than matching
+# substrings (a "key": "value" literal in a `when:` would also confuse the YAML).
+- name: Read the balancer status.
+  ansible.builtin.command:
+    cmd: ceph balancer status
+  delegate_to: "{{ pve_ceph_first_node }}"
+  register: pve_ceph_reconcile_balancer_get
+  changed_when: false
+
+- name: Set the balancer mode.
+  ansible.builtin.command:
+    cmd: ceph balancer mode {{ pve_ceph_balancer_mode }}
+  delegate_to: "{{ pve_ceph_first_node }}"
+  when: >-
+    (pve_ceph_reconcile_balancer_get.stdout | default('{}', true) | from_json).mode
+    | default('') != pve_ceph_balancer_mode
+  register: pve_ceph_reconcile_balancer_mode
+  changed_when: pve_ceph_reconcile_balancer_mode.rc == 0
+
+- name: Turn the balancer on.
+  ansible.builtin.command:
+    cmd: ceph balancer on
+  delegate_to: "{{ pve_ceph_first_node }}"
+  when: >-
+    not ((pve_ceph_reconcile_balancer_get.stdout | default('{}', true) | from_json).active | default(false))
+  register: pve_ceph_reconcile_balancer_on
+  changed_when: pve_ceph_reconcile_balancer_on.rc == 0
+
+- name: Read the default PG autoscale mode.
+  # The value is stored in the 'global' config section, but `ceph config get`
+  # needs a daemon ENTITY, not a section -- `get global` errors. Query 'mon',
+  # which resolves the effective (global-inherited) value.
+  ansible.builtin.command:
+    cmd: ceph config get mon osd_pool_default_pg_autoscale_mode
+  delegate_to: "{{ pve_ceph_first_node }}"
+  register: pve_ceph_reconcile_autoscale_get
+  changed_when: false
+
+- name: Set the default PG autoscale mode.
+  # Set on the 'global' section (a valid config section for `set`, and where the
+  # bootstrap put it), so it applies fleet-wide.
+  ansible.builtin.command:
+    cmd: ceph config set global osd_pool_default_pg_autoscale_mode {{ pve_ceph_pg_autoscale_default }}
+  delegate_to: "{{ pve_ceph_first_node }}"
+  when: (pve_ceph_reconcile_autoscale_get.stdout | default('') | trim) != pve_ceph_pg_autoscale_default
+  register: pve_ceph_reconcile_autoscale_set
+  changed_when: pve_ceph_reconcile_autoscale_set.rc == 0

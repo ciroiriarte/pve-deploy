@@ -1,0 +1,34 @@
+---
+# Found the cluster, with corosync pinned to its own network.
+#
+# --link0 is the entire point. Without it pvecm resolves the node's hostname and
+# uses whatever that returns -- the management address -- putting cluster
+# messaging on the operator network with no indication anything is wrong.
+
+- name: Create the cluster
+  ansible.builtin.command:
+    argv: >-
+      {{ ['pvecm', 'create', pve_cluster_name,
+          '--link0', pve_cluster_link0_addr
+                     ~ (',priority=' ~ pve_cluster_link0_priority
+                        if pve_cluster_link1_addr | length > 0 else '')]
+         + (['--link1', pve_cluster_link1_addr ~ ',priority=' ~ pve_cluster_link1_priority]
+            if pve_cluster_link1_addr | length > 0 else []) }}
+  register: pve_cluster_create
+  changed_when: pve_cluster_create.rc == 0
+
+- name: Wait for the founding node to reach quorum
+  ansible.builtin.command:
+    cmd: pvecm status
+  register: pve_cluster_founder_quorum
+  until: pve_cluster_founder_quorum.rc == 0 and 'Quorate:' in pve_cluster_founder_quorum.stdout
+  retries: "{{ pve_cluster_quorum_retries }}"
+  delay: "{{ pve_cluster_quorum_delay }}"
+  changed_when: false
+
+- name: Report the founded cluster
+  ansible.builtin.debug:
+    msg: >-
+      {{ pve_cluster_name }} founded on {{ inventory_hostname }} with corosync on
+      {{ pve_cluster_link0_addr }} ({{ pve_cluster_link0_network }}).
+  changed_when: false

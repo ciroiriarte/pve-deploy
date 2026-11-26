@@ -1,0 +1,253 @@
+---
+# NOTE ON TARGETING
+#
+# A --limit that matches no host cannot be caught from inside this file.
+# Ansible treats "no hosts matched" as success: it prints a skip notice and
+# exits 0, and a play with no matching hosts never runs its own pre_tasks. A
+# guard play added here would be filtered by the same --limit and skipped too.
+#
+# The trap is cross-tier naming. Tier A targets the BMC
+# (pve-01-bmc); Tier B targets the node (pve-01). Reaching
+# for the Tier B name that every other phase uses silently matches zero BMCs
+# and reports success having configured nothing.
+#
+# tools/hardware-run.sh resolves the limit against the inventory before
+# invoking ansible-playbook and refuses to run on zero matches. Use it for
+# apply runs rather than calling this playbook directly.
+- name: Phase 01 - Hardware Inventory, BIOS and RAID Convergence (Tier A, out-of-band)
+  hosts: bmc
+  connection: local
+  gather_facts: false
+
+  # One host at a time when applying, everything at once when only reading.
+  #
+  # Applying converges BIOS and RAID and reboots the host. Without serial the
+  # default is every matched host in parallel (forks=20 against a 6-host group),
+  # so a single mis-scoped invocation would reboot the entire fleet
+  # simultaneously. any_errors_fatal stops the run at the first failed host
+  # rather than continuing into the next one.
+  serial: "{{ (hardware_apply | bool) | ternary(1, '100%') }}"
+  any_errors_fatal: "{{ hardware_apply | bool }}"
+
+  vars:
+    bmc_inventory_stamp: "{{ lookup('pipe', 'date +%Y-%m-%dT%H%M') }}"
+
+    # Apply gate.
+    #
+    # false (default) -> read current state, compute the diff, write evidence and
+    # an assessment report. Zero writes to any BMC. This is the audit, and it is
+    # the same code path apply uses, so the audit cannot drift from what apply
+    # would actually set.
+    #
+    # true -> the same read and diff, then commit the diff, reboot once, verify.
+    #
+    # There is one implementation and one flag, rather than an audit playbook and
+    # an apply playbook that have to be kept in agreement by hand.
+    hardware_apply: false
+
+    # Per-operation-class scope.
+    #
+    # hardware_apply on its own is too coarse: BMC settings, BIOS attributes and
+    # storage topology have very different blast radii, and "converge the BIOS"
+    # should not silently authorise "reconfigure the RAID controller". Each class
+    # must be opted into by name, so an operator states what they intend to touch
+    # rather than accepting whatever the playbook happens to include.
+    #
+    # Everything off by default: hardware_apply=true alone converges nothing.
+    hardware_apply_scope:
+      bmc: false
+      bios: false
+      storage: false
+
+    # Storage operations that destroy data need their own key on top of the
+    # scope flag. Creating a volume on unconfigured drives and deleting one that
+    # already carries data are not the same decision, and raid_config cannot tell
+    # an operator's intent apart from the drive state alone.
+    hardware_allow_destructive_storage: false
+
+    # Second key for the apply gate, and deliberately not a boolean.
+    #
+    # hardware_apply on its own is too easy to arrive at by accident: an
+    # inherited -e from a wrapper script, a group_var copied between sites, a CI
+    # variable that outlived its purpose. None of those represent a decision to
+    # reconfigure hardware today. This one has to be typed on the command line
+    # and has to name the site being targeted, so a run aimed at the wrong
+    # inventory fails closed instead of reconfiguring another site's fleet.
+    hardware_apply_confirm: ""
+
+    # Escape hatch for a deliberate whole-group apply. Off by default because
+    # the bmc group is broader than it looks: alongside the four PVE nodes it
+    # holds the PBS node and the database server, neither of which should be
+    # reconfigured as a side effect of a PVE build.
+    hardware_apply_allow_fleet: false
+
+  pre_tasks:
+    - name: Refuse to run without a vaulted BMC password.
+      ansible.builtin.assert:
+        that:
+          - bmc_password is defined
+          - bmc_password | length > 0
+        fail_msg: "Define bmc_password in Ansible Vault, for example group_vars/bmc/vault.yml."
+        quiet: true
+      changed_when: false
+      no_log: true
+      tags:
+        - always
+
+    - name: Require an explicit, site-named confirmation before mutating hardware.
+      ansible.builtin.assert:
+        that:
+          - hardware_apply_confirm == pve_site_name
+        fail_msg: >-
+          hardware_apply=true commits BIOS and RAID changes and reboots every
+          targeted host. Confirm the site by re-running with
+          -e hardware_apply_confirm={{ pve_site_name }} and constrain the blast
+          radius with --limit. Refusing to continue.
+        quiet: true
+      when: hardware_apply | bool
+      changed_when: false
+      tags:
+        - always
+
+    # Configuration changes are limited to PVE nodes.
+    #
+    # The bmc group is every managed BMC in the site — here the four PVE nodes
+    # plus the PBS node and the database server. Auditing all of them is
+    # useful and harmless, so the read-only path stays fleet-wide. Converging
+    # them is not: the database server and the backup node are not part of
+    # the PVE build and must not be reconfigured or rebooted by it.
+    #
+    # Expressed as a positive allowlist keyed on the pve inventory group rather
+    # than as a count or a name pattern, so adding a BMC to the site cannot
+    # quietly widen what apply is allowed to touch. With serial: 1 and
+    # any_errors_fatal this aborts on the first ineligible host.
+    - name: Refuse to apply configuration to a host outside the pve group.
+      ansible.builtin.assert:
+        that:
+          - parent_host is defined
+          - parent_host in groups.get('pve', [])
+        fail_msg: >-
+          {{ inventory_hostname }} belongs to {{ parent_host | default('an unknown host') }},
+          which is not in the pve inventory group. Hardware configuration is
+          limited to PVE nodes; this host may be audited but not converged.
+          Narrow the run with --limit, for example
+          --limit {{ groups.get('pve', ['pve-01'])
+                     | map('regex_replace', '$', '-bmc') | join(',') }}.
+        quiet: true
+      when: hardware_apply | bool
+      changed_when: false
+      tags:
+        - always
+
+    # Retained alongside the pve-group allowlist above: that one bounds WHICH
+    # machines may be converged, this one forces a deliberate --limit even when
+    # every target is already eligible.
+    - name: Refuse to apply to the whole bmc group without an explicit override.
+      vars:
+        non_pve_targets: >-
+          {{ ansible_play_hosts_all
+             | map('extract', hostvars, 'parent_host')
+             | reject('in', groups.get('pve', []))
+             | list }}
+      ansible.builtin.assert:
+        that:
+          - (ansible_play_hosts_all | length) < (groups['bmc'] | length)
+        fail_msg: >-
+          apply mode is targeting all {{ groups['bmc'] | length }} hosts in the
+          bmc group, including non-PVE systems
+          ({{ non_pve_targets | join(', ') }}). Narrow the run with --limit, for
+          example --limit pve-01-bmc. Override with
+          -e hardware_apply_allow_fleet=true only if converging the entire
+          group is genuinely intended.
+        quiet: true
+      when:
+        - hardware_apply | bool
+        - not (hardware_apply_allow_fleet | bool)
+      changed_when: false
+      tags:
+        - always
+
+    # Counts come from ansible_play_hosts_all, not ansible_play_hosts. Under
+    # serial: 1 the latter is the current batch — always 1 — so it would report
+    # "1 host" while working through the whole group one node at a time.
+    # An apply run that selected no operation class would clear every gate, print
+    # the apply banner, converge nothing, and exit 0 — reading exactly like a
+    # successful convergence. Refusing is the only honest outcome.
+    - name: Refuse an apply run that selected no operation class.
+      ansible.builtin.assert:
+        that:
+          - hardware_apply_scope.values() | select() | list | length > 0
+        fail_msg: >-
+          hardware_apply=true but every entry in hardware_apply_scope is false,
+          so nothing would be converged. Name the classes to apply, for example
+          -e '{"hardware_apply_scope":{"bios":true}}'. Refusing to report a
+          convergence that would not happen.
+        quiet: true
+      when: hardware_apply | bool
+      changed_when: false
+      tags:
+        - always
+
+    - name: Announce that this run will modify hardware.
+      ansible.builtin.debug:
+        msg: >-
+          APPLY MODE on site '{{ pve_site_name }}':
+          {{ ansible_play_hosts_all | length }} host(s) in scope
+          ({{ ansible_play_hosts_all | join(', ') }}), converged one at a time,
+          each rebooted once if it has a pending diff.
+      when: hardware_apply | bool
+      changed_when: false
+      run_once: true
+      tags:
+        - always
+
+  roles:
+    # Read-only by construction rather than by flag: inventory capture has no
+    # apply mode and never will. It is a standing deliverable — Phase 13 reads
+    # this evidence back for fleet firmware consistency and raid_config consumes
+    # it to derive Ceph OSD candidates — which is what keeps a default-mode run
+    # of this playbook safe to repeat during BMC recovery.
+    - role: bmc_inventory
+      tags:
+        - phase01
+        - hardware
+        - bmc
+        - inventory
+        - readonly
+
+    # Two-mode roles. Their audit path is a strict prefix of their apply path:
+    # gather evidence, diff against the baseline, report, and only then commit.
+    #
+    # bmc_config runs first: it audits the BMC's own service configuration
+    # (time sync, DNS, management protocol posture, account policy), and a BMC
+    # whose clock is wrong timestamps every artifact the roles below produce.
+    - role: bmc_config
+      vars:
+        bmc_config_audit_only: >-
+          {{ not ((hardware_apply | bool) and (hardware_apply_scope.bmc | bool)) }}
+      tags:
+        - phase01
+        - hardware
+        - bmc
+        - bmc_config
+
+    - role: bios_config
+      vars:
+        bios_config_audit_only: >-
+          {{ not ((hardware_apply | bool) and (hardware_apply_scope.bios | bool)) }}
+      tags:
+        - phase01
+        - hardware
+        - bmc
+        - bios
+
+    - role: raid_config
+      vars:
+        raid_config_audit_only: >-
+          {{ not ((hardware_apply | bool) and (hardware_apply_scope.storage | bool)) }}
+        raid_config_allow_destructive: "{{ hardware_allow_destructive_storage | bool }}"
+      tags:
+        - phase01
+        - hardware
+        - bmc
+        - raid
